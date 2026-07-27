@@ -40,3 +40,14 @@ uv run python scripts/make_synthetic_shards.py --out data/synthetic --shards 2
 
 Real FineWeb shards are 190 MiB each; see [`reference/PROVENANCE.md`](reference/PROVENANCE.md)
 for sizes and the exact definition of the 3.28 target before pulling them.
+
+## Training
+
+```bash
+uv run python -m distrain.train --global-batch-seqs 2 --max-steps 5 --val-every 0
+```
+
+Defaults are the 124M Track A model at seq-1024 with a ~0.5M-token global batch. On
+Apple silicon the batch must be tiny — fp32 logits for 480 sequences would need well
+over 100 GB — and the resulting timings mean nothing. Local runs are for correctness;
+see [`project_brief.md`](project_brief.md) section 8.

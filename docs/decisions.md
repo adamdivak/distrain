@@ -44,10 +44,11 @@ runs that get compared to each other.
 Every throughput claim in both tracks depends on this being computed one way in
 one place.
 
-- **Numerator**: PaLM-style FLOPs per step, `6*N*D + 12*L*H*Q*T` — i.e. including
-  the attention term, not bare `6ND`. The attention term is a few percent at
-  124M/seq-1024 and materially more at 7B, so using `6ND` on Track A and the full
-  formula on Track B would make the two tracks incomparable.
+- **Numerator**: PaLM-style FLOPs per token, `6N + 12*L*H*Q*T` — i.e. including
+  the attention term, not bare `6ND`. Measured: that term is **13% of total FLOPs**
+  at 124M/seq-1024, which is larger than most effects this study aims to measure.
+  Using `6ND` on Track A and the full formula on Track B would also make the two
+  tracks incomparable.
 - **MFU vs HFU**: report **true MFU** (excludes activation-recomputation FLOPs).
   When activation checkpointing is on — which Track B will need under FSDP2 — also
   log **HFU** (includes recompute) as a separate metric. They differ by 30%+ and

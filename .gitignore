@@ -1,0 +1,20 @@
+# environments
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# data + run outputs (never committed; regenerate via scripts/)
+data/
+*.bin
+out/
+checkpoints/
+trackio/
+*.log
+
+# reference clones (vendored files are copied into reference/ explicitly)
+reference/_clones/
+
+# os
+.DS_Store

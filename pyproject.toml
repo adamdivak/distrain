@@ -29,6 +29,14 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/distrain"]
 
+[tool.uv]
+# Use uv's own CPython rather than whatever the distro ships. Two reasons: the
+# managed builds include the development headers Triton needs to JIT-compile
+# torch.compile kernels (Ubuntu splits those into python3-dev, which needs root),
+# and pinning the interpreter is part of keeping the environment identical across
+# the Mac, aurora and rented nodes.
+python-preference = "only-managed"
+
 # torch comes from PyPI on macOS (CPU/MPS, for local development only) and from
 # the CUDA wheel index on Linux (aurora + rented cloud nodes).
 #

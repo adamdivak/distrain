@@ -28,8 +28,29 @@ import numpy as np
 import torch
 
 from distrain.data import DataLoader, ShardingPlan, TokenStream
-from distrain.mfu import counter_for, peak_bf16_flops
+from distrain.mfu import PeakSpec, counter_for, peak_bf16_spec
 from distrain.model import GPT, GPTConfig
+
+_warned_impossible = False
+
+
+def warn_if_impossible(mfu: float, spec: PeakSpec | None) -> None:
+    """Shout once if MFU exceeds 100%, which means the denominator is wrong.
+
+    A GPU cannot exceed its own peak. When this fires, the recorded peak is too low
+    and every throughput number from the run is inflated -- exactly the failure that
+    put a 158% MFU on the board the first time this loop ran on a 3090.
+    """
+    global _warned_impossible
+    if mfu <= 1.0 or _warned_impossible or spec is None:
+        return
+    _warned_impossible = True
+    print(
+        f"\n*** MFU {mfu * 100:.1f}% exceeds 100%, which is physically impossible.\n"
+        f"*** Recorded peak is {spec.tflops:.1f} TFLOP/s ({spec.source}) and is too low.\n"
+        f"*** Re-measure with scripts/measure_roofline.py; results from this run are "
+        f"inflated by at least {mfu:.2f}x.\n"
+    )
 
 
 @dataclass
@@ -217,7 +238,8 @@ def train(cfg: TrainConfig) -> dict:
         cfg.weight_decay, cfg.learning_rate, cfg.betas, fused=(device == "cuda")
     )
     flops = counter_for(model, cfg.seq_len)
-    peak = peak_bf16_flops(torch.cuda.get_device_name()) if device == "cuda" else None
+    peak_spec = peak_bf16_spec(torch.cuda.get_device_name()) if device == "cuda" else None
+    peak = peak_spec.tflops * 1e12 if peak_spec else None
     tokens_per_step_this_rank = plan.seqs_per_rank * cfg.seq_len
 
     is_primary = cfg.rank == 0
@@ -275,6 +297,7 @@ def train(cfg: TrainConfig) -> dict:
                 metrics["perf/mfu"] = flops.mfu(tokens_per_step_this_rank, step_time, peak)
                 # identical to MFU until activation checkpointing is enabled
                 metrics["perf/hfu"] = flops.hfu(tokens_per_step_this_rank, step_time, peak)
+                warn_if_impossible(metrics["perf/mfu"], peak_spec)
             _log(cfg, metrics, step)
             print(
                 f"step {step:5d} | loss {metrics['train/loss']:.4f} | lr {lr:.2e} | "

@@ -10,43 +10,69 @@ are fixed here once (`docs/decisions.md` section 3) rather than re-derived per r
 - **MFU vs HFU**: MFU counts only the FLOPs the model mathematically requires. HFU
   additionally counts activation recomputation, which FSDP2 at 7B will need. They
   differ by ~33% under full recompute and are widely conflated; both are reported.
-- **Denominator**: bf16 *dense* peak. Never the 2:4-sparsity marketing number, which
-  is 2x higher and would halve every reported MFU.
+- **Denominator**: bf16 *dense* peak, measured where possible. Never the 2:4-sparsity
+  marketing number, which is 2x higher and would halve every reported MFU.
 
 Unknown devices raise rather than fall back to a guess: a silently wrong denominator
-is indistinguishable from a real efficiency finding.
+is indistinguishable from a real efficiency finding. That is not hypothetical -- see
+`PeakSpec`, which exists because the first version of this table shipped a wrong 3090
+figure and produced a 158% MFU.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# bf16 dense tensor-core peak, TFLOP/s per GPU. Ordered: first substring match wins,
-# so more specific variants must precede their families.
+
+@dataclass(frozen=True)
+class PeakSpec:
+    """A bf16 dense peak together with where the number came from.
+
+    Provenance is recorded because the first version of this table was wrong: the
+    RTX 3090 was entered at 35.6 TFLOP/s, which is the card's FP32 *non-tensor* rate,
+    not its bf16 tensor rate. The error produced a confident-looking MFU of 158%.
+    Anything above 100% is impossible, which is the only reason it was caught.
+    """
+
+    tflops: float
+    source: str
+
+    @property
+    def measured(self) -> bool:
+        return self.source.startswith("measured")
+
+
+# Ordered: first substring match wins, so specific variants precede their families.
 #
-# The RTX 3090 figure is the one that surprises people: GeForce cards run tensor-core
-# matmuls with FP32 accumulate at half rate, and PyTorch's bf16 matmul accumulates in
-# FP32. 71 TFLOP/s is the FP16-accumulate number and does not apply here.
-_PEAK_BF16_TFLOPS: tuple[tuple[str, float], ...] = (
-    ("H100 PCIe", 756.0),
-    ("H100 NVL", 835.0),
-    ("H100", 989.0),  # SXM
-    ("A100", 312.0),  # SXM and PCIe are the same
-    ("L40S", 181.0),
-    ("RTX 3090", 35.6),
+# Prefer measured values. Run `scripts/measure_roofline.py` on any new GPU class before
+# trusting its MFU numbers, and record the result here -- the same discipline the brief
+# already applies to interconnect, where nccl-tests defines the ceiling rather than the
+# vendor's bandwidth claim.
+_PEAK_BF16: tuple[tuple[str, PeakSpec], ...] = (
+    ("H100 PCIe", PeakSpec(756.0, "datasheet dense, UNVERIFIED")),
+    ("H100 NVL", PeakSpec(835.0, "datasheet dense, UNVERIFIED")),
+    ("H100", PeakSpec(989.0, "datasheet dense SXM, UNVERIFIED")),
+    ("A100", PeakSpec(312.0, "datasheet dense, SXM and PCIe alike, UNVERIFIED")),
+    ("L40S", PeakSpec(181.0, "datasheet dense, UNVERIFIED")),
+    ("RTX 3090", PeakSpec(82.6, "measured on aurora 2026-07-28, 16384^3 bf16 GEMM")),
 )
 
 
-def peak_bf16_flops(device_name: str) -> float:
-    """bf16 dense peak in FLOP/s for a `torch.cuda.get_device_name()` string."""
-    for pattern, tflops in _PEAK_BF16_TFLOPS:
+def peak_bf16_spec(device_name: str) -> PeakSpec:
+    """Peak spec for a `torch.cuda.get_device_name()` string, with provenance."""
+    for pattern, spec in _PEAK_BF16:
         if pattern in device_name:
-            return tflops * 1e12
-    known = ", ".join(p for p, _ in _PEAK_BF16_TFLOPS)
+            return spec
+    known = ", ".join(p for p, _ in _PEAK_BF16)
     raise KeyError(
-        f"no bf16 dense peak recorded for {device_name!r}. Add it to _PEAK_BF16_TFLOPS "
-        f"using the dense (non-sparsity) figure from the vendor datasheet. Known: {known}"
+        f"no bf16 dense peak recorded for {device_name!r}. Measure it with "
+        f"scripts/measure_roofline.py and add it to _PEAK_BF16. Known: {known}"
     )
+
+
+def peak_bf16_flops(device_name: str) -> float:
+    """bf16 dense peak in FLOP/s."""
+    return peak_bf16_spec(device_name).tflops * 1e12
 
 
 @dataclass(frozen=True)

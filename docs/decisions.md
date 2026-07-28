@@ -54,9 +54,30 @@ one place.
   log **HFU** (includes recompute) as a separate metric. They differ by 30%+ and
   are routinely conflated in published numbers.
 - **Denominator**: bf16 **dense** peak, never the 2:4-sparsity marketing figure.
-  H100 SXM = 989 TFLOP/s, *not* 1979. RTX 3090 ≈ 35, *not* 71.
+  H100 SXM = 989 TFLOP/s, *not* 1979.
+- **Measure the roofline, don't cite it.** Datasheets mix tensor and non-tensor rates,
+  dense and sparse figures, and FP16- vs FP32-accumulate variants. Run
+  `scripts/measure_roofline.py` on each new GPU class and record the measured value
+  with its provenance. Datacenter entries currently in the table are datasheet
+  values marked `UNVERIFIED` until measured on first use.
 - **Implementation**: one unit-tested function, with peak TFLOP/s in a table keyed
   by device name. Never hand-entered per run.
+
+**Correction (2026-07-28).** The 3090 was first entered at 35.6 TFLOP/s on the belief
+that GeForce cards run bf16 tensor matmuls at half rate. That is wrong: 35.6 is the
+card's **FP32 non-tensor** rate. Measured on aurora: bf16 GEMM sustains **82.6–82.9
+TFLOP/s**, while fp32 GEMM runs at 27.4 — about 77% of 35.6, which is what confirmed
+the misidentification. The bad denominator produced a **158% MFU**, corrected to 68.4%.
+
+Two mechanisms now exist so this fails loudly rather than silently:
+- `warn_if_impossible()` in the training loop shouts once if MFU exceeds 100%.
+- `scripts/measure_roofline.py` compares its measurement against the recorded table
+  and flags a gap over 2% (below that is run-to-run noise).
+
+Known convention detail, deliberately left alone: `12*L*H*Q*T` assumes a full T x T
+attention matrix, while causal SDPA computes roughly half of it. PaLM and nanoGPT both
+count it this way, so keeping it preserves comparability with published MFU figures at
+the cost of a small overstatement.
 
 ## 4. Time-to-target-loss definition — **load-bearing**
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from distrain.mfu import FlopsCounter, counter_for, peak_bf16_flops
+from distrain.mfu import FlopsCounter, counter_for, peak_bf16_flops, peak_bf16_spec
 from distrain.model import GPT, GPTConfig
 
 
@@ -28,7 +28,7 @@ class TestPeakLookup:
             ("NVIDIA A100-SXM4-80GB", 312.0),
             ("NVIDIA A100-PCIE-40GB", 312.0),
             ("NVIDIA L40S", 181.0),
-            ("NVIDIA GeForce RTX 3090", 35.6),
+            ("NVIDIA GeForce RTX 3090", 82.6),
         ],
     )
     def test_known_devices(self, name, expected_tflops):
@@ -39,9 +39,23 @@ class TestPeakLookup:
         assert peak_bf16_flops("NVIDIA H100 80GB HBM3") != pytest.approx(1979e12)
         assert peak_bf16_flops("NVIDIA L40S") != pytest.approx(362e12)
 
-    def test_3090_uses_fp32_accumulate_rate(self):
-        """GeForce halves FP32-accumulate tensor throughput; 71 TFLOP/s is the wrong number."""
-        assert peak_bf16_flops("NVIDIA GeForce RTX 3090") == pytest.approx(35.6e12)
+    def test_3090_is_the_tensor_rate_not_the_fp32_rate(self):
+        """Regression: 35.6 TFLOP/s is the 3090's FP32 non-tensor rate.
+
+        It was entered here as the bf16 peak and produced a 158% MFU. Measured bf16
+        GEMM throughput on aurora is 82.6 TFLOP/s; a measured fp32 GEMM runs at 27.3,
+        which is ~77% of 35.6 and confirms what that number actually describes.
+        """
+        assert peak_bf16_flops("NVIDIA GeForce RTX 3090") == pytest.approx(82.6e12)
+        assert peak_bf16_flops("NVIDIA GeForce RTX 3090") > 71e12
+
+    def test_measured_entries_are_marked_as_such(self):
+        assert peak_bf16_spec("NVIDIA GeForce RTX 3090").measured
+        assert not peak_bf16_spec("NVIDIA H100 80GB HBM3").measured
+
+    def test_unverified_entries_say_so(self):
+        """Datacenter figures are datasheet values until a roofline is measured."""
+        assert "UNVERIFIED" in peak_bf16_spec("NVIDIA A100-SXM4-80GB").source
 
     def test_unknown_device_raises(self):
         with pytest.raises(KeyError, match="no bf16 dense peak recorded"):

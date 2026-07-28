@@ -1,0 +1,56 @@
+# distrain — working notes
+
+A self-funded distributed-training scaling study. Read [`project_brief.md`](project_brief.md)
+for intent and [`docs/decisions.md`](docs/decisions.md) for everything settled since.
+[`README.md`](README.md) has current status and known gaps. Those three are the source
+of truth; this file is only what a session needs before touching anything.
+
+## Where things run
+
+| Machine | Role |
+|---|---|
+| this Mac (arm64, no NVIDIA) | editor; CPU/MPS correctness only |
+| `aurora` (RTX 3090), `adam@aurora` over Tailscale, `~/work/distrain` | all CUDA work |
+| rented cloud nodes | all reported results — none rented yet |
+
+Iterate with rsync, not git:
+
+```bash
+scripts/sync-aurora.sh && ssh adam@aurora 'cd ~/work/distrain && uv run pytest -q'
+```
+
+`uv` on aurora may need its full path (`~/.local/bin/uv`) over non-interactive SSH.
+Commit at milestones. Remote `github.com/adamdivak/distrain` is **private**.
+
+## Things that are load-bearing
+
+Breaking any of these invalidates results silently rather than loudly, which is worse
+than a crash. Each is enforced by a test — do not weaken them to make a test pass.
+
+- **Data order must not depend on world size.** `ShardingPlan` fixes what step *t*
+  consumes regardless of rank count; `tests/test_data.py` asserts byte-identical token
+  streams across world sizes 1/2/4/8. Changing GPU count must never change data order.
+- **One FLOPs convention, in `mfu.py` only.** PaLM-style `6N + 12*L*H*Q*T`, true MFU
+  reported, HFU logged separately when checkpointing is on, bf16 **dense** peaks.
+- **Peaks are measured, not cited.** A datasheet figure for the 3090 (35.6 TFLOP/s —
+  actually its FP32 non-tensor rate) once produced a 158% MFU. Run
+  `scripts/measure_roofline.py` on any new GPU class; datacenter entries are marked
+  `UNVERIFIED` until then. MFU above 100% means the denominator is wrong.
+- **Time-to-target-loss is the first unsmoothed crossing**, with training time
+  excluding validation.
+- **Architecture must be identical across configs.** The 3.28 target constrains data
+  and tokenizer, not model shape — but a scaling comparison is meaningless if the
+  model differs between runs.
+
+## Costs are real
+
+Budget is $150 target / $400 ceiling of the user's own money. Never debug on rented
+hardware; aurora is free. Before anything is rented, the launcher needs a hard
+wall-clock ceiling and teardown-on-exception (`docs/decisions.md` §9).
+
+## Conventions
+
+- Vendored upstream code in `reference/` is verbatim and lint-excluded. Do not edit it.
+- `data/`, `.venv/`, `out/`, `checkpoints/` are gitignored and machine-local.
+- Real FineWeb shards are 190 MiB each, ~19 GiB for the full set. The Mac's connection
+  is metered; aurora's is not. Synthetic shards cover all local development.

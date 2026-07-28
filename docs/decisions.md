@@ -14,8 +14,12 @@ invalidate a cross-config comparison is marked **load-bearing**.
 | Machine | Role | Environment |
 |---|---|---|
 | MacBook Pro (arm64, no NVIDIA) | Editor + fast iteration | native `uv` venv, CPU / MPS |
-| `aurora` (local, RTX 3090) | All CUDA correctness work | pinned Docker image |
-| Rented cloud nodes | All reported results | same pinned Docker image |
+| `aurora` (local, RTX 3090 24 GB) | All CUDA correctness work | native `uv` venv today; Docker planned |
+| Rented cloud nodes | All reported results | pinned Docker image |
+
+Reached as `adam@aurora` over Tailscale; the repo lives at `~/work/distrain`.
+Driver 580.173.02, 16 cores, 31 GB RAM, 730 GB free — enough for the full 19 GiB
+FineWeb10B pull.
 
 The Mac must be able to run a tiny config end-to-end (small `n_layer`/`n_embd`,
 short sequence, CPU or MPS) so the loop, data path, checkpointing and the
@@ -25,7 +29,27 @@ transfers anywhere.
 
 Docker is **not** used on the Mac — a CUDA image is meaningless on arm64 without
 an NVIDIA GPU. Identical-image reproducibility is a claim about `aurora` and
-cloud only, which is where every reported number comes from.
+cloud only, which is where every reported number comes from. **Docker is not yet
+in use on aurora either**: the NVIDIA Container Toolkit is not installed, so
+`docker run --gpus all` does not work there. Until it is, aurora runs the native
+`uv` venv and image parity with the cloud is unproven.
+
+## 1a. Development workflow
+
+Edit on the Mac, run on aurora:
+
+```bash
+scripts/sync-aurora.sh                                    # rsync, well under a second
+ssh adam@aurora 'cd ~/work/distrain && uv run pytest -q'
+```
+
+Git is for milestones, not for iteration — pushing and pulling per edit made the
+feedback loop slow and the history unreadable. `sync-aurora.sh` excludes `data/`,
+`.venv/` and outputs, and `rsync --delete` does not touch excluded paths, so
+aurora keeps its own shards and environment.
+
+Remote: `github.com/adamdivak/distrain`, **private for now**, to be made public
+with the write-up.
 
 ## 2. Dependency pinning
 
@@ -34,10 +58,18 @@ in `pyproject.toml` with a `uv.lock` covering transitives. trackio in particular
 pinned because its API is young (brief §3).
 
 torch resolves from PyPI on macOS and from the **cu126** wheel index on Linux.
-cu126 rather than the newer cu130/cu132 because it has the widest NVIDIA driver
-compatibility and `aurora`'s driver version is not yet confirmed. Once it is,
-bump if the driver allows — but bump *before* the first cloud run, never between
-runs that get compared to each other.
+
+aurora's driver is now confirmed as **580.173.02**, which is new enough for CUDA 13,
+so cu130/cu132 would work there. cu126 is kept anyway: rented nodes are the binding
+constraint and many ship older drivers, and the pin exists to make cross-provider
+results comparable rather than to chase kernels. If it is ever bumped, bump *before*
+the first cloud run — never between runs that get compared to each other.
+
+**Python interpreter is uv-managed** (`python-preference = "only-managed"`). Ubuntu's
+system `python3.12` ships without development headers unless `python3-dev` is
+installed, and without `Python.h` Triton cannot build the kernels `torch.compile`
+emits — compiled runs die at the first step. uv's CPython includes headers, so this
+removes a root requirement and pins the interpreter itself.
 
 ## 3. MFU / HFU definition — **load-bearing**
 

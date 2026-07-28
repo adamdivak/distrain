@@ -23,6 +23,7 @@ the Mac and aurora.
 | 124M GPT, SDPA, bf16 + `torch.compile` | done, [`model.py`](src/distrain/model.py) |
 | FLOPs / MFU / HFU accounting | done, [`mfu.py`](src/distrain/mfu.py) |
 | Single-device loop, trackio logging | done, [`train.py`](src/distrain/train.py) |
+| Pinned Docker image (aurora + cloud parity) | builds + tests pass on aurora, [`Dockerfile`](Dockerfile) |
 | Hand-rolled DDP (3 modes) | **next** |
 | Checkpointing (`torch.distributed.checkpoint`) | not started |
 | FSDP2 / TP, DiLoCo, run matrix | not started |
@@ -68,6 +69,34 @@ uv run pytest
 On macOS this installs a CPU/MPS torch; on Linux, the CUDA build from the pinned
 `cu126` index.
 
+## Container
+
+The pinned Docker image ([`Dockerfile`](Dockerfile)) is the reproducibility unit:
+the *same* image on aurora and on rented cloud nodes, so cross-provider numbers are
+comparable (`project_brief.md` §3). It bakes the exact `uv` environment on a pinned
+CUDA 12.6 base; torch still comes from the `cu126` wheels, so the base supplies only
+the toolchain and the driver ABI (injected by the NVIDIA Container Toolkit).
+
+One-time host setup (installs the NVIDIA Container Toolkit, wires it into Docker,
+adds you to the `docker` group — needs sudo, so run it yourself):
+
+```bash
+scripts/setup-docker-nvidia.sh   # then log out/in so 'docker' group applies
+```
+
+Then everything goes through one helper:
+
+```bash
+scripts/container.sh build        # (re)build the image
+scripts/container.sh test         # pytest in the container, on GPU
+scripts/container.sh smoke        # torch + GPU visibility check
+scripts/container.sh run torchrun --nproc_per_node=1 -m distrain.train --max-steps 20
+```
+
+`run`/`test`/`shell` bind-mount the working tree at `/workspace` so rsync'd edits are
+live without a rebuild (the venv lives at `/opt/venv`, outside the mount). `--no-mount`
+runs the code baked into the image — the reproducible mode for reported results.
+
 ## Data
 
 Local work runs on synthetic shards, so no download is needed:
@@ -104,8 +133,10 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ## Known gaps
 
-- **NVIDIA Container Toolkit is not installed on aurora**, so `docker run --gpus all`
-  does not work and image parity with the cloud is unproven.
+- **Image parity with the cloud is unproven.** The pinned image builds and its
+  tests pass on aurora (toolkit installed via
+  [`scripts/setup-docker-nvidia.sh`](scripts/setup-docker-nvidia.sh)), but "same
+  image everywhere" stays a claim until the first rented node runs it.
 - **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline script
   first thing on any rented node, alongside `nccl-tests`.
 - **No checkpointing yet**, so no spot-preemption recovery.

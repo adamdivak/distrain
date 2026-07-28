@@ -29,10 +29,18 @@ transfers anywhere.
 
 Docker is **not** used on the Mac — a CUDA image is meaningless on arm64 without
 an NVIDIA GPU. Identical-image reproducibility is a claim about `aurora` and
-cloud only, which is where every reported number comes from. **Docker is not yet
-in use on aurora either**: the NVIDIA Container Toolkit is not installed, so
-`docker run --gpus all` does not work there. Until it is, aurora runs the native
-`uv` venv and image parity with the cloud is unproven.
+cloud only, which is where every reported number comes from.
+
+The image and its tooling now exist: `Dockerfile` bakes the pinned `uv` environment
+on a pinned CUDA 12.6 devel base (torch still from the `cu126` wheels; the base
+supplies the toolchain and, via the toolkit, the driver ABI). `scripts/container.sh`
+is the single build/run/test/shell entry point, and `scripts/setup-docker-nvidia.sh`
+does the one-time, sudo-requiring host setup (install the NVIDIA Container Toolkit,
+`nvidia-ctk runtime configure --runtime=docker`, add the user to `docker`). This has
+now been run on aurora (toolkit 1.19.1): the image builds and its tests pass in the
+container on the GPU. Image parity with the *cloud* stays unproven only until the
+first rented node runs the same image; the native `uv` venv remains the day-to-day
+path on aurora, with the container the reproducibility unit for reported results.
 
 ## 1a. Development workflow
 

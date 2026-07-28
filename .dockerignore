@@ -1,0 +1,30 @@
+# Keep the build context tiny and reproducible. Mirrors .gitignore intent: the
+# image bakes deps from pyproject.toml + uv.lock and its own uv-managed venv, so
+# nothing machine-local should enter the context.
+
+# environments (the image builds its own venv at /opt/venv)
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# data + run outputs (regenerated via scripts/, or bind-mounted at run time)
+data/
+*.bin
+out/
+checkpoints/
+trackio/
+*.log
+
+# vendored clones (verbatim files are copied into reference/ explicitly)
+reference/_clones/
+
+# vcs + os
+.git/
+.gitignore
+.DS_Store
+
+# docker itself
+Dockerfile
+.dockerignore

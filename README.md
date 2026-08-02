@@ -14,8 +14,9 @@ time-to-target-loss, and to quantify where and why the two diverge.
 
 ## Status
 
-Single-device training works end to end on CPU, MPS and CUDA. 79 tests pass on both
-the Mac and aurora.
+Single-device training works end to end on CPU, MPS and CUDA, and multi-rank DDP is
+correct in its naive form. 83 tests pass on the Mac; the multi-rank ones run on gloo/CPU
+so they are exercisable without a GPU.
 
 | Piece | State |
 |---|---|
@@ -24,9 +25,16 @@ the Mac and aurora.
 | FLOPs / MFU / HFU accounting | done, [`mfu.py`](src/distrain/mfu.py) |
 | Single-device loop, trackio logging | done, [`train.py`](src/distrain/train.py) |
 | Pinned Docker image (aurora + cloud parity) | builds + tests pass on aurora, [`Dockerfile`](Dockerfile) |
-| Hand-rolled DDP (3 modes) | **next** |
+| DDP mode 1 — naive per-parameter all-reduce | done, [`distributed_synchronizer.py`](src/distrain/distributed_synchronizer.py) |
+| DDP mode 2 — bucketed all-reduce | **next** |
+| DDP mode 3 — bucketed + backward-hook overlap | not started |
 | Checkpointing (`torch.distributed.checkpoint`) | not started |
 | FSDP2 / TP, DiLoCo, run matrix | not started |
+
+The distributed layer is a single seam in the training loop — `finalize_gradients()`
+between the accumulation loop and gradient clipping — behind which all three modes
+switch at runtime. See [`docs/decisions.md`](docs/decisions.md) §6 for the conventions
+it rests on and §10 for how the multi-rank tests are built.
 
 Measured on aurora (RTX 3090): 124M at seq-1024, batch 8, bf16 + compile →
 **123.9 ms/step, 68.4% MFU**. Correctness only — a consumer card's numbers do not
@@ -140,3 +148,11 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 - **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline script
   first thing on any rented node, alongside `nccl-tests`.
 - **No checkpointing yet**, so no spot-preemption recovery.
+- **DDP has never run on more than one GPU.** Every multi-rank test is gloo/CPU. NCCL,
+  `torchrun`, and `cuda:{local_rank}` device placement are untested end to end — first
+  real exercise is 1 GPU on aurora, then whatever the first rented node has.
+- **Gradient accumulation is untested under DDP.** All distributed tests run
+  `grad_accum_steps=1`, so the path where only the last micro-batch reduces (`no_sync`)
+  does not exist yet and is unexercised.
+- **`evaluate()` runs redundantly on every rank**, each computing the identical full
+  validation pass. Correct, but on rented hardware it is N× the cost for one number.

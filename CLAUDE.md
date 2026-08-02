@@ -41,6 +41,18 @@ than a crash. Each is enforced by a test — do not weaken them to make a test p
 - **Architecture must be identical across configs.** The 3.28 target constrains data
   and tokenizer, not model shape — but a scaling comparison is meaningless if the
   model differs between runs.
+- **Initialization must not depend on world size either.** Seeds are `cfg.seed +
+  cfg.rank` — rank-dependent (so dropout decorrelates across replicas) but *never*
+  scaled by `world_size`, which would make rank 0's stream change when GPU count
+  changes and confound every cross-config comparison. Replica equality comes from
+  the rank-0 broadcast in `DistributedSynchronizer.__init__`, not from seeding.
+- **Gradient averaging is `SUM` then `/ world_size`, in the synchronizer only.**
+  `ReduceOp.AVG` is NCCL-only; gloo lacks it, and gloo is the correctness backend.
+  The accumulation divisor stays in the training loop — two chunkings, two divisors.
+  See `docs/decisions.md` §6.
+- **Collective order must be identical on every rank.** Collectives match by order of
+  invocation, not by tensor name. A rank-dependent sequence deadlocks or silently
+  pairs the wrong tensors. Never make participation conditional on per-rank state.
 
 ## Costs are real
 

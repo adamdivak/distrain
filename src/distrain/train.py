@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 from distrain.data import DataLoader, ShardingPlan, TokenStream
+from distrain.distributed_synchronizer import DistributedSynchronizer
 from distrain.mfu import PeakSpec, counter_for, peak_bf16_spec
 from distrain.model import GPT, GPTConfig
 
@@ -94,7 +95,10 @@ class TrainConfig:
     compile: bool = False
     seed: int = 1337
     world_size: int = 1
-    rank: int = 0
+    rank: int = 0 # rank in the whole training - [0, world_size)
+    local_rank: int = 0 # rank (i.e. GPU) within the current machine - [0, num_gpus_in_current_machine]
+    distributed_mode: str | None = None # ddp or others to be implemented
+    distributed_backend: str = "auto" # auto for torch to suggest based on the host
 
     # logging
     project: str = "distrain"
@@ -105,13 +109,15 @@ class TrainConfig:
     extra: dict = field(default_factory=dict)
 
 
-def resolve_device(requested: str) -> str:
-    if requested != "auto":
-        return requested
+def resolve_device(requested_device: str, local_rank: int | None = None) -> str:
+    if requested_device != "auto":
+        return requested_device
     if torch.cuda.is_available():
-        return "cuda"
+        if local_rank is None:
+            local_rank = 0
+        return f"cuda:{local_rank}"
     if torch.backends.mps.is_available():
-        return "mps"
+        return "mps" # FIXME: can we have multiple mps or cpu devices?
     return "cpu"
 
 
@@ -123,7 +129,7 @@ def resolve_dtype(requested: str, device: str) -> torch.dtype:
     anyway (`project_brief.md` section 8).
     """
     if requested == "auto":
-        return torch.bfloat16 if device == "cuda" else torch.float32
+        return torch.bfloat16 if is_cuda(device) else torch.float32
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[requested]
 
 
@@ -138,9 +144,9 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
     return cfg.min_lr + coeff * (cfg.learning_rate - cfg.min_lr)
 
 
-def synchronize(device: str) -> None:
+def accelerator_synchronize(device: str) -> None:
     """Make host timing reflect device work rather than queue depth."""
-    if device == "cuda":
+    if is_cuda(device):
         torch.cuda.synchronize()
     elif device == "mps":
         torch.mps.synchronize()
@@ -183,19 +189,46 @@ def evaluate(model: GPT, stream: TokenStream, cfg: TrainConfig, device: str,
     model.train()
     return total / counted
 
+def resolve_distributed_backend(requested_distributed_backend: str, device: str) -> str:
+    if requested_distributed_backend == "auto":
+        return torch.distributed.get_default_backend_for_device(device)
+    else:
+        return requested_distributed_backend
 
-def train(cfg: TrainConfig) -> dict:
-    device = resolve_device(cfg.device)
+def setup_distributed(world_size, rank, device, init_method="env://", distributed_backend="auto"):
+    # Choose an available accelerator by default, or use the user-specified one
+    dist_backend = resolve_distributed_backend(distributed_backend, device)
+
+    if is_cuda(device):
+        # Set the correct cuda device. Must be before init_process_group
+        torch.cuda.set_device(device)
+
+    # initialize the process group
+    torch.distributed.init_process_group(dist_backend, rank=rank, world_size=world_size, init_method=init_method)
+    # return dist_backend
+
+def cleanup_distributed():
+    torch.distributed.destroy_process_group()
+
+def is_distributed(cfg: TrainConfig) -> bool:
+    return cfg.world_size > 1
+
+def is_cuda(device: str) -> bool:
+    return "cuda" in device
+
+def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dict:
+    device = resolve_device(cfg.device, cfg.local_rank)
     dtype = resolve_dtype(cfg.dtype, device)
-    torch.manual_seed(cfg.seed)
-    if device == "cuda":
-        torch.cuda.manual_seed(cfg.seed)
+    # Set a rank-specific seed, to avoid all ranks doing e.g. identical data augmentations
+    torch.manual_seed(cfg.seed + cfg.rank)
+    if is_cuda(device):
+        torch.cuda.manual_seed(cfg.seed + cfg.rank)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
     autocast_ctx = (
         torch.autocast(device_type=device, dtype=dtype)
-        if device == "cuda" and dtype != torch.float32
+        if is_cuda(device) and dtype != torch.float32
         else torch.autocast(device_type="cpu", enabled=False)
     )
 
@@ -235,12 +268,15 @@ def train(cfg: TrainConfig) -> dict:
         model = torch.compile(model)
 
     optimizer = model.configure_optimizer(
-        cfg.weight_decay, cfg.learning_rate, cfg.betas, fused=(device == "cuda")
+        cfg.weight_decay, cfg.learning_rate, cfg.betas, fused=(is_cuda(device))
     )
     flops = counter_for(model, cfg.seq_len)
-    peak_spec = peak_bf16_spec(torch.cuda.get_device_name()) if device == "cuda" else None
+    peak_spec = peak_bf16_spec(torch.cuda.get_device_name()) if is_cuda(device) else None
     peak = peak_spec.tflops * 1e12 if peak_spec else None
     tokens_per_step_this_rank = plan.seqs_per_rank * cfg.seq_len
+
+    if is_distributed(cfg):
+        dist_sync = DistributedSynchronizer(model, cfg.distributed_mode, cfg.world_size)
 
     is_primary = cfg.rank == 0
     if cfg.trackio and is_primary:
@@ -263,11 +299,14 @@ def train(cfg: TrainConfig) -> dict:
         for group in optimizer.param_groups:
             group["lr"] = lr
 
-        synchronize(device)
+        accelerator_synchronize(device) # cuda sync, only for timing
         step_start = time.perf_counter()
 
+        # Zero gradients outside the gradient accumulation microbatch-iterations,
+        # so that we can share their combined value at the end
         optimizer.zero_grad(set_to_none=True)
         loss_sum = 0.0
+        
         for accum in range(cfg.grad_accum_steps):
             xb, yb = loader.microbatch(step, accum)
             x, y = to_device(xb, device), to_device(yb, device)
@@ -276,11 +315,17 @@ def train(cfg: TrainConfig) -> dict:
             # average, not sum, so the gradient matches a single large batch
             (loss / cfg.grad_accum_steps).backward()
             loss_sum += loss.item()
+
+        # Synch gradients between ranks, or wait for the communication to finish when using hooks
+        if is_distributed(cfg):
+            dist_sync.finalize_gradients()
+
+        # Do gradient clipping after synching has been finished
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
 
-        synchronize(device)
+        accelerator_synchronize(device) # cuda sync, only for timing
         step_time = time.perf_counter() - step_start
         train_time_s += step_time
 
@@ -326,6 +371,13 @@ def train(cfg: TrainConfig) -> dict:
         import trackio
 
         trackio.finish()
+
+    if return_debug_values:
+        # FIXME remove once checkpoints are implemented, update the distributed
+        # test using this
+        if "model" in return_debug_values:
+            results["model"] = model
+
     return results
 
 
@@ -358,8 +410,15 @@ def main() -> None:
     # torchrun sets these; harmless when absent
     cfg.world_size = int(os.environ.get("WORLD_SIZE", cfg.world_size))
     cfg.rank = int(os.environ.get("RANK", cfg.rank))
-    results = train(cfg)
-    print(results)
+    cfg.local_rank = int(os.environ.get("LOCAL_RANK", cfg.local_rank))
+    try:
+        if is_distributed(cfg):
+            setup_distributed(cfg.world_size, cfg.rank, resolve_device(cfg.device))
+        results = train(cfg)
+        print(results)
+    finally:
+        if is_distributed(cfg):
+            cleanup_distributed()
 
 
 if __name__ == "__main__":

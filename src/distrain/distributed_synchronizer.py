@@ -5,10 +5,18 @@ from torch import nn
 
 
 class DistributedSynchronizer:
-    def __init__(self, model: nn.Module, mode: str | None, world_size: int):
+    def __init__(self, model: nn.Module, mode: str | None, world_size: int,
+                 bucket_size: int | None = None):
         self.model = model
         self.world_size = world_size
         self.mode = mode
+
+        if self.mode == "ddp_bucketed":
+            if bucket_size is None:
+                raise ValueError("ddp_bucketed requires a bucket_size (bytes)")
+            self.buckets = []
+            self.bucket_size = bucket_size
+            self._build_buckets()
 
         # using torch.no_grad to avoid
         # "an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it"
@@ -24,10 +32,46 @@ class DistributedSynchronizer:
             for buffer in self.model.buffers():
                 dist.broadcast(buffer, src=0)
 
+    def _build_buckets(self):
+        """Group parameters into all-reduce buckets, in reverse registration order.
+
+        `model.parameters()` delegates to `named_parameters(remove_duplicate=True)`,
+        so the tied `wte`/`lm_head` tensor is yielded once and lands in exactly one
+        bucket -- the same deduplication the naive path gets, obtained here rather
+        than at reduce time.
+
+        A parameter larger than `bucket_size` cannot be split, so it gets a bucket to
+        itself. At 124M that is `wte` (154 MB, ~31% of all gradient bytes) sitting
+        alone in the *last* bucket, which is worth remembering when mode 3 arrives:
+        it is also the last gradient backward produces, so there is no compute left
+        to overlap it against.
+
+        Buckets are not keyed by dtype or device, which is fine only while every
+        parameter is fp32 on one device -- `_flatten_dense_tensors` concatenates, so
+        a mixed bucket would break the moment that stops being true.
+        """
+        current_bucket = []
+        current_size = 0
+
+        # Iterate over the parameters backwards (will be important when attaching hooks)
+        for param in list(self.model.parameters())[::-1]:
+            size = param.numel() * param.element_size()
+
+            if current_bucket and current_size + size > self.bucket_size:
+                self.buckets.append(current_bucket)
+                current_bucket = []
+                current_size = 0
+
+            current_bucket.append(param)
+            current_size += size
+
+        if current_bucket:
+            self.buckets.append(current_bucket)
+
     def finalize_gradients(self):
         # Called after gradients are calculated in each rank. Either does the actual gradient
         # syncing, or waits for the gradients to be synched when using hooks
-        if self.mode == "ddp":
+        if self.mode == "ddp_naive":
             # Iterating over named_parameters also performs deduplication of tied tensors
             # to avoid unnecessary transfer costs
             for _, param in self.model.named_parameters(remove_duplicate=True):
@@ -39,9 +83,34 @@ class DistributedSynchronizer:
                     param.grad = torch.zeros_like(param)
                 dist.all_reduce(param.grad, dist.ReduceOp.SUM)
                 # dist.ReduceOp.AVG is not implemented for gloo, so we manually average
-                # FIXME Assumes identical token count on each rank, we may need to
-                # rethink this later?
+                # Note: Assumes identical token count on each rank, currently provided by the data loader
                 param.grad /= self.world_size
+        elif self.mode == "ddp_bucketed":
+            # Bucket membership and order were fixed in the constructor, so every rank
+            # reduces the same tensors in the same sequence. Tied parameters were
+            # already deduplicated there, by `_build_buckets`
+            for bucket in self.buckets:
+                # Same rule as the naive path: a missing gradient means the parameter
+                # was absent from the autograd graph, so its true contribution to the
+                # global mean is zero. Materialise it *on the parameter*, not just in
+                # a local list, or the copy-back below has nothing to write into
+                for param in bucket:
+                    if param.grad is None:
+                        param.grad = torch.zeros_like(param)
+
+                grads = [param.grad for param in bucket]
+                flat_grads = torch._utils._flatten_dense_tensors(grads)
+                dist.all_reduce(flat_grads, dist.ReduceOp.SUM)
+                # dist.ReduceOp.AVG is not implemented for gloo, so we manually average.
+                # In place on the flat buffer: dividing per parameter instead would
+                # allocate a second full set of gradients every step, which is exactly
+                # the overhead bucketing exists to remove
+                # Note: Assumes identical token count on each rank, currently provided by the data loader
+                flat_grads /= self.world_size
+
+                unflat_grads = torch._utils._unflatten_dense_tensors(flat_grads, grads)
+                for grad, reduced in zip(grads, unflat_grads):
+                    grad.copy_(reduced)
         else:
             raise NotImplementedError()
 

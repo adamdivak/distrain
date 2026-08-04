@@ -101,7 +101,8 @@ def calc_backward_save_grad(rank, cfg: TrainConfig, tmp_path):
         # )
         
         if is_distributed(cfg):
-            dist_sync = DistributedSynchronizer(model, cfg.distributed_mode, cfg.world_size)
+            dist_sync = DistributedSynchronizer(
+                model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
 
         # Make exactly two steps, as there might be some state in some communication
         # patterns, so we want to test that the second one works as well
@@ -157,7 +158,8 @@ def init_model_save_params(rank, cfg: TrainConfig, tmp_path):
 
         if is_distributed(cfg):
             # The constructor makes sure all ranks have the same model
-            DistributedSynchronizer(model, cfg.distributed_mode, cfg.world_size)
+            DistributedSynchronizer(
+                model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
 
         # Save parameters
         model_params_fn = get_tmp_model_params_fn(cfg)
@@ -185,7 +187,8 @@ def broadcast_scalar_save_result(rank, cfg: TrainConfig, tmp_path):
                 bias=cfg.bias,
             )
         )
-        dist_sync = DistributedSynchronizer(model, cfg.distributed_mode, cfg.world_size)
+        dist_sync = DistributedSynchronizer(
+            model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
 
         # Stand in for the val loss: only rank 0 has the real one, every other rank
         # holds a different placeholder, so a broadcast that does nothing is visible
@@ -217,10 +220,11 @@ def train_save_params(rank, cfg: TrainConfig, tmp_path):
     finally:
         cleanup_distributed()
 
+@pytest.mark.parametrize("distributed_mode", ["ddp_naive", "ddp_bucketed"])
 class TestInitialization:
-    def test_distributed_has_same_params_after_init(self, tiny_data, tmp_path):
+    def test_distributed_has_same_params_after_init(self, tiny_data, tmp_path, distributed_mode):
         cfg_ws1 = tiny_train_config(tiny_data, max_steps=0)
-        cfg_ws2 = tiny_train_config(tiny_data, max_steps=0, world_size=2, distributed_mode = "ddp")
+        cfg_ws2 = tiny_train_config(tiny_data, max_steps=0, world_size=2, distributed_mode = distributed_mode)
         spawn_mp(cfg_ws1, init_model_save_params, tmp_path)
         spawn_mp(cfg_ws2, init_model_save_params, tmp_path)
         
@@ -235,8 +239,8 @@ class TestInitialization:
             torch.testing.assert_close(model_params_ws1[key], model_params_ws2[key],
                                         msg=lambda input_msg, key=key: f"Mismatch in values of {key}. \n" + input_msg)
 
-    def test_all_ranks_have_same_params_after_init(self, tiny_data, tmp_path):
-        cfg_ws2_r0 = tiny_train_config(tiny_data, max_steps=0, world_size=2, distributed_mode = "ddp")
+    def test_all_ranks_have_same_params_after_init(self, tiny_data, tmp_path, distributed_mode):
+        cfg_ws2_r0 = tiny_train_config(tiny_data, max_steps=0, world_size=2, distributed_mode = distributed_mode)
         spawn_mp(cfg_ws2_r0, init_model_save_params, tmp_path)
 
         cfg_ws2_r1 = dataclasses.replace(cfg_ws2_r0, rank=1)
@@ -253,10 +257,11 @@ class TestInitialization:
                                         msg=lambda input_msg, key=key: f"Mismatch in values of {key}. \n" + input_msg)
 
 
+@pytest.mark.parametrize("distributed_mode", ["ddp_naive", "ddp_bucketed"])
 class TestGradients:
-    def test_gradient_is_equal_for_larger_world_size(self, tiny_data, tmp_path):
+    def test_gradient_is_equal_for_larger_world_size(self, tiny_data, tmp_path, distributed_mode):
         cfg_ws1 = tiny_train_config(tiny_data)
-        cfg_ws2_r0 = tiny_train_config(tiny_data, world_size=2, distributed_mode = "ddp")
+        cfg_ws2_r0 = tiny_train_config(tiny_data, world_size=2, distributed_mode = distributed_mode)
         spawn_mp(cfg_ws1, calc_backward_save_grad, tmp_path)
         spawn_mp(cfg_ws2_r0, calc_backward_save_grad, tmp_path)
         
@@ -287,6 +292,7 @@ class TestGradients:
                                         msg=lambda input_msg, key=key: f"Mismatch in values of {key}. \n" + input_msg)
 
 
+@pytest.mark.parametrize("distributed_mode", ["ddp_naive", "ddp_bucketed"])
 class TestScalarBroadcast:
     """Only rank 0 evaluates, so every other rank's val loss arrives by broadcast.
 
@@ -296,8 +302,8 @@ class TestScalarBroadcast:
     than as a crash.
     """
 
-    def test_all_ranks_get_rank_0_value(self, tiny_data, tmp_path):
-        cfg = tiny_train_config(tiny_data, world_size=2, distributed_mode="ddp")
+    def test_all_ranks_get_rank_0_value(self, tiny_data, tmp_path, distributed_mode):
+        cfg = tiny_train_config(tiny_data, world_size=2, distributed_mode = distributed_mode)
         spawn_mp(cfg, broadcast_scalar_save_result, tmp_path)
 
         results = [torch.load(tmp_path / f"broadcast_rank_{rank}.pt")
@@ -308,7 +314,7 @@ class TestScalarBroadcast:
         assert results[0] == results[1]
         assert results[0] == torch.tensor([3.14159], dtype=torch.float32).item()
 
-    def test_tensor_is_allocated_on_the_model_device(self, tiny_data):
+    def test_tensor_is_allocated_on_the_model_device(self, tiny_data, distributed_mode):
         """NCCL cannot broadcast a CPU tensor, and no gloo test would ever notice.
 
         Skips where the only device is the CPU, because there the assertion holds
@@ -319,7 +325,7 @@ class TestScalarBroadcast:
         if device is None:
             pytest.skip("no non-CPU device; the assertion would be vacuous")
 
-        cfg = tiny_train_config(tiny_data, world_size=2, distributed_mode="ddp")
+        cfg = tiny_train_config(tiny_data, world_size=2, distributed_mode = distributed_mode)
         model = GPT(
             GPTConfig(
                 block_size=cfg.seq_len,
@@ -339,16 +345,18 @@ class TestScalarBroadcast:
             broadcast_devices.append(tensor.device)
 
         with mock.patch("torch.distributed.broadcast", side_effect=record):
-            dist_sync = DistributedSynchronizer(model, cfg.distributed_mode, cfg.world_size)
+            dist_sync = DistributedSynchronizer(
+                model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
             dist_sync.broadcast_scalar(3.14159)
 
         assert broadcast_devices[-1] == next(model.parameters()).device
 
 
+@pytest.mark.parametrize("distributed_mode", ["ddp_naive", "ddp_bucketed"])
 class TestEndToEnd:
-    def test_params_equal_for_larger_world_size(self, tiny_data, tmp_path):
+    def test_params_equal_for_larger_world_size(self, tiny_data, tmp_path, distributed_mode):
         cfg_ws1 = tiny_train_config(tiny_data)
-        cfg_ws2 = tiny_train_config(tiny_data, world_size=2, distributed_mode = "ddp")
+        cfg_ws2 = tiny_train_config(tiny_data, world_size=2, distributed_mode = distributed_mode)
         spawn_mp(cfg_ws1, train_save_params, tmp_path)
         spawn_mp(cfg_ws2, train_save_params, tmp_path)
         
@@ -363,9 +371,9 @@ class TestEndToEnd:
             torch.testing.assert_close(model_params_ws1[key], model_params_ws2[key],
                                        msg=lambda input_msg, key=key: f"Mismatch in values of {key}. \n" + input_msg)
 
-    def test_params_equal_for_larger_world_size_with_grad_accum(self, tiny_data, tmp_path):
+    def test_params_equal_for_larger_world_size_with_grad_accum(self, tiny_data, tmp_path, distributed_mode):
         cfg_ws1 = tiny_train_config(tiny_data, grad_accum_steps=4)
-        cfg_ws2 = tiny_train_config(tiny_data, grad_accum_steps=2, world_size=2, distributed_mode = "ddp")
+        cfg_ws2 = tiny_train_config(tiny_data, grad_accum_steps=2, world_size=2, distributed_mode = distributed_mode)
         spawn_mp(cfg_ws1, train_save_params, tmp_path)
         spawn_mp(cfg_ws2, train_save_params, tmp_path)
         

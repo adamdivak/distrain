@@ -26,6 +26,7 @@ def tiny_train_config(tiny_data, **overrides):
         "device": "cpu",
         "trackio": False,
         "log_every": 100,
+        "ddp_bucket_size": 25000, # bytes
     }
     cfg.update(overrides)
     return TrainConfig(**cfg)

@@ -100,11 +100,14 @@ class TrainConfig:
     dtype: str = "auto"
     compile: bool = False
     seed: int = 1337
+
+    # distributed
     world_size: int = 1
     rank: int = 0 # rank in the whole training - [0, world_size)
     local_rank: int = 0 # rank (i.e. GPU) within the current machine - [0, num_gpus_in_current_machine]
-    distributed_mode: str | None = None # ddp or others to be implemented
+    distributed_mode: str | None = None # ddp_naive, ddp_bucketed or others to be implemented
     distributed_backend: str = "auto" # auto for torch to suggest based on the host
+    ddp_bucket_size: int | None = 25 * 1024 * 1024 # bucket size in bytes when using bucketed ddp
 
     # logging
     project: str = "distrain"
@@ -290,7 +293,8 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
     tokens_per_step_this_rank = plan.seqs_per_rank * cfg.seq_len
 
     if is_distributed(cfg):
-        dist_sync = DistributedSynchronizer(model, cfg.distributed_mode, cfg.world_size)
+        dist_sync = DistributedSynchronizer(
+            model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
 
     is_primary = cfg.rank == 0
     if cfg.trackio and is_primary:

@@ -44,3 +44,40 @@ class DistributedSynchronizer:
                 param.grad /= self.world_size
         else:
             raise NotImplementedError()
+
+    def broadcast_scalar(self, value: float, src: int = 0) -> float:
+        """Give every rank `src`'s value of a Python scalar.
+
+        Used for the validation loss, which only rank 0 computes. Every rank must
+        come back with the *identical* float, because each one independently tests it
+        against the target loss -- if src kept its own value and the others took the
+        broadcast one, the two could differ in the last bits and ranks could disagree
+        about which step first crossed 3.28. So src reads its result back out of the
+        tensor too, rather than returning what it passed in.
+
+        The tensor is allocated on the model's device on purpose: NCCL cannot
+        broadcast a CPU tensor, and no test in this repo can catch that, since every
+        multi-rank test runs on gloo (which accepts both). Taking the device from a
+        parameter means it cannot drift from where the model actually lives.
+        """
+        device = next(self.model.parameters()).device
+        tensor = torch.tensor([value], dtype=torch.float32, device=device)
+        dist.broadcast(tensor, src=src)
+        return tensor.item()
+
+    def wait_for_all_ranks(self) -> None:
+        """Block until every rank has finished all of its collectives.
+
+        Called once at the end of training, before any rank can tear its process
+        group down. Without it, ranks leave the last collective at slightly different
+        times -- and since only rank 0 evaluates, the others leave the final val
+        broadcast first, destroy the process group and exit while rank 0 is still
+        completing its side of that same broadcast. Rank 0's peer connection then
+        drops mid-teardown and gloo aborts the process (SIGABRT, "terminate called
+        without an active exception") after training has otherwise succeeded.
+
+        Deliberately at the end of a *successful* run rather than inside
+        `cleanup_distributed`: on the error path the surviving ranks would block here
+        until the gloo timeout, turning one rank's crash into a hang.
+        """
+        dist.barrier()

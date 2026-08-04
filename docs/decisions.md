@@ -129,6 +129,22 @@ is on the same order as the DDP-vs-DiLoCo effect being measured:
 - **No smoothing** applied to the val curve.
 - Eval batch, val split and eval determinism identical across every config.
 
+**The eval batch is its own config field** (`eval_batch_seqs`), not derived from
+`global_batch_seqs // grad_accum_steps` as it was originally. Two reasons, and the
+second is the one that would have bitten:
+
+- Nothing in that formula names `world_size`, but the way configs are *swept* couples
+  them anyway: strong scaling holds the global batch fixed and cuts `grad_accum_steps`
+  as ranks are added, so the eval batch moved as a side effect of a knob turned for
+  training reasons. The numerical effect is tiny (same sequences, same order, only the
+  reduction order differs), but "identical across every config" should be true by
+  construction, not by coincidence.
+- Eval never shards — it is one rank's full pass over the val split. So the derived
+  batch was the *whole* global step batch while each rank's training microbatch shrank
+  with world size: at `global=480, accum=1`, training goes 480 → 60 sequences per GPU
+  from 1 rank to 8 while eval stays at 480. Validation becomes the memory high-water
+  mark of the run and never shrinks, so a config that trains fine OOMs in eval.
+
 ## 5. Seed variance
 
 Single runs per config give no error bar, and time-to-target-loss run-to-run
@@ -210,6 +226,25 @@ every rank, all ranks compute the same norm.
   no node is created. Preferred over `.data`, which also works but additionally bypasses
   the version-counter safety net. The `all_reduce` in `finalize_gradients` needs no such
   guard: `.grad` does not require grad.
+- **Rank 0 evaluates, the loss is broadcast, and the broadcast tensor lives on the
+  model's device.** Every rank running the identical full val pass is N× the cost for
+  one number. `evaluate()` stays free of collectives so the call site alone determines
+  rank-invariance; the broadcast lives in the synchronizer, which owns the process
+  group. Rank 0 takes its own value back out of the tensor rather than keeping the one
+  it put in, so all ranks compare a bit-identical float against 3.28 — otherwise ranks
+  could disagree about which step first crossed, and that disagreement surfaces as an
+  inconsistent result rather than a crash. The tensor is allocated on the model's
+  device because **NCCL cannot broadcast a CPU tensor** and no test here can catch
+  that: every multi-rank test is gloo, which accepts both.
+- **Training ends with an explicit barrier before any rank tears down.** Once only
+  rank 0 evaluates, the other ranks leave the final val broadcast first, destroy the
+  process group and exit the process while rank 0 is still completing its side of that
+  same collective. Rank 0's peer connection drops mid-teardown and gloo aborts it —
+  SIGABRT, `terminate called without an active exception`, with no Python frame, after
+  training has otherwise fully succeeded and printed its results. It reproduced in
+  4 of 8 runs and vanished in 10 of 10 with the barrier. It belongs at the end of a
+  *successful* run, not in `cleanup_distributed`: on the error path the surviving
+  ranks would block there until the gloo timeout, turning one rank's crash into a hang.
 - **Tied weights are reduced once.** `wte.weight` and `lm_head.weight` are the same
   tensor; `named_parameters(remove_duplicate=True)` (the default) yields it once. Untying
   is a `GPTConfig` change, applied to every config in a study or none — untying *mid-run*
@@ -283,6 +318,22 @@ and 2 steps in the gradient worker — enough to catch state that survives acros
 diverge before the broadcast, so `test_all_ranks_have_same_params_after_init` fails if
 the broadcast is removed. Identical seeds would make that test pass whether or not the
 broadcast exists — vacuous, and it would look like coverage.
+
+**NCCL cannot be exercised on aurora at all.** Two ranks cannot share one GPU — NCCL
+rejects a communicator with a duplicate device (`ncclInvalidUsage`) and there is no
+flag around it; MPS does not help, being a scheduling layer rather than a device
+multiplexer. The most that runs locally is
+
+```bash
+torchrun --nproc_per_node=2 -m distrain.train --device cuda:0 --distributed-backend gloo
+```
+
+which covers `torchrun`'s env plumbing, `cuda:{local_rank}` resolution and collectives
+on CUDA tensors (gloo stages them through host memory) — everything except NCCL. Two
+consequences: a 2-process NCCL job is the first thing to run on the first rented node,
+before anything with a clock on it; and NCCL-only failures such as a CPU-tensor
+collective cannot be caught by any local test, so they have to be designed out rather
+than tested out.
 
 **These tests only work because `dropout == 0`.** With dropout on, no seeding scheme
 makes world sizes 1 and 2 bitwise comparable: one batch of 8 and two batches of 4 draw

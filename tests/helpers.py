@@ -19,6 +19,10 @@ def tiny_train_config(tiny_data, **overrides):
         "min_lr": 3e-4,
         "val_every": 15,
         "val_tokens": 3200,
+        # set explicitly rather than inherited: the eval batch must be identical across
+        # every config being compared, so a test comparing two configs should not let it
+        # come from a default that a future edit could couple to the training batch again
+        "eval_batch_seqs": 8,
         "device": "cpu",
         "trackio": False,
         "log_every": 100,

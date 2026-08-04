@@ -15,8 +15,11 @@ time-to-target-loss, and to quantify where and why the two diverge.
 ## Status
 
 Single-device training works end to end on CPU, MPS and CUDA, and multi-rank DDP is
-correct in its naive form. 83 tests pass on the Mac; the multi-rank ones run on gloo/CPU
-so they are exercisable without a GPU.
+correct in its naive form, including under gradient accumulation. 86 tests pass; the
+multi-rank ones run on gloo/CPU so they are exercisable without a GPU.
+
+Validation runs on rank 0 only and the loss is broadcast, so every rank tests the same
+value against the 3.28 target without N ranks paying for the same number.
 
 | Piece | State |
 |---|---|
@@ -148,11 +151,10 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 - **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline script
   first thing on any rented node, alongside `nccl-tests`.
 - **No checkpointing yet**, so no spot-preemption recovery.
-- **DDP has never run on more than one GPU.** Every multi-rank test is gloo/CPU. NCCL,
-  `torchrun`, and `cuda:{local_rank}` device placement are untested end to end — first
-  real exercise is 1 GPU on aurora, then whatever the first rented node has.
-- **Gradient accumulation is untested under DDP.** All distributed tests run
-  `grad_accum_steps=1`, so the path where only the last micro-batch reduces (`no_sync`)
-  does not exist yet and is unexercised.
-- **`evaluate()` runs redundantly on every rank**, each computing the identical full
-  validation pass. Correct, but on rented hardware it is N× the cost for one number.
+- **NCCL is untestable on aurora and stays unproven until the first rented node.**
+  Two ranks cannot share one GPU: NCCL rejects it outright (`ncclInvalidUsage`,
+  duplicate GPU in the communicator), and there is no flag around it. What *does* run
+  locally is `torchrun --nproc_per_node=2 --device cuda:0 --distributed-backend gloo`,
+  which exercises `torchrun`, `cuda:{local_rank}` placement and collectives on CUDA
+  tensors — everything except NCCL itself. So a 2-process NCCL job belongs at the very
+  top of the first cloud session, before anything with a clock on it.

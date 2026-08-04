@@ -88,6 +88,12 @@ class TrainConfig:
     # reference/PROVENANCE.md
     val_tokens: int = 10_485_760
     target_val_loss: float = 3.28
+    # sequences per eval forward pass. Deliberately independent of global_batch_seqs,
+    # grad_accum_steps and world_size: decisions.md section 4 requires the eval batch to be
+    # identical across every config, and deriving it from the training batch would
+    # both break that and make eval -- which never shards -- the memory high-water
+    # mark of a multi-GPU run, since it would not shrink as ranks are added.
+    eval_batch_seqs: int = 32
 
     # runtime
     device: str = "auto"
@@ -164,11 +170,19 @@ def evaluate(model: GPT, stream: TokenStream, cfg: TrainConfig, device: str,
     """Mean cross-entropy over the first `val_tokens` tokens of the val stream.
 
     Deterministic and identical across configs: the same sequences in the same order,
-    every time. That is what makes the 3.28 crossing comparable between runs.
+    in batches of `cfg.eval_batch_seqs`, every time. That is what makes the 3.28
+    crossing comparable between runs.
+
+    Never sharded -- this is one rank's full pass over the val split. Under DDP the
+    caller runs it on rank 0 only and broadcasts the scalar, so every rank tests the
+    same value against the target.
+
+    Pure by design: no collectives here, so the call site alone determines
+    rank-invariance and the function stays directly callable from tests.
     """
     plan = ShardingPlan(
         seq_len=cfg.seq_len,
-        global_batch_seqs=cfg.global_batch_seqs // cfg.grad_accum_steps,
+        global_batch_seqs=cfg.eval_batch_seqs,
         world_size=1,
         rank=0,
     )
@@ -352,7 +366,14 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
 
         is_last = step == cfg.max_steps - 1
         if cfg.val_every > 0 and (step % cfg.val_every == 0 or is_last):
-            val_loss = evaluate(model, val_stream, cfg, device, autocast_ctx)
+            # Only rank 0 evaluates - every rank computing the identical full val pass
+            # is N x the cost for one number. The broadcast is unconditional within this
+            # branch, whose condition depends only on the step, so collective order stays
+            # rank-invariant (decisions.md section 6).
+            val_loss = evaluate(model, val_stream, cfg, device, autocast_ctx) if is_primary else 0.0
+            if is_distributed(cfg):
+                val_loss = dist_sync.broadcast_scalar(val_loss)
+
             if is_primary:
                 _log(cfg, {"val/loss": val_loss}, step)
                 print(f"step {step:5d} | val_loss {val_loss:.4f} | "
@@ -364,6 +385,12 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
                 if is_primary:
                     print(f"reached target {cfg.target_val_loss} at step {step} "
                           f"after {train_time_s:.1f}s of training")
+
+    # No rank may start tearing down while another is still in a collective; see
+    # DistributedSynchronizer.wait_for_all_ranks. Outside the timed region: this is
+    # teardown, not training work.
+    if is_distributed(cfg):
+        dist_sync.wait_for_all_ranks()
 
     results["train_time_s"] = train_time_s
     results["wall_time_s"] = time.perf_counter() - wall_start
@@ -413,7 +440,8 @@ def main() -> None:
     cfg.local_rank = int(os.environ.get("LOCAL_RANK", cfg.local_rank))
     try:
         if is_distributed(cfg):
-            setup_distributed(cfg.world_size, cfg.rank, resolve_device(cfg.device))
+            setup_distributed(cfg.world_size, cfg.rank, resolve_device(cfg.device, cfg.local_rank),
+                              distributed_backend=cfg.distributed_backend)
         results = train(cfg)
         print(results)
     finally:

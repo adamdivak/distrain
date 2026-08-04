@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import glob
+import os
 from collections import OrderedDict
+from unittest import mock
 
+import pytest
 import torch
 
 from distrain.data import DataLoader, ShardingPlan, TokenStream
@@ -23,6 +26,13 @@ from distrain.train import (
 from helpers import tiny_train_config
 
 
+def _device_available(device: str) -> bool:
+    if device == "cuda":
+        return torch.cuda.is_available()
+    if device == "mps":
+        return torch.backends.mps.is_available()
+    return device == "cpu"
+
 def get_tmp_gradient_fn(cfg):
     gradient_fn = f"grads_world_size_{cfg.world_size}_rank_{cfg.rank}_model.pt"
     return gradient_fn
@@ -39,13 +49,14 @@ def spawn_mp(cfg: TrainConfig, fn, tmp_path):
 def calc_backward_save_grad(rank, cfg: TrainConfig, tmp_path):
     try:
         cfg.rank = rank # update rank that we got from spawn
+        cfg.local_rank = int(os.environ.get("LOCAL_RANK", cfg.local_rank))
 
         setup_distributed(cfg.world_size, cfg.rank, 
                           # different rendezvous file for each world size, as we'll be running
                           # multiple of these from the same unit test, where the tmp_path is identical,
                           # and we want to avoid them having conflicts
                           init_method=f"file://{tmp_path}/rendezvous_world_size{cfg.world_size}",
-                          device=resolve_device(cfg.device))
+                          device=resolve_device(cfg.device, cfg.local_rank))
 
         device = resolve_device(cfg.device, cfg.local_rank)
         torch.manual_seed(cfg.seed + cfg.rank)
@@ -121,6 +132,7 @@ def calc_backward_save_grad(rank, cfg: TrainConfig, tmp_path):
 def init_model_save_params(rank, cfg: TrainConfig, tmp_path):
     try:
         cfg.rank = rank # update rank that we got from spawn
+        cfg.local_rank = int(os.environ.get("LOCAL_RANK", cfg.local_rank))
 
         setup_distributed(cfg.world_size, cfg.rank, 
                           # different rendezvous file for each world size, as we'll be running
@@ -153,16 +165,48 @@ def init_model_save_params(rank, cfg: TrainConfig, tmp_path):
     finally:
         cleanup_distributed()
 
+def broadcast_scalar_save_result(rank, cfg: TrainConfig, tmp_path):
+    try:
+        cfg.rank = rank # update rank that we got from spawn
+        cfg.local_rank = int(os.environ.get("LOCAL_RANK", cfg.local_rank))
+
+        setup_distributed(cfg.world_size, cfg.rank,
+                          init_method=f"file://{tmp_path}/rendezvous_world_size{cfg.world_size}",
+                          device=resolve_device(cfg.device, cfg.local_rank))
+
+        model = GPT(
+            GPTConfig(
+                block_size=cfg.seq_len,
+                vocab_size=cfg.vocab_size,
+                n_layer=cfg.n_layer,
+                n_head=cfg.n_head,
+                n_embd=cfg.n_embd,
+                dropout=cfg.dropout,
+                bias=cfg.bias,
+            )
+        )
+        dist_sync = DistributedSynchronizer(model, cfg.distributed_mode, cfg.world_size)
+
+        # Stand in for the val loss: only rank 0 has the real one, every other rank
+        # holds a different placeholder, so a broadcast that does nothing is visible
+        local_value = 3.14159 if cfg.rank == 0 else float(cfg.rank)
+        result = dist_sync.broadcast_scalar(local_value)
+
+        torch.save(result, (tmp_path / f"broadcast_rank_{cfg.rank}.pt"))
+    finally:
+        cleanup_distributed()
+
 def train_save_params(rank, cfg: TrainConfig, tmp_path):
     try:
         cfg.rank = rank # update rank that we got from spaw
+        cfg.local_rank = int(os.environ.get("LOCAL_RANK", cfg.local_rank))
 
         setup_distributed(cfg.world_size, cfg.rank,
                           # different rendezvous file for each world size, as we'll be running
                             # multiple of these from the same unit test, where the tmp_path is identical,
                             # and we want to avoid them having conflicts
                             init_method=f"file://{tmp_path}/rendezvous_world_size{cfg.world_size}",
-                            device=resolve_device(cfg.device))
+                            device=resolve_device(cfg.device, cfg.local_rank))
 
         # FIXME read model from checkpoints instead
         results = train(cfg, return_debug_values=["model"])
@@ -242,10 +286,70 @@ class TestGradients:
             torch.testing.assert_close(gradient_ws2_r0[key], gradient_ws2_r1[key],
                                         msg=lambda input_msg, key=key: f"Mismatch in values of {key}. \n" + input_msg)
 
+
+class TestScalarBroadcast:
+    """Only rank 0 evaluates, so every other rank's val loss arrives by broadcast.
+
+    Each rank independently compares that value against the target loss, so anything
+    less than bit-identical agreement could make ranks disagree about which step first
+    crossed 3.28 -- a disagreement that would surface as an inconsistent result rather
+    than as a crash.
+    """
+
+    def test_all_ranks_get_rank_0_value(self, tiny_data, tmp_path):
+        cfg = tiny_train_config(tiny_data, world_size=2, distributed_mode="ddp")
+        spawn_mp(cfg, broadcast_scalar_save_result, tmp_path)
+
+        results = [torch.load(tmp_path / f"broadcast_rank_{rank}.pt")
+                   for rank in range(cfg.world_size)]
+
+        # exact equality, not assert_close: ranks must agree bit for bit, and rank 0
+        # must return what it read back out of the tensor rather than what it put in
+        assert results[0] == results[1]
+        assert results[0] == torch.tensor([3.14159], dtype=torch.float32).item()
+
+    def test_tensor_is_allocated_on_the_model_device(self, tiny_data):
+        """NCCL cannot broadcast a CPU tensor, and no gloo test would ever notice.
+
+        Skips where the only device is the CPU, because there the assertion holds
+        whether or not the code asks for the model's device -- and a test that cannot
+        fail is worse than no test.
+        """
+        device = next((d for d in ("cuda", "mps") if _device_available(d)), None)
+        if device is None:
+            pytest.skip("no non-CPU device; the assertion would be vacuous")
+
+        cfg = tiny_train_config(tiny_data, world_size=2, distributed_mode="ddp")
+        model = GPT(
+            GPTConfig(
+                block_size=cfg.seq_len,
+                vocab_size=cfg.vocab_size,
+                n_layer=cfg.n_layer,
+                n_head=cfg.n_head,
+                n_embd=cfg.n_embd,
+                dropout=cfg.dropout,
+                bias=cfg.bias,
+            )
+        ).to(device)
+
+        # patching broadcast stands in for a process group: this test is about which
+        # device the tensor is built on, which is decided before any collective runs
+        broadcast_devices = []
+        def record(tensor, src=0):
+            broadcast_devices.append(tensor.device)
+
+        with mock.patch("torch.distributed.broadcast", side_effect=record):
+            dist_sync = DistributedSynchronizer(model, cfg.distributed_mode, cfg.world_size)
+            dist_sync.broadcast_scalar(3.14159)
+
+        assert broadcast_devices[-1] == next(model.parameters()).device
+
+
+class TestEndToEnd:
     def test_params_equal_for_larger_world_size(self, tiny_data, tmp_path):
         cfg_ws1 = tiny_train_config(tiny_data)
         cfg_ws2 = tiny_train_config(tiny_data, world_size=2, distributed_mode = "ddp")
-        spawn_mp(cfg_ws1, train_save_params,  tmp_path)
+        spawn_mp(cfg_ws1, train_save_params, tmp_path)
         spawn_mp(cfg_ws2, train_save_params, tmp_path)
         
         model_params_fn_ws1 = get_tmp_model_params_fn(cfg_ws1)
@@ -258,3 +362,20 @@ class TestGradients:
         for key in model_params_ws1:
             torch.testing.assert_close(model_params_ws1[key], model_params_ws2[key],
                                        msg=lambda input_msg, key=key: f"Mismatch in values of {key}. \n" + input_msg)
+
+    def test_params_equal_for_larger_world_size_with_grad_accum(self, tiny_data, tmp_path):
+        cfg_ws1 = tiny_train_config(tiny_data, grad_accum_steps=4)
+        cfg_ws2 = tiny_train_config(tiny_data, grad_accum_steps=2, world_size=2, distributed_mode = "ddp")
+        spawn_mp(cfg_ws1, train_save_params, tmp_path)
+        spawn_mp(cfg_ws2, train_save_params, tmp_path)
+        
+        model_params_fn_ws1 = get_tmp_model_params_fn(cfg_ws1)
+        model_params_ws1 = torch.load(tmp_path / model_params_fn_ws1)
+
+        model_params_fn_ws2 = get_tmp_model_params_fn(cfg_ws2)
+        model_params_ws2 = torch.load(tmp_path / model_params_fn_ws2)
+
+        assert model_params_ws1.keys() == model_params_ws2.keys()
+        for key in model_params_ws1:
+            torch.testing.assert_close(model_params_ws1[key], model_params_ws2[key],
+                                        msg=lambda input_msg, key=key: f"Mismatch in values of {key}. \n" + input_msg)

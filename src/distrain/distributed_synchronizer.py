@@ -11,12 +11,23 @@ class DistributedSynchronizer:
         self.world_size = world_size
         self.mode = mode
 
-        if self.mode == "ddp_bucketed":
+        if self.mode in ["ddp_bucketed", "ddp_interleaved"]:
             if bucket_size is None:
                 raise ValueError("ddp_bucketed requires a bucket_size (bytes)")
             self.buckets = []
             self.bucket_size = bucket_size
             self._build_buckets()
+
+        if self.mode in ["ddp_interleaved"]:
+            self.async_handles = []
+            self._register_hooks()
+
+        # Flag used to guard against unnecessary communication during the gradient accumulation iterations.
+        # The trainer sets it to True during the final iteration
+        self.is_last_iteration = False
+
+        # Only for debug prints
+        self._param_names = {id(p): n for n, p in self.model.named_parameters()}
 
         # using torch.no_grad to avoid
         # "an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it"
@@ -58,7 +69,7 @@ class DistributedSynchronizer:
             size = param.numel() * param.element_size()
 
             if current_bucket and current_size + size > self.bucket_size:
-                self.buckets.append(current_bucket)
+                self.buckets.append({"params": current_bucket})
                 current_bucket = []
                 current_size = 0
 
@@ -66,7 +77,43 @@ class DistributedSynchronizer:
             current_size += size
 
         if current_bucket:
-            self.buckets.append(current_bucket)
+            self.buckets.append({"params": current_bucket})
+
+    def _register_hooks(self):
+        """ Register hooks in interleaved mode """
+        for bucket in self.buckets:
+            bucket["ready_count"] = 0 # keep track of parameters whose gradients are already finished
+            for param in bucket["params"]:
+                # post_accumulate_grad_hook fires exactly once the gradient has been calculated for the param.
+                # This is different the register_hook, which fires every time a gradient is calculated, which
+                # might be multiple times for a tied param
+                param.register_post_accumulate_grad_hook(
+                    self._make_hook(bucket)
+                )
+
+    def _make_hook(self, bucket):
+        """ Create hook for each a given bucket in interleaved mode """
+        def hook(param):
+            if self.is_last_iteration:
+                bucket["ready_count"] += 1
+
+                # Trigger synchronization when all parameters in the bucket have a finished gradient
+                if bucket["ready_count"] == len(bucket["params"]):
+                    grads = [param.grad for param in bucket["params"]]
+                    flat_grads = torch._utils._flatten_dense_tensors(grads)
+
+                    # Trigger an async all_reduce operation and return immediately.
+                    # The handle is used in finalize_gradients to make sure the communication finished
+                    # before proceeding
+                    async_handle = dist.all_reduce(flat_grads, dist.ReduceOp.SUM, async_op=True)
+
+                    self.async_handles.append((async_handle, flat_grads, grads, bucket))
+
+        return hook
+
+    def set_last_iteration(self):
+        """ Signal that the next iteration is the last on the rank, so hooks should perform communication """
+        self.is_last_iteration = True
 
     def finalize_gradients(self):
         # Called after gradients are calculated in each rank. Either does the actual gradient
@@ -94,11 +141,11 @@ class DistributedSynchronizer:
                 # was absent from the autograd graph, so its true contribution to the
                 # global mean is zero. Materialise it *on the parameter*, not just in
                 # a local list, or the copy-back below has nothing to write into
-                for param in bucket:
+                for param in bucket["params"]:
                     if param.grad is None:
                         param.grad = torch.zeros_like(param)
 
-                grads = [param.grad for param in bucket]
+                grads = [param.grad for param in bucket["params"]]
                 flat_grads = torch._utils._flatten_dense_tensors(grads)
                 dist.all_reduce(flat_grads, dist.ReduceOp.SUM)
                 # dist.ReduceOp.AVG is not implemented for gloo, so we manually average.
@@ -111,6 +158,41 @@ class DistributedSynchronizer:
                 unflat_grads = torch._utils._unflatten_dense_tensors(flat_grads, grads)
                 for grad, reduced in zip(grads, unflat_grads):
                     grad.copy_(reduced)
+        elif self.mode == "ddp_interleaved":
+            # Every rank runs the same dense graph on the same batch shape, so a
+            # bucket that did not fire here did not fire on any rank -- all ranks
+            # raise together rather than one crashing while the others hang in a
+            # collective. Not zero-filled as in modes 1 and 2: there is no
+            # unconditional loop to fill into, and an unfired bucket leaves every
+            # *other* parameter in it holding rank-local gradients, which we currently don't handle
+            for bucket in self.buckets:
+                if bucket["ready_count"] != len(bucket["params"]):
+                    stalled = [self._param_names[id(p)] for p in bucket["params"]
+                               if p.grad is None]
+                    raise RuntimeError(
+                        f"bucket reduced {bucket['ready_count']}/{len(bucket['params'])} "
+                        f"parameters; no gradient for {stalled}. ddp_interleaved needs "
+                        f"every parameter in the autograd graph, like DDP with "
+                        f"find_unused_parameters=False"
+                    )
+
+            # wait for the hooks
+            for async_handle, flat_grads, grads, bucket in self.async_handles:
+                # Wait for the communication to finish
+                async_handle.wait()
+
+                # Perform update similar to regular bucketed mode
+                flat_grads /= self.world_size
+
+                unflat_grads = torch._utils._unflatten_dense_tensors(flat_grads, grads)
+                for grad, reduced in zip(grads, unflat_grads):
+                    grad.copy_(reduced)
+
+            # Reset all registered async handles and parameter readiness counts
+            self.is_last_iteration = False
+            self.async_handles.clear()
+            for bucket in self.buckets:
+                bucket["ready_count"] = 0
         else:
             raise NotImplementedError()
 

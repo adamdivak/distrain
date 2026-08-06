@@ -326,6 +326,12 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
         loss_sum = 0.0
         
         for accum in range(cfg.grad_accum_steps):
+            # We want to avoid doing unnecessary communication during the gradient accumulation
+            # steps, so a signal is sent to the synchronizer during the last iteration
+            # so that it actually triggers all_reduce
+            if is_distributed(cfg) and accum == cfg.grad_accum_steps - 1:
+                dist_sync.set_last_iteration()
+
             xb, yb = loader.microbatch(step, accum)
             x, y = to_device(xb, device), to_device(yb, device)
             with autocast_ctx:

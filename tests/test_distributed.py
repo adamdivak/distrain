@@ -25,6 +25,7 @@ from distrain.train import (
 )
 from helpers import tiny_train_config
 
+distributed_modes = ["ddp_naive", "ddp_bucketed", "ddp_interleaved"]
 
 def _device_available(device: str) -> bool:
     if device == "cuda":
@@ -107,6 +108,8 @@ def calc_backward_save_grad(rank, cfg: TrainConfig, tmp_path):
         # Make exactly two steps, as there might be some state in some communication
         # patterns, so we want to test that the second one works as well
         for step in range(2):  # cfg.max_steps
+            if is_distributed(cfg):
+                dist_sync.set_last_iteration()
             # optimizer.zero_grad(set_to_none=True)
             model.zero_grad(set_to_none=True)
             # for accum in range(cfg.grad_accum_steps):
@@ -220,7 +223,7 @@ def train_save_params(rank, cfg: TrainConfig, tmp_path):
     finally:
         cleanup_distributed()
 
-@pytest.mark.parametrize("distributed_mode", ["ddp_naive", "ddp_bucketed"])
+@pytest.mark.parametrize("distributed_mode", distributed_modes)
 class TestInitialization:
     def test_distributed_has_same_params_after_init(self, tiny_data, tmp_path, distributed_mode):
         cfg_ws1 = tiny_train_config(tiny_data, max_steps=0)
@@ -257,7 +260,7 @@ class TestInitialization:
                                         msg=lambda input_msg, key=key: f"Mismatch in values of {key}. \n" + input_msg)
 
 
-@pytest.mark.parametrize("distributed_mode", ["ddp_naive", "ddp_bucketed"])
+@pytest.mark.parametrize("distributed_mode", distributed_modes)
 class TestGradients:
     def test_gradient_is_equal_for_larger_world_size(self, tiny_data, tmp_path, distributed_mode):
         cfg_ws1 = tiny_train_config(tiny_data)
@@ -292,7 +295,7 @@ class TestGradients:
                                         msg=lambda input_msg, key=key: f"Mismatch in values of {key}. \n" + input_msg)
 
 
-@pytest.mark.parametrize("distributed_mode", ["ddp_naive", "ddp_bucketed"])
+@pytest.mark.parametrize("distributed_mode", distributed_modes)
 class TestScalarBroadcast:
     """Only rank 0 evaluates, so every other rank's val loss arrives by broadcast.
 
@@ -352,7 +355,7 @@ class TestScalarBroadcast:
         assert broadcast_devices[-1] == next(model.parameters()).device
 
 
-@pytest.mark.parametrize("distributed_mode", ["ddp_naive", "ddp_bucketed"])
+@pytest.mark.parametrize("distributed_mode", distributed_modes)
 class TestEndToEnd:
     def test_params_equal_for_larger_world_size(self, tiny_data, tmp_path, distributed_mode):
         cfg_ws1 = tiny_train_config(tiny_data)

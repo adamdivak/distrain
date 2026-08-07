@@ -46,6 +46,11 @@ class TestDtypeResolution:
 
 
 class TestEndToEnd:
+    def test_distributed_run_requires_explicit_mode(self, tiny_data):
+        cfg = tiny_train_config(tiny_data, world_size=2, distributed_mode=None)
+        with pytest.raises(ValueError, match="requires --distributed-mode"):
+            train(cfg)
+
     def test_loop_runs_and_loss_decreases(self, tiny_data, capsys):
         results = train(tiny_train_config(tiny_data))
         out = capsys.readouterr().out

@@ -14,8 +14,8 @@ time-to-target-loss, and to quantify where and why the two diverge.
 
 ## Status
 
-Single-device training works end to end on CPU, MPS and CUDA, and multi-rank DDP is
-correct in its naive form, including under gradient accumulation. 86 tests pass; the
+Single-device training works end to end on CPU, MPS and CUDA, and all three hand-rolled
+DDP modes are correct, including under gradient accumulation. 102 tests pass; the
 multi-rank ones run on gloo/CPU so they are exercisable without a GPU.
 
 Validation runs on rank 0 only and the loss is broadcast, so every rank tests the same
@@ -29,9 +29,9 @@ value against the 3.28 target without N ranks paying for the same number.
 | Single-device loop, trackio logging | done, [`train.py`](src/distrain/train.py) |
 | Pinned Docker image (aurora + cloud parity) | builds + tests pass on aurora, [`Dockerfile`](Dockerfile) |
 | DDP mode 1 — naive per-parameter all-reduce | done, [`distributed_synchronizer.py`](src/distrain/distributed_synchronizer.py) |
-| DDP mode 2 — bucketed all-reduce | **next** |
-| DDP mode 3 — bucketed + backward-hook overlap | not started |
-| Checkpointing (`torch.distributed.checkpoint`) | not started |
+| DDP mode 2 — bucketed all-reduce | done |
+| DDP mode 3 — bucketed + backward-hook overlap | correct; overlap not yet measured |
+| Checkpointing (`torch.distributed.checkpoint`) | **next** |
 | FSDP2 / TP, DiLoCo, run matrix | not started |
 
 The distributed layer is a single seam in the training loop — `finalize_gradients()`
@@ -130,6 +130,13 @@ Defaults are the 124M Track A model at seq-1024 with a ~0.5M-token global batch.
 Batch must be far smaller on the Mac — fp32 logits for 480 sequences would need well
 over 100 GB.
 
+Local testing of a distributed run:
+
+```bash
+uv run torchrun --nproc_per_node=2 -m distrain.train --device cuda:0 \
+  --distributed-backend gloo --distributed-mode ddp_naive
+```
+
 ## Measuring a new GPU
 
 Before trusting MFU on any GPU class this project has not used before:
@@ -150,6 +157,9 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
   image everywhere" stays a claim until the first rented node runs it.
 - **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline script
   first thing on any rented node, alongside `nccl-tests`.
+- **The three DDP modes have never been timed against each other**, which is the
+  measurement they exist for. It needs ≥2 GPUs, so it belongs to the first cloud
+  session — correctness tests cannot tell a mode that overlaps from one that does not.
 - **No checkpointing yet**, so no spot-preemption recovery.
 - **NCCL is untestable on aurora and stays unproven until the first rented node.**
   Two ranks cannot share one GPU: NCCL rejects it outright (`ncclInvalidUsage`,

@@ -64,5 +64,6 @@ wall-clock ceiling and teardown-on-exception (`docs/decisions.md` §9).
 
 - Vendored upstream code in `reference/` is verbatim and lint-excluded. Do not edit it.
 - `data/`, `.venv/`, `out/`, `checkpoints/` are gitignored and machine-local.
-- Real FineWeb shards are 190 MiB each, ~19 GiB for the full set. The Mac's connection
-  is metered; aurora's is not. Synthetic shards cover all local development.
+- Real FineWeb shards are 190 MiB each, ~19 GiB for the full set. 
+  Synthetic shards were used initially in local development.
+- Keep documents and code comments concise.

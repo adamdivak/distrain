@@ -99,6 +99,9 @@ class DistributedSynchronizer:
 
                 # Trigger synchronization when all parameters in the bucket have a finished gradient
                 if bucket["ready_count"] == len(bucket["params"]):
+                    # Only for verifying in a test that overlapping is performed correctly
+                    bucket["debug_inflight_at_launch"] = len(self.async_handles)
+
                     grads = [param.grad for param in bucket["params"]]
                     flat_grads = torch._utils._flatten_dense_tensors(grads)
 

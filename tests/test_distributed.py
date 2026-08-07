@@ -10,6 +10,7 @@ from unittest import mock
 
 import pytest
 import torch
+from torch import nn
 
 from distrain.data import DataLoader, ShardingPlan, TokenStream
 from distrain.distributed_synchronizer import DistributedSynchronizer
@@ -222,6 +223,152 @@ def train_save_params(rank, cfg: TrainConfig, tmp_path):
         torch.save(OrderedDict(results["model"].named_parameters()), (tmp_path / model_params_fn))
     finally:
         cleanup_distributed()
+
+
+def _observe_launches(dist_sync) -> dict:
+    """Read what the synchronizer launched, by bucket index, in launch order.
+
+    `async_handles` is appended to at launch, and every wait happens later in
+    `finalize_gradients`, so calling this between backward and finalize gives exactly
+    the collectives that were issued *during* backward and are still in flight.
+    Modes 1 and 2 have no `async_handles` at all, hence the getattr defaults.
+    """
+    handles = getattr(dist_sync, "async_handles", [])
+    buckets = getattr(dist_sync, "buckets", [])
+    bucket_index = {id(bucket): i for i, bucket in enumerate(buckets)}
+    return {
+        "n_buckets": len(buckets),
+        "launched_during_backward": len(handles),
+        # gloo returns None from all_reduce when async_op=False, so this is what
+        # catches async_op being dropped -- the gradients would still be correct
+        "all_handles_async": all(handle is not None for handle, *_ in handles),
+        "launch_order": [bucket_index[id(entry[3])] for entry in handles],
+    }
+
+
+def record_overlap(rank, cfg: TrainConfig, tmp_path):
+    try:
+        cfg.rank = rank
+        cfg.local_rank = int(os.environ.get("LOCAL_RANK", cfg.local_rank))
+        setup_distributed(cfg.world_size, cfg.rank,
+                          init_method=f"file://{tmp_path}/rendezvous_world_size{cfg.world_size}",
+                          device=resolve_device(cfg.device, cfg.local_rank))
+        device = resolve_device(cfg.device, cfg.local_rank)
+        torch.manual_seed(cfg.seed + cfg.rank)
+
+        model = GPT(
+            GPTConfig(
+                block_size=cfg.seq_len,
+                vocab_size=cfg.vocab_size,
+                n_layer=cfg.n_layer,
+                n_head=cfg.n_head,
+                n_embd=cfg.n_embd,
+                dropout=cfg.dropout,
+                bias=cfg.bias,
+            )
+        ).to(device)
+
+        # Registered before the synchronizer, so for any given parameter this fires
+        # ahead of the synchronizer's own hook: it reads how many collectives are in
+        # flight *just before* that parameter's bucket becomes eligible to launch.
+        # The last reading therefore describes the moment the final gradient of the
+        # backward pass was produced -- the sharpest point at which to ask whether
+        # communication was already overlapping computation.
+        holder = {}
+        inflight = []
+
+        def probe(param):
+            if "sync" in holder:
+                inflight.append(len(getattr(holder["sync"], "async_handles", [])))
+
+        for param in model.parameters():
+            param.register_post_accumulate_grad_hook(probe)
+
+        dist_sync = DistributedSynchronizer(
+            model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
+        holder["sync"] = dist_sync
+        dist_sync.set_last_iteration()
+
+        # Random tokens are fine: this is a test about when collectives are issued,
+        # not about what they carry. Both ranks use identical shapes, which is all
+        # that collective matching depends on.
+        x = torch.randint(0, cfg.vocab_size, (2, cfg.seq_len), device=device)
+        _, loss = model(x, x)
+        loss.backward()
+
+        observed = _observe_launches(dist_sync)
+        observed["inflight_at_last_grad"] = inflight[-1] if inflight else None
+
+        dist_sync.finalize_gradients()
+        torch.save(observed, tmp_path / f"overlap_rank_{cfg.rank}.pt")
+    finally:
+        cleanup_distributed()
+
+
+def record_launch_order(rank, cfg: TrainConfig, tmp_path):
+    try:
+        cfg.rank = rank
+        cfg.local_rank = int(os.environ.get("LOCAL_RANK", cfg.local_rank))
+        setup_distributed(cfg.world_size, cfg.rank,
+                          init_method=f"file://{tmp_path}/rendezvous_world_size{cfg.world_size}",
+                          device=resolve_device(cfg.device, cfg.local_rank))
+        device = resolve_device(cfg.device, cfg.local_rank)
+        torch.manual_seed(cfg.seed + cfg.rank)
+
+        model = ReversedExecutionModel().to(device)
+        dist_sync = DistributedSynchronizer(
+            model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
+        dist_sync.set_last_iteration()
+
+        model(torch.randn(4, 32, device=device)).sum().backward()
+
+        observed = _observe_launches(dist_sync)
+        dist_sync.finalize_gradients()
+        torch.save(observed, tmp_path / f"launch_order_rank_{cfg.rank}.pt")
+    finally:
+        cleanup_distributed()
+
+
+class TestBackwardOverlap:
+    """Mode 3's only claim over mode 2 is *when* it issues its collectives.
+
+    Every way that claim can break -- `async_op` dropped, the launch sliding into
+    `finalize_gradients`, a `wait()` landing inside the hook -- leaves the gradients
+    numerically perfect, so every other test in this file still passes. These assert
+    the launch schedule directly instead, with no timing, which would mean nothing
+    on gloo/CPU anyway.
+    """
+
+    def test_interleaved_launches_during_backward(self, tiny_data, tmp_path):
+        cfg = tiny_train_config(tiny_data, world_size=2, distributed_mode="ddp_interleaved")
+        spawn_mp(cfg, record_overlap, tmp_path)
+        observed = torch.load(tmp_path / "overlap_rank_0.pt")
+
+        # With one bucket there is nothing to overlap and the assertions below hold
+        # trivially, so guard rather than let the test quietly stop testing anything
+        assert observed["n_buckets"] >= 3, (
+            f"only {observed['n_buckets']} bucket(s); lower ddp_bucket_size or this "
+            f"test proves nothing about overlap"
+        )
+        assert observed["launched_during_backward"] == observed["n_buckets"]
+        assert observed["all_handles_async"]
+        # the point of the mode: when the last gradient of the pass was produced,
+        # every other bucket was already in flight
+        assert observed["inflight_at_last_grad"] == observed["n_buckets"] - 1
+
+    def test_bucketed_launches_nothing_during_backward(self, tiny_data, tmp_path):
+        """The half that stops the test above from being vacuous.
+
+        If mode 2 also showed collectives in flight during backward, the assertions
+        above would be measuring something other than overlap.
+        """
+        cfg = tiny_train_config(tiny_data, world_size=2, distributed_mode="ddp_bucketed")
+        spawn_mp(cfg, record_overlap, tmp_path)
+        observed = torch.load(tmp_path / "overlap_rank_0.pt")
+
+        assert observed["launched_during_backward"] == 0
+        assert observed["inflight_at_last_grad"] == 0
+
 
 @pytest.mark.parametrize("distributed_mode", distributed_modes)
 class TestInitialization:

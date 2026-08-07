@@ -159,12 +159,23 @@ This is about how many seeds to *run*. How a seed is derived per rank is §11.
 
 Built as runtime-switchable modes so all three are measurable on identical hardware:
 
-1. naive per-parameter all-reduce — **done** (`cfg.distributed_mode="ddp"`)
-2. bucketed all-reduce — not started
-3. bucketed with backward-hook compute/communication overlap — not started
+1. naive per-parameter all-reduce — **done** (`ddp_naive`)
+2. bucketed all-reduce — **done** (`ddp_bucketed`, `cfg.ddp_bucket_size` bytes)
+3. bucketed with backward-hook compute/communication overlap — **done** (`ddp_interleaved`)
 
 This is an extra result axis for free (no extra provisioning) and it is the most
 direct demonstration of the skill the project exists to build.
+
+All three are correctness-tested on gloo/CPU at world sizes 1 and 2, with and without
+gradient accumulation. None has been *timed* against the others — that needs ≥2 GPUs,
+so it is a first-cloud-session measurement, and no correctness test can distinguish a
+mode 3 that truly overlaps from one that does not.
+
+Buckets are built in **reverse registration order**, which approximates the order
+backward produces gradients. At 124M this puts `wte` (154 MB, ~31% of all gradient
+bytes) alone in the last bucket — it exceeds `bucket_size` so it cannot share one, and
+it is also the last gradient backward produces, so mode 3 has no compute left to
+overlap it against. That single bucket bounds the speedup mode 3 can show.
 
 ### The seam in the training loop
 
@@ -207,6 +218,12 @@ every rank, all ranks compute the same norm.
   parameter unconditionally and materialises `zeros_like` when `.grad is None`, rather
   than testing a per-rank predicate. Real DDP freezes bucket order in its constructor for
   the same reason, and makes `find_unused_parameters` an explicit, per-iteration opt-in.
+  - Modes 1 and 2 satisfy this by construction: both iterate a sequence fixed before the
+    step. Mode 3 does **not** — it launches from hooks, so the collective sequence is
+    autograd's completion order, identical across ranks only because every rank runs the
+    same dense graph on the same shapes. Real DDP launches strictly in bucket index
+    order via a cursor for exactly this reason. **Open item**, held by an `xfail(strict)`
+    test — `TestBackwardOverlap::test_launch_order_is_bucket_order`.
   - Zero-filling is not a fudge: `grad is None` means that parameter was absent from the
     autograd graph, so its true contribution to the global mean gradient *is* zero.
   - `TORCH_DISTRIBUTED_DEBUG=DETAIL` validates cross-rank shape/dtype agreement and raises

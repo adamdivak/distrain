@@ -234,6 +234,13 @@ def is_cuda(device: str) -> bool:
     return "cuda" in device
 
 def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dict:
+    distributed_modes = {"ddp_naive", "ddp_bucketed", "ddp_interleaved"}
+    if is_distributed(cfg) and cfg.distributed_mode not in distributed_modes:
+        choices = ", ".join(sorted(distributed_modes))
+        raise ValueError(
+            f"world_size={cfg.world_size} requires --distributed-mode to be one of: {choices}"
+        )
+
     device = resolve_device(cfg.device, cfg.local_rank)
     dtype = resolve_dtype(cfg.dtype, device)
     # Set a rank-specific seed, to avoid all ranks doing e.g. identical data augmentations

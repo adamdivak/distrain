@@ -88,3 +88,68 @@ class TestEndToEnd:
         cfg = TrainConfig(train_glob=str(tmp_path / "nothing_*.bin"), trackio=False)
         with pytest.raises(FileNotFoundError, match="make_synthetic_shards"):
             train(cfg)
+
+
+class TestCheckpointing:
+    def test_resume_matches_uninterrupted_run(self, tiny_data):
+        """Interrupt at step 4, resume to 8: bitwise-identical to a straight 8-step run.
+
+        Everything the loop consumes is a pure function of the step index (LR, data
+        order) or restored from the checkpoint (params, optimizer state), and CPU fp32
+        with dropout 0 is deterministic -- so exact equality is the correct bar, and
+        anything the checkpoint failed to carry would break it.
+
+        LR is pinned flat because the cosine schedule length derives from max_steps,
+        and emulating the interrupt here means giving the first segment a smaller
+        max_steps. A real resume reuses the same command line, so its schedule is
+        identical across segments by construction.
+        """
+        flat_lr = {"learning_rate": 3e-3, "min_lr": 3e-3, "warmup_steps": 0}
+        ckpt_dir = str(tiny_data / "ckpt")
+        straight = train(tiny_train_config(tiny_data, max_steps=8, **flat_lr),
+                         return_debug_values=["model"])
+        train(tiny_train_config(tiny_data, max_steps=4, checkpoint_every=4,
+                                checkpoint_dir=ckpt_dir, **flat_lr))
+        resumed = train(tiny_train_config(tiny_data, max_steps=8, resume=True,
+                                          checkpoint_dir=ckpt_dir, **flat_lr),
+                        return_debug_values=["model"])
+        a = dict(straight["model"].named_parameters())
+        b = dict(resumed["model"].named_parameters())
+        assert a.keys() == b.keys()
+        for key, param in a.items():
+            torch.testing.assert_close(
+                param, b[key], rtol=0, atol=0,
+                msg=lambda m, key=key: f"{key} diverged after resume:\n{m}")
+
+    def test_resume_preserves_recorded_crossing_and_clock(self, tiny_data):
+        """A crossing before the interrupt must survive it, and train_time_s accumulates."""
+        ckpt_dir = str(tiny_data / "ckpt")
+        first = train(tiny_train_config(tiny_data, max_steps=4, checkpoint_every=4,
+                                        checkpoint_dir=ckpt_dir, target_val_loss=100.0,
+                                        val_every=2))
+        resumed = train(tiny_train_config(tiny_data, max_steps=8, resume=True,
+                                          checkpoint_dir=ckpt_dir, target_val_loss=100.0,
+                                          val_every=2))
+        assert resumed["target_reached_step"] == first["target_reached_step"] == 0
+        assert resumed["train_time_s"] > first["train_time_s"]
+
+    def test_periodic_and_final_saves(self, tiny_data):
+        """checkpoint_every=2 over 5 steps: periodic saves plus one at the last step."""
+        ckpt_dir = tiny_data / "ckpt"
+        train(tiny_train_config(tiny_data, max_steps=5, checkpoint_every=2,
+                                checkpoint_dir=str(ckpt_dir)))
+        state = torch.load(ckpt_dir / "ckpt.pt", weights_only=True)
+        assert state["next_step"] == 5  # the is_last save, not the step-4 periodic one
+        assert state["cfg"]["max_steps"] == 5
+
+    def test_no_checkpoint_by_default(self, tiny_data):
+        train(tiny_train_config(tiny_data, max_steps=2,
+                                checkpoint_dir=str(tiny_data / "ckpt")))
+        assert not (tiny_data / "ckpt").exists()
+
+    def test_resume_without_checkpoint_fails_loudly(self, tiny_data):
+        """Silently starting fresh would look like a resume and waste the night."""
+        cfg = tiny_train_config(tiny_data, resume=True,
+                                checkpoint_dir=str(tiny_data / "nowhere"))
+        with pytest.raises(FileNotFoundError, match="--resume"):
+            train(cfg)

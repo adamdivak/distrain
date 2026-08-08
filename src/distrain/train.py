@@ -101,6 +101,13 @@ class TrainConfig:
     compile: bool = False
     seed: int = 1337
 
+    # checkpointing: rank 0 writes {checkpoint_dir}/ckpt.pt every N steps (0 = never);
+    # --resume continues from it. Point checkpoint_dir somewhere run-specific when
+    # several runs share a working directory.
+    checkpoint_dir: str = "checkpoints"
+    checkpoint_every: int = 0
+    resume: bool = False
+
     # distributed
     world_size: int = 1
     rank: int = 0 # rank in the whole training - [0, world_size)
@@ -227,6 +234,44 @@ def setup_distributed(world_size, rank, device, init_method="env://", distribute
 def cleanup_distributed():
     torch.distributed.destroy_process_group()
 
+def save_checkpoint(path: str, model: GPT, optimizer, cfg: TrainConfig,
+                    next_step: int, train_time_s: float, results: dict) -> None:
+    """Single-file checkpoint, written atomically by rank 0 only.
+
+    `os.replace` means an interrupt mid-save leaves the previous checkpoint intact
+    instead of a truncated file. RNG state is deliberately not saved: with
+    `dropout == 0` the training loop draws no random numbers -- seeding only affects
+    init, which the checkpoint overwrites -- and per-rank streams would need
+    per-rank files.
+    """
+    state = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "next_step": next_step,
+        "train_time_s": train_time_s,
+        "results": {k: results[k] for k in
+                    ("target_reached_step", "target_reached_train_time_s")},
+        "cfg": asdict(cfg),
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path: str, model: GPT, optimizer, device: str) -> dict:
+    """Load model + optimizer state in place; the caller applies the rest."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"--resume was given but no checkpoint exists at {path!r}. "
+            f"Drop --resume to start fresh, or point --checkpoint-dir at the run to continue."
+        )
+    state = torch.load(path, map_location=device, weights_only=True)
+    model.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optimizer"])
+    return state
+
+
 def is_distributed(cfg: TrainConfig) -> bool:
     return cfg.world_size > 1
 
@@ -288,12 +333,25 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
             bias=cfg.bias,
         )
     ).to(device)
+    # kept for checkpoint IO: torch.compile's wrapper prefixes state_dict keys with
+    # `_orig_mod.`, and the wrapper shares parameters with the module it wraps
+    raw_model = model
     if cfg.compile:
         model = torch.compile(model)
 
     optimizer = model.configure_optimizer(
         cfg.weight_decay, cfg.learning_rate, cfg.betas, fused=(is_cuda(device))
     )
+
+    # Resume before the synchronizer is built, so replica equality still comes from
+    # its rank-0 broadcast (decisions.md section 6) rather than from every rank
+    # having read the same file.
+    ckpt_path = os.path.join(cfg.checkpoint_dir, "ckpt.pt")
+    start_step = 0
+    resumed: dict | None = None
+    if cfg.resume:
+        resumed = load_checkpoint(ckpt_path, raw_model, optimizer, device)
+        start_step = resumed["next_step"]
     flops = counter_for(model, cfg.seq_len)
     peak_spec = peak_bf16_spec(torch.cuda.get_device_name()) if is_cuda(device) else None
     peak = peak_spec.tflops * 1e12 if peak_spec else None
@@ -310,6 +368,8 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
         trackio.init(project=cfg.project, name=cfg.run_name, config=asdict(cfg))
 
     if is_primary:
+        if resumed is not None:
+            print(f"resumed from {ckpt_path} at step {start_step}")
         print(
             f"device={device} dtype={dtype} params={model.num_params()/1e6:.1f}M "
             f"tokens/step={plan.global_batch_seqs * cfg.seq_len:,} steps={cfg.max_steps}"
@@ -317,9 +377,14 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
 
     results = {"target_reached_step": None, "target_reached_train_time_s": None}
     train_time_s = 0.0  # excludes validation
+    if resumed is not None:
+        # train_time_s carries across the interrupt so time-to-target stays
+        # meaningful; wall_time_s is this process's clock and restarts
+        results.update(resumed["results"])
+        train_time_s = resumed["train_time_s"]
     wall_start = time.perf_counter()
 
-    for step in range(cfg.max_steps):
+    for step in range(start_step, cfg.max_steps):
         lr = lr_at(step, cfg)
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -402,6 +467,13 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
                 if is_primary:
                     print(f"reached target {cfg.target_val_loss} at step {step} "
                           f"after {train_time_s:.1f}s of training")
+
+        # Outside the timed region, and after eval so a crossing recorded this step
+        # is captured. Rank 0 only: post-reduce state is identical on every rank.
+        if (cfg.checkpoint_every > 0 and is_primary
+                and ((step + 1) % cfg.checkpoint_every == 0 or is_last)):
+            save_checkpoint(ckpt_path, raw_model, optimizer, cfg,
+                            step + 1, train_time_s, results)
 
     # No rank may start tearing down while another is still in a collective; see
     # DistributedSynchronizer.wait_for_all_ranks. Outside the timed region: this is

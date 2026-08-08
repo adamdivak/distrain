@@ -371,3 +371,54 @@ regardless. Assert it in the test config rather than inheriting it from a defaul
 - Parameter equality across ranks does **not** depend on any of this — the rank-0
   broadcast (§6) enforces it. The seed policy exists for the randomness that should
   differ, not the state that must not.
+
+## 12. De-risking resequenced (2026-08-08)
+
+Everything unproven — NCCL, relative timing of the three DDP modes, image parity,
+the token-budget assumption — was gated on one scarce event: the first 2×8 H100
+session, while capacity has been the blocker since July. "Never debug on rented
+hardware" had a loophole: first contact with NCCL *is* debugging, and it was
+scheduled for the most expensive machine in the plan. Resequenced so the big
+session becomes a confirmation run, in this order:
+
+1. **Overnight real-FineWeb run on aurora.** Pull the real shards and run to
+   (near-)convergence locally. Validates the real data path end-to-end and checks
+   the shakiest budget assumption (2–3B vs 5B tokens to 3.28, brief §6) for free,
+   before any paid converged run.
+2. **Fix the mode-3 launch-order `xfail`** (`test_launch_order_is_bucket_order`,
+   §6) before renting anything. Launch buckets in index order via a cursor, as
+   real DDP does. Completion-order launch is exactly the class of bug that
+   surfaces as a hang on rented hardware — the expensive failure mode.
+3. **Cheap 2-GPU session** (~$5: Vast/RunPod community, 2×3090 or 2×4090): first
+   NCCL contact, time the three DDP modes against each other, verify mode 3
+   actually overlaps. GeForce P2P-over-host scaling is unrepresentative, so
+   nothing from this session is *reported* — it exists so the H100 session starts
+   with known-good, NCCL-proven code. Relative mode comparison doesn't need
+   representative hardware, and a bad interconnect makes overlap easier to see.
+
+Consequences elsewhere:
+
+- **Checkpointing demoted from "next" to when-needed.** It only serves spot
+  preemption on Track A (Track B's ~40-step configs never converge), and
+  on-demand fits the budget. A basic single-file `torch.save` save/resume now
+  exists (`--checkpoint-every` / `--resume`, rank 0, atomic via `os.replace`) so
+  a local overnight run survives an interrupt; resume is exact because the loop
+  is a pure function of the step index once params + optimizer state are
+  restored (dropout 0 → no RNG drawn; data order and LR derive from the step —
+  which also means resume must reuse the same command line, `max_steps`
+  included, or the LR schedule silently changes). DCP arrives with FSDP2's
+  sharded states, and the preemption hardening (§9) waits until spot is
+  actually chosen — which it may never be.
+- **Track A plans around a single 8-GPU node.** `NCCL_P2P_DISABLE=1
+  NCCL_SHM_DISABLE=1` forces socket transport intra-node and netem shapes it. A
+  proxy for real inter-node TCP, but the x-axis is measured `all_reduce_perf`
+  bandwidth anyway (§9), which is what makes a proxy transport legitimate. A
+  2-node slot, if one appears, validates a few points on the curve instead of
+  gating the whole plot. Single 8-GPU nodes are far easier to rent than 2×8.
+- **Track B shrinks to its §9 fallback by default.** FSDP2 on one 8-GPU node is
+  the plan (genuinely forced at ~7B); torchtitan comparison if time allows;
+  TP8×DP2 only if 2-node capacity falls into our lap.
+- **DiLoCo is scope-boxed.** Run at published hyperparameters, one config,
+  labeled "untuned DiLoCo". Its time-to-target depends heavily on tuning (inner
+  steps, outer LR/momentum) — a time sink and a fairness confound; tuning it is
+  explicitly out of scope.

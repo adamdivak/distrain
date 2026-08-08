@@ -18,3 +18,5 @@ reference/_clones/
 
 # os
 .DS_Store
+# symlink so cached_fineweb10B.py lands shards in machine-local data/
+reference/modded_nanogpt/fineweb10B

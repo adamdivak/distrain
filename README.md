@@ -31,8 +31,8 @@ value against the 3.28 target without N ranks paying for the same number.
 | DDP mode 1 — naive per-parameter all-reduce | done, [`distributed_synchronizer.py`](src/distrain/distributed_synchronizer.py) |
 | DDP mode 2 — bucketed all-reduce | done |
 | DDP mode 3 — bucketed + backward-hook overlap | correct; overlap not yet measured |
-| Checkpointing (`torch.distributed.checkpoint`) | **next** |
-| FSDP2 / TP, DiLoCo, run matrix | not started |
+| Checkpointing — basic single-file save/resume | done, in [`train.py`](src/distrain/train.py); DCP deferred — [`docs/decisions.md`](docs/decisions.md) §12 |
+| FSDP2, DiLoCo, run matrix | not started |
 
 The distributed layer is a single seam in the training loop — `finalize_gradients()`
 between the accumulation loop and gradient clipping — behind which all three modes
@@ -130,6 +130,10 @@ Defaults are the 124M Track A model at seq-1024 with a ~0.5M-token global batch.
 Batch must be far smaller on the Mac — fp32 logits for 480 sequences would need well
 over 100 GB.
 
+`--checkpoint-every N` writes `checkpoints/ckpt.pt` (rank 0, atomic) every N steps;
+`--resume` continues from it with the same command line — same command line matters,
+because the LR schedule derives from `--max-steps`.
+
 Local testing of a distributed run:
 
 ```bash
@@ -149,6 +153,18 @@ Record the result in `_PEAK_BF16` in [`mfu.py`](src/distrain/mfu.py). Datacenter
 entries there are datasheet values marked `UNVERIFIED` and should not be trusted
 until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
+## Next steps
+
+De-risking is resequenced so the expensive cloud session starts with proven code
+([`docs/decisions.md`](docs/decisions.md) §12). In order:
+
+1. **Overnight real-FineWeb run on aurora** — validates the real data path and the
+   token-budget assumption (2–3B vs 5B to 3.28) before any paid run.
+2. **Fix the mode-3 launch-order `xfail`** — launch buckets in index order via a
+   cursor, as real DDP does, before renting anything.
+3. **Cheap 2-GPU session** (~$5, Vast/RunPod community) — first NCCL contact, time
+   the three DDP modes, verify mode 3 overlaps. Not for reported numbers.
+
 ## Known gaps
 
 - **Image parity with the cloud is unproven.** The pinned image builds and its
@@ -158,13 +174,15 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 - **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline script
   first thing on any rented node, alongside `nccl-tests`.
 - **The three DDP modes have never been timed against each other**, which is the
-  measurement they exist for. It needs ≥2 GPUs, so it belongs to the first cloud
-  session — correctness tests cannot tell a mode that overlaps from one that does not.
-- **No checkpointing yet**, so no spot-preemption recovery.
-- **NCCL is untestable on aurora and stays unproven until the first rented node.**
+  measurement they exist for. It needs ≥2 GPUs — next-steps item 3 covers it;
+  correctness tests cannot tell a mode that overlaps from one that does not.
+- **No spot-preemption recovery.** Basic single-file save/resume exists
+  (`--checkpoint-every N`, `--resume`), enough to interrupt a local run; the
+  DCP/preemption hardening is deliberately deferred
+  ([`docs/decisions.md`](docs/decisions.md) §12) — it only matters if spot is chosen.
+- **NCCL is untestable on aurora and stays unproven until first rented hardware.**
   Two ranks cannot share one GPU: NCCL rejects it outright (`ncclInvalidUsage`,
   duplicate GPU in the communicator), and there is no flag around it. What *does* run
   locally is `torchrun --nproc_per_node=2 --device cuda:0 --distributed-backend gloo`,
   which exercises `torchrun`, `cuda:{local_rank}` placement and collectives on CUDA
-  tensors — everything except NCCL itself. So a 2-process NCCL job belongs at the very
-  top of the first cloud session, before anything with a clock on it.
+  tensors — everything except NCCL itself. Next-steps item 3 closes this.

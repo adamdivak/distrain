@@ -44,7 +44,12 @@ path on aurora, with the container the reproducibility unit for reported results
 
 ## 1a. Development workflow
 
-Edit on the Mac, run on aurora:
+**Default: work directly on aurora** (`ssh adam@aurora`, repo at `~/work/distrain`) —
+editing, `uv run pytest -q`, training runs and the trackio dashboard all happen
+there. Since the real FineWeb data, the GPU and the long-running jobs live on
+aurora, editing anywhere else just adds a transport step.
+
+Fallback: edit on the Mac and push over:
 
 ```bash
 scripts/sync-aurora.sh                                    # rsync, well under a second
@@ -54,7 +59,8 @@ ssh adam@aurora 'cd ~/work/distrain && uv run pytest -q'
 Git is for milestones, not for iteration — pushing and pulling per edit made the
 feedback loop slow and the history unreadable. `sync-aurora.sh` excludes `data/`,
 `.venv/` and outputs, and `rsync --delete` does not touch excluded paths, so
-aurora keeps its own shards and environment.
+aurora keeps its own shards and environment. Careful with `--delete` when the
+working tree on aurora is ahead of the Mac's, which is now the common case.
 
 Remote: `github.com/adamdivak/distrain`, **private for now**, to be made public
 with the write-up.
@@ -219,11 +225,29 @@ every rank, all ranks compute the same norm.
   than testing a per-rank predicate. Real DDP freezes bucket order in its constructor for
   the same reason, and makes `find_unused_parameters` an explicit, per-iteration opt-in.
   - Modes 1 and 2 satisfy this by construction: both iterate a sequence fixed before the
-    step. Mode 3 does **not** — it launches from hooks, so the collective sequence is
-    autograd's completion order, identical across ranks only because every rank runs the
-    same dense graph on the same shapes. Real DDP launches strictly in bucket index
-    order via a cursor for exactly this reason. **Open item**, held by an `xfail(strict)`
-    test — `TestBackwardOverlap::test_launch_order_is_bucket_order`.
+    step. Mode 3 originally did **not** — it launched from hooks, so the collective
+    sequence was autograd's completion order, identical across ranks only because every
+    rank runs the same dense graph on the same shapes. **Resolved (2026-08-08)** the way
+    real DDP does it, in two parts:
+    - *Cursor.* Hooks only mark a bucket ready; `_reduce_all_ready_buckets_in_order`
+      launches every consecutively-ready bucket strictly in bucket-index order. The
+      launch sequence is now a function of the agreed bucket structure, never of
+      autograd's scheduling. Worst case (buckets ordered opposite to completion) it
+      degrades to mode-2 behaviour — performance lost, correctness never.
+    - *Rebuild.* The first communicating step records per-parameter completion order;
+      `_reorder_buckets` then broadcasts **rank 0's** recording and rebuilds the buckets
+      from it on every rank — the analogue of DDP's `rebuild_buckets()` +
+      `sync_bucket_indices()`. The broadcast is the load-bearing part: each rank's
+      recording is only an observation, and adopting it locally would bake rank
+      divergence into every later step. Hooks resolve their bucket through a
+      `_param_to_bucket` map at fire time, so the rebuild swaps bucket dicts without
+      re-registering anything.
+    - Tested with a model whose execution order is the reverse of registration order:
+      launch order holds on both steps, overlap is zero before the rebuild and full
+      after, and the broadcast is fault-injected (rank 1's recording scrambled) so
+      dropping it fails the cross-rank agreement test — mutation-verified. `wte` still
+      arrives last and exceeds `bucket_size`, so no ordering gives mode 3 compute to
+      overlap it against; the rebuild does not lift that bound.
   - Zero-filling is not a fudge: `grad is None` means that parameter was absent from the
     autograd graph, so its true contribution to the global mean gradient *is* zero.
   - `TORCH_DISTRIBUTED_DEBUG=DETAIL` validates cross-rank shape/dtype agreement and raises
@@ -381,14 +405,13 @@ hardware" had a loophole: first contact with NCCL *is* debugging, and it was
 scheduled for the most expensive machine in the plan. Resequenced so the big
 session becomes a confirmation run, in this order:
 
-1. **Overnight real-FineWeb run on aurora.** Pull the real shards and run to
-   (near-)convergence locally. Validates the real data path end-to-end and checks
-   the shakiest budget assumption (2–3B vs 5B tokens to 3.28, brief §6) for free,
-   before any paid converged run.
-2. **Fix the mode-3 launch-order `xfail`** (`test_launch_order_is_bucket_order`,
-   §6) before renting anything. Launch buckets in index order via a cursor, as
-   real DDP does. Completion-order launch is exactly the class of bug that
-   surfaces as a hang on rented hardware — the expensive failure mode.
+1. **Overnight real-FineWeb run on aurora.** *(Running since 2026-08-08.)* Pull the
+   real shards and run to (near-)convergence locally. Validates the real data path
+   end-to-end and checks the shakiest budget assumption (2–3B vs 5B tokens to 3.28,
+   brief §6) for free, before any paid converged run.
+2. **Fix the mode-3 launch-order gap** before renting anything. *(Done — cursor +
+   measured-order rebuild, see §6.)* Completion-order launch is exactly the class
+   of bug that surfaces as a hang on rented hardware — the expensive failure mode.
 3. **Cheap 2-GPU session** (~$5: Vast/RunPod community, 2×3090 or 2×4090): first
    NCCL contact, time the three DDP modes against each other, verify mode 3
    actually overlaps. GeForce P2P-over-host scaling is unrepresentative, so

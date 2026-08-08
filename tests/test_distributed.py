@@ -6,6 +6,7 @@ import dataclasses
 import glob
 import os
 from collections import OrderedDict
+from typing import ClassVar
 from unittest import mock
 
 import pytest
@@ -305,6 +306,27 @@ def record_overlap(rank, cfg: TrainConfig, tmp_path):
         cleanup_distributed()
 
 
+class ReversedExecutionModel(nn.Module):
+    """Registration order is the exact reverse of execution order.
+
+    Buckets are built in reverse *registration* order on the assumption that this
+    approximates backward's completion order. Running the layers backwards breaks
+    that assumption as hard as possible: the last-registered layer runs first in
+    forward, so its gradients arrive last -- completion order becomes descending
+    bucket index. On the real GPT the two orders happen to coincide, which is why
+    a launch-order test needs this model and cannot use the trainer's.
+    """
+
+    def __init__(self, n_layers: int = 4, width: int = 32):
+        super().__init__()
+        self.layers = nn.ModuleList(nn.Linear(width, width) for _ in range(n_layers))
+
+    def forward(self, x):
+        for layer in reversed(self.layers):
+            x = layer(x)
+        return x
+
+
 def record_launch_order(rank, cfg: TrainConfig, tmp_path):
     try:
         cfg.rank = rank
@@ -325,6 +347,65 @@ def record_launch_order(rank, cfg: TrainConfig, tmp_path):
         observed = _observe_launches(dist_sync)
         dist_sync.finalize_gradients()
         torch.save(observed, tmp_path / f"launch_order_rank_{cfg.rank}.pt")
+    finally:
+        cleanup_distributed()
+
+
+def record_rebuild(rank, cfg: TrainConfig, tmp_path):
+    """Two communicating steps on ReversedExecutionModel, observations for each.
+
+    Rank 1's recorded completion order is deliberately scrambled before the first
+    `finalize_gradients`: the rebuild must adopt rank 0's broadcast order, so the
+    scramble has to leave no trace. Dropping the broadcast would not crash -- this
+    model's buckets all flatten to the same size, so ranks would silently average
+    mismatched buckets -- it only shows up as cross-rank bucket disagreement.
+    """
+    try:
+        cfg.rank = rank
+        cfg.local_rank = int(os.environ.get("LOCAL_RANK", cfg.local_rank))
+        setup_distributed(cfg.world_size, cfg.rank,
+                          init_method=f"file://{tmp_path}/rendezvous_world_size{cfg.world_size}",
+                          device=resolve_device(cfg.device, cfg.local_rank))
+        device = resolve_device(cfg.device, cfg.local_rank)
+        torch.manual_seed(cfg.seed + cfg.rank)
+
+        model = ReversedExecutionModel().to(device)
+
+        # Probes are registered before the synchronizer's hooks so they fire first:
+        # inflight[-1] is what was already launched when the last gradient arrived
+        holder = {}
+        inflight = []
+
+        def probe(param):
+            if "sync" in holder:
+                inflight.append(len(holder["sync"].async_handles))
+
+        for param in model.parameters():
+            param.register_post_accumulate_grad_hook(probe)
+
+        dist_sync = DistributedSynchronizer(
+            model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
+        holder["sync"] = dist_sync
+        param_names = {id(p): n for n, p in model.named_parameters()}
+
+        steps = []
+        for step in range(2):
+            inflight.clear()
+            model.zero_grad(set_to_none=True)
+            dist_sync.set_last_iteration()
+            model(torch.randn(4, 32, device=device)).sum().backward()
+
+            observed = _observe_launches(dist_sync)
+            observed["inflight_at_last_grad"] = inflight[-1] if inflight else None
+            observed["bucket_params"] = [[param_names[id(p)] for p in bucket["params"]]
+                                         for bucket in dist_sync.buckets]
+            steps.append(observed)
+
+            if step == 0 and cfg.rank == 1:
+                dist_sync._param_names_in_completion_order.reverse()
+            dist_sync.finalize_gradients()
+
+        torch.save(steps, tmp_path / f"rebuild_rank_{cfg.rank}.pt")
     finally:
         cleanup_distributed()
 
@@ -368,6 +449,88 @@ class TestBackwardOverlap:
 
         assert observed["launched_during_backward"] == 0
         assert observed["inflight_at_last_grad"] == 0
+
+    # One Linear(32, 32) is 4224 fp32 bytes (weight 4096 + bias 128), so this bucket
+    # size fits exactly one layer per bucket: 4 layers -> 4 buckets.
+    _one_layer_per_bucket: ClassVar[dict] = {"ddp_bucket_size": 4300}
+
+    def test_reversed_model_launches_every_bucket(self, tiny_data, tmp_path):
+        """Vacuity guard for the launch-order test below, kept separate on purpose.
+
+        This pins down that the reversed model produces several buckets and that
+        every one of them launches during backward, so the ordering test below is
+        genuinely about the order -- a setup regression (one giant bucket, a hook
+        that never fires) fails loudly here instead of quietly satisfying it.
+        """
+        cfg = tiny_train_config(tiny_data, world_size=2,
+                                distributed_mode="ddp_interleaved",
+                                **self._one_layer_per_bucket)
+        spawn_mp(cfg, record_launch_order, tmp_path)
+        observed = torch.load(tmp_path / "launch_order_rank_0.pt")
+
+        assert observed["n_buckets"] >= 3
+        assert sorted(observed["launch_order"]) == list(range(observed["n_buckets"]))
+        assert observed["all_handles_async"]
+
+    def test_launch_order_is_bucket_order(self, tiny_data, tmp_path):
+        """Collectives match across ranks by invocation order alone, so the launch
+        sequence must be a rank-invariant function of the bucket structure -- not of
+        whatever order autograd happens to finish gradients in."""
+        cfg = tiny_train_config(tiny_data, world_size=2,
+                                distributed_mode="ddp_interleaved",
+                                **self._one_layer_per_bucket)
+        spawn_mp(cfg, record_launch_order, tmp_path)
+        observed = torch.load(tmp_path / "launch_order_rank_0.pt")
+
+        assert observed["launch_order"] == sorted(observed["launch_order"]), (
+            f"buckets launched in completion order {observed['launch_order']}, "
+            f"not bucket-index order"
+        )
+
+
+class TestBucketRebuild:
+    """After the first communicating step, buckets are rebuilt in the measured
+    completion order (rank 0's, broadcast to all ranks). The cursor keeps the
+    launch sequence rank-invariant either way; the rebuild is what makes that
+    fixed sequence coincide with arrival order, so overlap survives models whose
+    execution order defeats the registration-order heuristic."""
+
+    def test_rebuild_restores_overlap_on_adversarial_order(self, tiny_data, tmp_path):
+        cfg = tiny_train_config(tiny_data, world_size=2,
+                                distributed_mode="ddp_interleaved",
+                                **TestBackwardOverlap._one_layer_per_bucket)
+        spawn_mp(cfg, record_rebuild, tmp_path)
+        first, second = torch.load(tmp_path / "rebuild_rank_0.pt")
+
+        # Step 1: the cursor holds the line -- launches stay in bucket-index
+        # order -- but registration-derived buckets are exactly backwards for this
+        # model, so nothing can launch until the final gradient arrives: order
+        # kept, overlap lost
+        assert first["launch_order"] == sorted(first["launch_order"])
+        assert first["inflight_at_last_grad"] == 0
+
+        # Step 2: same invariant, but the rebuilt buckets follow arrival order, so
+        # when the last gradient lands every other bucket is already in flight
+        assert second["n_buckets"] >= 3
+        assert second["launch_order"] == sorted(second["launch_order"])
+        assert second["inflight_at_last_grad"] == second["n_buckets"] - 1
+
+        # Membership actually moved: layers.0 executes last in forward, so its
+        # gradients arrive first -- last bucket before the rebuild, first after
+        assert any("layers.0." in n for n in first["bucket_params"][-1])
+        assert any("layers.0." in n for n in second["bucket_params"][0])
+
+    def test_rebuilt_buckets_agree_across_ranks(self, tiny_data, tmp_path):
+        """Fault-injected like the init-broadcast test (decisions.md section 10):
+        the worker scrambles rank 1's recording, so post-rebuild agreement can
+        only come from the rank-0 broadcast in `_reorder_buckets`."""
+        cfg = tiny_train_config(tiny_data, world_size=2,
+                                distributed_mode="ddp_interleaved",
+                                **TestBackwardOverlap._one_layer_per_bucket)
+        spawn_mp(cfg, record_rebuild, tmp_path)
+        rank0 = torch.load(tmp_path / "rebuild_rank_0.pt")
+        rank1 = torch.load(tmp_path / "rebuild_rank_1.pt")
+        assert rank0[1]["bucket_params"] == rank1[1]["bucket_params"]
 
 
 @pytest.mark.parametrize("distributed_mode", distributed_modes)

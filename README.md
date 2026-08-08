@@ -15,8 +15,13 @@ time-to-target-loss, and to quantify where and why the two diverge.
 ## Status
 
 Single-device training works end to end on CPU, MPS and CUDA, and all three hand-rolled
-DDP modes are correct, including under gradient accumulation. 102 tests pass; the
-multi-rank ones run on gloo/CPU so they are exercisable without a GPU.
+DDP modes are correct, including under gradient accumulation. Mode 3 launches its
+collectives through a cursor in fixed bucket order (rank-invariant by construction, not
+by luck), and rebuilds its buckets after the first step in the measured
+gradient-arrival order — rank 0's, broadcast — so the fixed order also preserves
+overlap. 112 tests pass; the multi-rank ones run on gloo/CPU so they are exercisable
+without a GPU. The first real-data run (124M, FineWeb, ~3B tokens) is underway on
+aurora.
 
 Validation runs on rank 0 only and the loss is broadcast, so every rank tests the same
 value against the 3.28 target without N ranks paying for the same number.
@@ -30,7 +35,7 @@ value against the 3.28 target without N ranks paying for the same number.
 | Pinned Docker image (aurora + cloud parity) | builds + tests pass on aurora, [`Dockerfile`](Dockerfile) |
 | DDP mode 1 — naive per-parameter all-reduce | done, [`distributed_synchronizer.py`](src/distrain/distributed_synchronizer.py) |
 | DDP mode 2 — bucketed all-reduce | done |
-| DDP mode 3 — bucketed + backward-hook overlap | correct; overlap not yet measured |
+| DDP mode 3 — bucketed + backward-hook overlap | done: cursor-ordered launches, arrival-order bucket rebuild; overlap not yet timed |
 | Checkpointing — basic single-file save/resume | done, in [`train.py`](src/distrain/train.py); DCP deferred — [`docs/decisions.md`](docs/decisions.md) §12 |
 | FSDP2, DiLoCo, run matrix | not started |
 
@@ -47,22 +52,12 @@ transfer (`project_brief.md` §8).
 
 | Machine | Role |
 |---|---|
-| MacBook Pro (arm64) | editor, CPU/MPS correctness work |
-| `aurora` (RTX 3090, via Tailscale) | all CUDA work, `~/work/distrain` |
+| `aurora` (RTX 3090, via Tailscale) | default development — editing, tests, all CUDA work, `~/work/distrain` |
 | rented cloud nodes | all reported results — none yet |
+| MacBook Pro (arm64) | fallback editor, CPU/MPS correctness only |
 
-Edit on the Mac, run on aurora:
-
-```bash
-scripts/sync-aurora.sh
-```
-
-```bash
-ssh adam@aurora 'cd ~/work/distrain && uv run pytest -q'
-```
-
-Git is for milestones; `sync-aurora.sh` is for iteration. It excludes `data/` and
-`.venv/`, which aurora owns.
+Day-to-day work happens directly on aurora (`ssh adam@aurora`); git is for
+milestones. The Mac fallback workflow is at the [end of this README](#mac-fallback).
 
 ## Setup
 
@@ -110,29 +105,48 @@ runs the code baked into the image — the reproducible mode for reported result
 
 ## Data
 
-Local work runs on synthetic shards, so no download is needed:
+The full FineWeb10B set (104 shards, ~19 GiB; see
+[`reference/PROVENANCE.md`](reference/PROVENANCE.md)) lives on aurora at
+`data/fineweb10B`, fetched with:
+
+```bash
+ln -sfn ../../data/fineweb10B reference/modded_nanogpt/fineweb10B
+uv run --extra data python reference/modded_nanogpt/cached_fineweb10B.py
+```
+
+The symlink makes the vendored script land shards in machine-local `data/`, which
+git, rsync and the image build all ignore.
+
+Synthetic shards exist for quick smokes and for machines without the real data:
 
 ```bash
 uv run python scripts/make_synthetic_shards.py --out data/synthetic --shards 2
 ```
 
-Real FineWeb shards are 190 MiB each and the full pull is ~19 GiB; see
-[`reference/PROVENANCE.md`](reference/PROVENANCE.md) before fetching them. Nothing
-real has been downloaded yet.
-
 ## Training
+
+A real-data run on aurora — the Track A 124M model, GPT-2 global batch (480 seqs
+via 60×8 accumulation), checkpointed and resumable:
+
+```bash
+PYTHONUNBUFFERED=1 nohup uv run python -m distrain.train \
+  --train-glob 'data/fineweb10B/fineweb_train_*.bin' \
+  --val-glob 'data/fineweb10B/fineweb_val_*.bin' \
+  --grad-accum-steps 60 --max-steps 6000 \
+  --val-every 250 --checkpoint-every 250 \
+  --compile --run-name <name> > out/train.log 2>&1 &
+```
+
+`--checkpoint-every N` writes `checkpoints/ckpt.pt` (rank 0, atomic) every N steps;
+`--resume` continues from it with the same command line — same command line matters,
+because the LR schedule derives from `--max-steps`. `PYTHONUNBUFFERED=1` keeps the
+log readable in real time instead of flushing every few hours.
+
+A quick synthetic smoke (defaults are the 124M model at seq-1024):
 
 ```bash
 uv run python -m distrain.train --global-batch-seqs 8 --max-steps 20 --compile
 ```
-
-Defaults are the 124M Track A model at seq-1024 with a ~0.5M-token global batch.
-Batch must be far smaller on the Mac — fp32 logits for 480 sequences would need well
-over 100 GB.
-
-`--checkpoint-every N` writes `checkpoints/ckpt.pt` (rank 0, atomic) every N steps;
-`--resume` continues from it with the same command line — same command line matters,
-because the LR schedule derives from `--max-steps`.
 
 Local testing of a distributed run:
 
@@ -140,6 +154,20 @@ Local testing of a distributed run:
 uv run torchrun --nproc_per_node=2 -m distrain.train --device cuda:0 \
   --distributed-backend gloo --distributed-mode ddp_naive
 ```
+
+### Watching a run
+
+Metrics live in a local SQLite store (`~/.cache/huggingface/trackio/distrain.db`).
+The dashboard:
+
+```bash
+uv run trackio show --project distrain
+```
+
+It serves on `localhost:7860` on aurora; from another machine, forward the port
+first (`ssh -L 7860:localhost:7860 adam@aurora`) and open http://localhost:7860.
+System metrics (GPU/CPU/RAM, 10 s cadence) are logged automatically via the
+`trackio[gpu]` extra.
 
 ## Measuring a new GPU
 
@@ -158,12 +186,14 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 De-risking is resequenced so the expensive cloud session starts with proven code
 ([`docs/decisions.md`](docs/decisions.md) §12). In order:
 
-1. **Overnight real-FineWeb run on aurora** — validates the real data path and the
-   token-budget assumption (2–3B vs 5B to 3.28) before any paid run.
-2. **Fix the mode-3 launch-order `xfail`** — launch buckets in index order via a
-   cursor, as real DDP does, before renting anything.
-3. **Cheap 2-GPU session** (~$5, Vast/RunPod community) — first NCCL contact, time
-   the three DDP modes, verify mode 3 overlaps. Not for reported numbers.
+1. **Overnight real-FineWeb run on aurora** — *running* (started 2026-08-08, ~3B
+   tokens). Validates the real data path and the token-budget assumption (2–3B vs
+   5B to 3.28) before any paid run.
+2. ~~Fix the mode-3 launch order~~ — *done*: launch cursor plus measured-order
+   bucket rebuild ([`docs/decisions.md`](docs/decisions.md) §6).
+3. **Cheap 2-GPU session** (~$5, Vast/RunPod community) — the next action. First
+   NCCL contact, time the three DDP modes, verify mode 3 overlaps. Not for
+   reported numbers.
 
 ## Known gaps
 
@@ -186,3 +216,19 @@ De-risking is resequenced so the expensive cloud session starts with proven code
   locally is `torchrun --nproc_per_node=2 --device cuda:0 --distributed-backend gloo`,
   which exercises `torchrun`, `cuda:{local_rank}` placement and collectives on CUDA
   tensors — everything except NCCL itself. Next-steps item 3 closes this.
+
+## Mac fallback
+
+The MacBook (arm64, no NVIDIA) can run everything except CUDA: tiny CPU/MPS configs
+exercise the loop, data path, checkpointing and the gloo multi-rank tests. Keep the
+batch small — fp32 logits for 480 sequences would need well over 100 GB. No
+performance number from the Mac transfers anywhere (`project_brief.md` §8), and
+Docker is not used there. Edit on the Mac, run on aurora:
+
+```bash
+scripts/sync-aurora.sh
+ssh adam@aurora 'cd ~/work/distrain && uv run pytest -q'
+```
+
+`sync-aurora.sh` is for iteration (git stays for milestones); it excludes `data/`
+and `.venv/`, which aurora owns.

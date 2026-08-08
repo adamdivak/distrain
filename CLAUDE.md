@@ -9,11 +9,13 @@ of truth; this file is only what a session needs before touching anything.
 
 | Machine | Role |
 |---|---|
-| this Mac (arm64, no NVIDIA) | editor; CPU/MPS correctness only |
-| `aurora` (RTX 3090), `adam@aurora` over Tailscale, `~/work/distrain` | all CUDA work |
+| `aurora` (RTX 3090), `adam@aurora` over Tailscale, `~/work/distrain` | **default**: editing, tests, all CUDA work, long runs |
 | rented cloud nodes | all reported results — none rented yet |
+| the Mac (arm64, no NVIDIA) | fallback editor; CPU/MPS correctness only |
 
-Iterate with rsync, not git:
+Work directly on aurora: `uv run pytest -q`. Real FineWeb data is at
+`data/fineweb10B` there; the trackio dashboard is `uv run trackio show --project
+distrain` (port 7860). From the Mac (fallback), iterate with rsync, not git:
 
 ```bash
 scripts/sync-aurora.sh && ssh adam@aurora 'cd ~/work/distrain && uv run pytest -q'

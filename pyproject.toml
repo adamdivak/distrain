@@ -8,7 +8,7 @@ dependencies = [
     "torch==2.13.0",
     "numpy==2.5.1",
     "tiktoken==0.13.0",
-    "trackio==0.33.0",
+    "trackio[gpu]==0.33.0",
 ]
 
 [project.optional-dependencies]

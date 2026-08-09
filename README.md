@@ -169,6 +169,22 @@ first (`ssh -L 7860:localhost:7860 adam@aurora`) and open http://localhost:7860.
 System metrics (GPU/CPU/RAM, 10 s cadence) are logged automatically via the
 `trackio[gpu]` extra.
 
+### Timing the DDP modes
+
+For any machine with ≥2 GPUs — a single-process baseline plus all three modes,
+warmup excluded, raw per-step times and a comparison table written to
+`out/bench/<timestamp>/`:
+
+```bash
+uv run python scripts/bench_ddp_modes.py --nproc 2 --steps 50 --warmup 10
+```
+
+Everything after `--` is forwarded to `distrain.train` (data globs, model size,
+`--ddp-bucket-size`, ...). A hung mode is recorded as a result, not a crash — the
+remaining modes still run. Harness mechanics are covered by
+[`tests/test_bench.py`](tests/test_bench.py) on gloo/CPU, so the first paid
+session only exercises NCCL, not the script.
+
 ## Measuring a new GPU
 
 Before trusting MFU on any GPU class this project has not used before:
@@ -204,7 +220,8 @@ De-risking is resequenced so the expensive cloud session starts with proven code
 - **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline script
   first thing on any rented node, alongside `nccl-tests`.
 - **The three DDP modes have never been timed against each other**, which is the
-  measurement they exist for. It needs ≥2 GPUs — next-steps item 3 covers it;
+  measurement they exist for. It needs ≥2 GPUs — next-steps item 3 covers it, and
+  [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) is ready to run there;
   correctness tests cannot tell a mode that overlaps from one that does not.
 - **No spot-preemption recovery.** Basic single-file save/resume exists
   (`--checkpoint-every N`, `--resume`), enough to interrupt a local run; the

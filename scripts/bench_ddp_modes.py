@@ -32,7 +32,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-MODES = ["ddp_naive", "ddp_bucketed", "ddp_interleaved"]
+MODES = ["ddp_naive", "ddp_bucketed", "ddp_interleaved", "ddp_torch"]
 SINGLE = "single"
 
 # Matches the per-step line train.py prints: "step  3 | loss 4.1 | lr 6e-04 |  123.4 ms | mfu 68%"

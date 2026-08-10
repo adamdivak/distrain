@@ -28,6 +28,10 @@ from distrain.train import (
 from helpers import tiny_train_config
 
 distributed_modes = ["ddp_naive", "ddp_bucketed", "ddp_interleaved"]
+# The hand-rolled modes plus the upstream torch DDP baseline. Only end-to-end
+# tests use this: the gradient-tier workers drive DistributedSynchronizer
+# directly, which for ddp_torch would test nothing (DDP owns the reduction).
+all_distributed_modes = [*distributed_modes, "ddp_torch"]
 
 def _device_available(device: str) -> bool:
     if device == "cuda":
@@ -665,7 +669,7 @@ class TestScalarBroadcast:
         assert broadcast_devices[-1] == next(model.parameters()).device
 
 
-@pytest.mark.parametrize("distributed_mode", distributed_modes)
+@pytest.mark.parametrize("distributed_mode", all_distributed_modes)
 class TestEndToEnd:
     def test_params_equal_for_larger_world_size(self, tiny_data, tmp_path, distributed_mode):
         cfg_ws1 = tiny_train_config(tiny_data)

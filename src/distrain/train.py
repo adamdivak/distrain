@@ -22,6 +22,7 @@ import glob
 import math
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -279,7 +280,7 @@ def is_cuda(device: str) -> bool:
     return "cuda" in device
 
 def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dict:
-    distributed_modes = {"ddp_naive", "ddp_bucketed", "ddp_interleaved"}
+    distributed_modes = {"ddp_naive", "ddp_bucketed", "ddp_interleaved", "ddp_torch"}
     if is_distributed(cfg) and cfg.distributed_mode not in distributed_modes:
         choices = ", ".join(sorted(distributed_modes))
         raise ValueError(
@@ -333,13 +334,27 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
             bias=cfg.bias,
         )
     ).to(device)
-    # kept for checkpoint IO: torch.compile's wrapper prefixes state_dict keys with
-    # `_orig_mod.`, and the wrapper shares parameters with the module it wraps
+    # kept for checkpoint IO and eval: wrappers (torch.compile, DDP) prefix
+    # state_dict keys but share parameters with the module they wrap
     raw_model = model
+    use_torch_ddp = is_distributed(cfg) and cfg.distributed_mode == "ddp_torch"
+    if use_torch_ddp:
+        # The upstream baseline the hand-rolled modes are compared against.
+        # Wrapped BEFORE torch.compile so dynamo sees the DDP module and applies
+        # DDPOptimizer -- graph breaks at bucket boundaries, which is what keeps
+        # DDP's backward hooks firing mid-backward under compile.
+        # broadcast_buffers=False: GPT has no buffers, and buffer broadcast is a
+        # collective in *forward*, which would deadlock rank-0-only eval.
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[torch.device(device).index] if is_cuda(device) else None,
+            broadcast_buffers=False,
+            bucket_cap_mb=(cfg.ddp_bucket_size or 25 * 1024 * 1024) / (1024 * 1024),
+        )
     if cfg.compile:
         model = torch.compile(model)
 
-    optimizer = model.configure_optimizer(
+    optimizer = raw_model.configure_optimizer(
         cfg.weight_decay, cfg.learning_rate, cfg.betas, fused=(is_cuda(device))
     )
 
@@ -352,7 +367,9 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
     if cfg.resume:
         resumed = load_checkpoint(ckpt_path, raw_model, optimizer, device)
         start_step = resumed["next_step"]
-    flops = counter_for(model, cfg.seq_len)
+    # raw_model: DDP's wrapper (unlike torch.compile's) does not delegate
+    # attribute access to the module it wraps
+    flops = counter_for(raw_model, cfg.seq_len)
     peak_spec = peak_bf16_spec(torch.cuda.get_device_name()) if is_cuda(device) else None
     peak = peak_spec.tflops * 1e12 if peak_spec else None
     tokens_per_step_this_rank = plan.seqs_per_rank * cfg.seq_len
@@ -371,7 +388,7 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
         if resumed is not None:
             print(f"resumed from {ckpt_path} at step {start_step}")
         print(
-            f"device={device} dtype={dtype} params={model.num_params()/1e6:.1f}M "
+            f"device={device} dtype={dtype} params={raw_model.num_params()/1e6:.1f}M "
             f"tokens/step={plan.global_batch_seqs * cfg.seq_len:,} steps={cfg.max_steps}"
         )
 
@@ -406,10 +423,17 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
 
             xb, yb = loader.microbatch(step, accum)
             x, y = to_device(xb, device), to_device(yb, device)
-            with autocast_ctx:
-                _, loss = model(x, y)
-            # average, not sum, so the gradient matches a single large batch
-            (loss / cfg.grad_accum_steps).backward()
+            # DDP reduces on every backward unless told not to; our modes get the
+            # same accumulation behaviour from set_last_iteration. no_sync must
+            # cover the forward too -- DDP latches the flag at forward time.
+            no_sync = (model.no_sync()
+                       if use_torch_ddp and accum < cfg.grad_accum_steps - 1
+                       else nullcontext())
+            with no_sync:
+                with autocast_ctx:
+                    _, loss = model(x, y)
+                # average, not sum, so the gradient matches a single large batch
+                (loss / cfg.grad_accum_steps).backward()
             loss_sum += loss.item()
 
         # Synch gradients between ranks, or wait for the communication to finish when using hooks
@@ -452,7 +476,10 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
             # is N x the cost for one number. The broadcast is unconditional within this
             # branch, whose condition depends only on the step, so collective order stays
             # rank-invariant (decisions.md section 6).
-            val_loss = evaluate(model, val_stream, cfg, device, autocast_ctx) if is_primary else 0.0
+            # ddp_torch evaluates on the underlying module: a DDP forward is not
+            # guaranteed collective-free, and eval runs on rank 0 only
+            eval_model = raw_model if use_torch_ddp else model
+            val_loss = evaluate(eval_model, val_stream, cfg, device, autocast_ctx) if is_primary else 0.0
             if is_distributed(cfg):
                 val_loss = dist_sync.broadcast_scalar(val_loss)
 
@@ -492,7 +519,8 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
         # FIXME remove once checkpoints are implemented, update the distributed
         # test using this
         if "model" in return_debug_values:
-            results["model"] = model
+            # raw_model, so parameter names are wrapper-free regardless of mode
+            results["model"] = raw_model
 
     return results
 

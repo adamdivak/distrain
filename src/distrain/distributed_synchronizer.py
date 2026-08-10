@@ -281,6 +281,11 @@ class DistributedSynchronizer:
 
             if self.record_execution_order:
                 self._reorder_buckets()
+        elif self.mode == "ddp_torch":
+            # Upstream DDP's reducer already averaged gradients during backward;
+            # nothing happens at the seam. The branch exists so the training loop
+            # stays mode-agnostic and the baseline swaps in via config alone.
+            pass
         else:
             raise NotImplementedError()
 

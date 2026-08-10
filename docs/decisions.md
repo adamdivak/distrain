@@ -507,8 +507,22 @@ FP8, custom kernels — per the brief's no-micro-optimizations rule.
 Checkpoints from before this change no longer load (untied head, renamed
 schedule fields). Expected and accepted: nothing durable had been trained.
 
-**Next, in order:** 500-step sanity run on aurora (the LR incident is
-the argument for cheap sanity before long runs) → overnight calibration
+**Sanity run + controlled rotary A/B (2026-08-10).** The 500-step sanity run
+(`rotary-sanity-500`: warmup 100 / warmdown 100, real FineWeb) finished at val
+4.89 — *above* the earlier `3090-fineweb-3B-modded` run's mid-plateau 4.57 at
+the same step, which looked like a rotary regression. It wasn't: that baseline
+ran a pre-commit working-tree state (its step-0 val of 10.68 proves a non-zero
+head; the zero-init head forces exactly ln 50304 = 10.826), and mid-schedule
+loss comparisons across different LR schedules are confounded anyway. A control
+run of the committed no-rotary state (`norotary-sanity-500`, identical
+seed/schedule/data — the only delta was the rotary commit) settled it: **4.89
+vs 5.63 at step 499 — rotary is 0.74 ahead**, with the gap growing at every
+checkpoint. Two lessons kept: (1) only matched-code, matched-schedule runs are
+comparable — dashboard curves across code states mislead; (2) the zero-init
+head deliberately trades early loss (it must grow from zero) for the
+long-horizon win, so short-horizon comparisons penalize it by construction.
+
+**Next, in order:** overnight calibration
 measuring tokens-to-3.28 → budget arithmetic with the measured number → first
 larger-GPU session (single 8-GPU node; the mode × compile matrix now includes
 the `ddp_torch` baseline).

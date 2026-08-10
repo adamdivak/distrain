@@ -206,7 +206,8 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **500-step sanity run on aurora**, then the **overnight calibration run** —
+1. **Overnight calibration run** (the 500-step sanity run passed, and a
+   controlled A/B put rotary 0.74 val ahead at step 500 — decisions §13) —
    measures tokens-to-3.28 for the modernized model; that number, not the
    estimated ~2.2×, drives the final budget arithmetic.
 2. **First larger-GPU session** (single 8-GPU node, RunPod has capacity):

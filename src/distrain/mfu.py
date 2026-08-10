@@ -79,8 +79,8 @@ def peak_bf16_flops(device_name: str) -> float:
 class FlopsCounter:
     """Per-token FLOPs for one model shape.
 
-    `num_params` is the non-embedding count -- position embeddings excluded, tied token
-    embeddings included, matching `GPT.num_params()`.
+    `num_params` matches `GPT.num_params()`: every parameter counts (rotary has no
+    positional parameters), tied token embeddings once.
     """
 
     num_params: int
@@ -129,7 +129,7 @@ def counter_for(model, seq_len: int) -> FlopsCounter:
     """Build a `FlopsCounter` from a `GPT`, so the shape is never transcribed by hand."""
     cfg = model.config
     return FlopsCounter(
-        num_params=model.num_params(non_embedding=True),
+        num_params=model.num_params(),
         n_layer=cfg.n_layer,
         n_head=cfg.n_head,
         head_dim=cfg.head_dim,

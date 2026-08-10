@@ -471,8 +471,16 @@ before anything is rented):
   params ≈ +25% FLOPs/token; the MFU counter sees actual parameters, so the
   accounting follows automatically.
 
-**Pending:** rotary embeddings (the biggest single early lever, ÷1.43 together
-with the LR tuning). **Skipped deliberately:** Muon (cut for schedule reasons,
+**Rotary embeddings — done (2026-08-10)**, completing the pack (the biggest
+single early lever, ÷1.43 together with the LR tuning). Early-record design:
+half-split rotation applied to q and k after QK-norm, base 10000, cos/sin
+precomputed in fp32 for `block_size` as non-persistent buffers (static graph
+under `torch.compile`, absent from checkpoints). `wpe` is gone, so
+`num_params()` lost its `non_embedding` flag — there are no positional
+parameters left to exclude. Tests pin the properties rotary is for: norm
+preservation, position-0 identity, scores a function of relative position only,
+and a 1-layer prefix-permutation test that fails if rotary is dropped (with
+`wpe` gone the model would be position-blind). **Skipped deliberately:** Muon (cut for schedule reasons,
 revisitable) and everything past record ~#9 — value embeddings, FlexAttention,
 FP8, custom kernels — per the brief's no-micro-optimizations rule.
 
@@ -499,7 +507,7 @@ FP8, custom kernels — per the brief's no-micro-optimizations rule.
 Checkpoints from before this change no longer load (untied head, renamed
 schedule fields). Expected and accepted: nothing durable had been trained.
 
-**Next, in order:** rotary → 500-step sanity run on aurora (the LR incident is
+**Next, in order:** 500-step sanity run on aurora (the LR incident is
 the argument for cheap sanity before long runs) → overnight calibration
 measuring tokens-to-3.28 → budget arithmetic with the measured number → first
 larger-GPU session (single 8-GPU node; the mode × compile matrix now includes

@@ -131,10 +131,4 @@ class TestCounterForModel:
         model = GPT(GPTConfig(n_layer=2, n_head=4, n_embd=128, block_size=64, vocab_size=256))
         c = counter_for(model, seq_len=64)
         assert (c.n_layer, c.n_head, c.head_dim, c.seq_len) == (2, 4, 32, 64)
-        assert c.num_params == model.num_params(non_embedding=True)
-
-    def test_param_count_excludes_position_embeddings_only(self):
-        cfg = GPTConfig(n_layer=2, n_head=4, n_embd=128, block_size=64, vocab_size=256)
-        model = GPT(cfg)
-        wpe = cfg.block_size * cfg.n_embd
-        assert model.num_params(True) == model.num_params(False) - wpe
+        assert c.num_params == model.num_params()

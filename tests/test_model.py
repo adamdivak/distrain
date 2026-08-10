@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from distrain.model import GPT, GPTConfig
+from distrain.model import GPT, GPTConfig, Rotary
 
 
 def tiny_config(**overrides):
@@ -102,6 +102,69 @@ class TestForward:
         assert torch.isfinite(loss)
 
 
+class TestRotary:
+    """The properties RoPE is used for, asserted directly on the module."""
+
+    def test_rejects_odd_dim(self):
+        with pytest.raises(ValueError, match="must be even"):
+            Rotary(dim=15, max_seq_len=8)
+
+    def test_rotation_preserves_norm(self):
+        """Rotations are orthogonal: attention logit scale must not change with position."""
+        torch.manual_seed(0)
+        x = torch.randn(2, 4, 32, 16)
+        y = Rotary(16, 32)(x)
+        torch.testing.assert_close(y.norm(dim=-1), x.norm(dim=-1))
+
+    def test_position_zero_is_identity(self):
+        torch.manual_seed(0)
+        x = torch.randn(1, 2, 8, 16)
+        y = Rotary(16, 8)(x)
+        torch.testing.assert_close(y[:, :, 0], x[:, :, 0])
+
+    def test_scores_depend_only_on_relative_position(self):
+        """The point of RoPE: q_i . k_j is a function of i - j, not of i and j.
+
+        Broadcast one q and one k to every position, rotate, and check the score
+        matrix is constant along diagonals (equal at (i, j) and (i+s, j+s)).
+        """
+        torch.manual_seed(0)
+        T, hd = 16, 16
+        rotary = Rotary(hd, T)
+        q = rotary(torch.randn(hd).expand(1, 1, T, hd))
+        k = rotary(torch.randn(hd).expand(1, 1, T, hd))
+        scores = (q @ k.transpose(-2, -1)).squeeze()
+        for shift in (1, 5):
+            torch.testing.assert_close(
+                scores[: T - shift, : T - shift],
+                scores[shift:, shift:],
+            )
+
+    def test_model_output_depends_on_prefix_order(self):
+        """With wpe gone, rotary is the only source of position. In a 1-layer model
+        without it, the last position's logits are exactly invariant under permuting
+        the prefix: the (k, v) set is the same and softmax reweighting is
+        permutation-invariant. So this fails if rotary is dropped.
+
+        Zero-init makes a fresh model output all-zero logits, so the zeroed
+        weights are re-randomized first.
+        """
+        cfg = tiny_config(n_layer=1)
+        torch.manual_seed(0)
+        model = GPT(cfg).eval()
+        with torch.no_grad():
+            for _, p in model.named_parameters():
+                if torch.all(p == 0):
+                    p.normal_(0.0, 0.02)
+        a = torch.arange(1, 17).unsqueeze(0)  # distinct tokens
+        b = a.clone()
+        b[0, :-1] = b[0, :-1].flip(0)  # permute the prefix, keep the final token
+        with torch.no_grad():
+            logits_a, _ = model(a)
+            logits_b, _ = model(b)
+        assert not torch.allclose(logits_a[0, -1], logits_b[0, -1])
+
+
 class TestCausality:
     def test_future_tokens_do_not_affect_past_logits(self):
         """If the causal mask were wrong, every scaling result would be on a broken model."""
@@ -122,15 +185,16 @@ class TestParameters:
         model = GPT(tiny_config(use_weight_tying=True))
         assert model.transformer.wte.weight is model.lm_head.weight
 
-    def test_num_params_excludes_position_embeddings(self):
-        cfg = tiny_config()
-        model = GPT(cfg)
-        assert model.num_params(False) - model.num_params(True) == cfg.block_size * cfg.n_embd
+    def test_no_positional_parameters(self):
+        """Rotary replaced wpe: position is encoded by buffers, not learned weights."""
+        model = GPT(tiny_config())
+        assert not any("wpe" in name for name, _ in model.named_parameters())
+        assert not any(b.requires_grad for b in model.buffers())
 
     def test_gpt2_small_is_124m(self):
         """The Track A model, at the size the brief and the benchmark assume."""
         model = GPT(GPTConfig(use_weight_tying=True))
-        assert 123e6 < model.num_params(non_embedding=True) < 125e6
+        assert 123e6 < model.num_params() < 125e6
 
 
 class TestDeterminism:

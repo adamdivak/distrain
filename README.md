@@ -21,11 +21,11 @@ and timed on a rented 2×3090 ([session log](docs/sessions/2026-08-09-runpod-2x3
 headline finding: `torch.compile` defeats hook-based overlap, so uncompiled
 interleaved is the fastest configuration on that box.
 
-The model is no longer vanilla GPT-2: QK-norm, ReLU², zero-init residual
-projections, untied zero-init head, trapezoid LR at 0.0018 — the early
-modded-nanogpt improvements, adopted because the vanilla architecture measured
-val 3.50 after 3B tokens (~10B needed to 3.28, 3× the assumed cost). Rotary
-embeddings are next; see [`docs/decisions.md`](docs/decisions.md) §13. 121 tests
+The model is no longer vanilla GPT-2: rotary embeddings (replacing `wpe`),
+QK-norm, ReLU², zero-init residual projections, untied zero-init head, trapezoid
+LR at 0.0018 — the early modded-nanogpt improvements, adopted because the vanilla
+architecture measured val 3.50 after 3B tokens (~10B needed to 3.28, 3× the
+assumed cost). See [`docs/decisions.md`](docs/decisions.md) §13. 125 tests
 pass; the multi-rank ones run on gloo/CPU so they are exercisable without a GPU.
 
 Validation runs on rank 0 only and the loss is broadcast, so every rank tests the same
@@ -34,7 +34,7 @@ value against the 3.28 target without N ranks paying for the same number.
 | Piece | State |
 |---|---|
 | Shard IO + world-size-independent sharding | done, [`data.py`](src/distrain/data.py) |
-| 124M GPT: SDPA, QK-norm, ReLU², zero-init, untied head | done, [`model.py`](src/distrain/model.py); rotary pending |
+| 124M GPT: SDPA, rotary, QK-norm, ReLU², zero-init, untied head | done, [`model.py`](src/distrain/model.py) |
 | FLOPs / MFU / HFU accounting | done, [`mfu.py`](src/distrain/mfu.py) |
 | Single-device loop, trapezoid LR, trackio logging | done, [`train.py`](src/distrain/train.py) |
 | Pinned Docker image (aurora + cloud parity) | builds + tests pass on aurora, [`Dockerfile`](Dockerfile) |
@@ -49,9 +49,9 @@ between the accumulation loop and gradient clipping — behind which all four mo
 switch at runtime. See [`docs/decisions.md`](docs/decisions.md) §6 for the conventions
 it rests on and §10 for how the multi-rank tests are built.
 
-Measured on aurora (RTX 3090): 124M at seq-1024, batch 8, bf16 + compile →
-**123.9 ms/step, 68.4% MFU**. Correctness only — a consumer card's numbers do not
-transfer (`project_brief.md` §8).
+Measured on aurora (RTX 3090): the modernized model (162M params with the untied
+head) at seq-1024, batch 8, bf16 + compile → **130.4 ms/step, 82.6% MFU**.
+Correctness only — a consumer card's numbers do not transfer (`project_brief.md` §8).
 
 ## Machines
 
@@ -206,18 +206,16 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **Rotary embeddings** — the last piece of the modernization pack (largest
-   single early-speedrun lever). Replaces the learned `wpe`.
-2. **500-step sanity run on aurora**, then the **overnight calibration run** —
+1. **500-step sanity run on aurora**, then the **overnight calibration run** —
    measures tokens-to-3.28 for the modernized model; that number, not the
    estimated ~2.2×, drives the final budget arithmetic.
-3. **First larger-GPU session** (single 8-GPU node, RunPod has capacity):
+2. **First larger-GPU session** (single 8-GPU node, RunPod has capacity):
    roofline + `nccl-tests`, image-parity check, then
    [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) across the four
    modes × compile on/off — the 2×3090 session showed compile kills hook-based
    overlap, and `ddp_torch` (which gets dynamo's DDPOptimizer graph breaks)
    is the interesting comparison. Then the first converged Track A run.
-4. DiLoCo and the netem bandwidth curve after that.
+3. DiLoCo and the netem bandwidth curve after that.
 
 ## Known gaps
 

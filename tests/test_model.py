@@ -17,6 +17,39 @@ def tiny_config(**overrides):
     return GPTConfig(**base)
 
 
+class TestZeroInit:
+    """modded-nanogpt zero-init: residual projections and the untied head start at
+    zero, so every block is the identity at init.
+
+    These assert the state of the *finished* model on purpose: zeroing inside a
+    submodule constructor is silently undone by GPT's apply(_init_weights), so a
+    constructor-time check would pass while the model ships gaussian weights.
+    """
+
+    def test_residual_projections_start_at_zero(self):
+        for name, p in GPT(tiny_config()).named_parameters():
+            if name.endswith("c_proj.weight"):
+                assert torch.all(p == 0), f"{name} survived init non-zero"
+
+    def test_untied_head_is_zero_and_embedding_is_not(self):
+        model = GPT(tiny_config(use_weight_tying=False))
+        assert torch.all(model.lm_head.weight == 0)
+        assert model.transformer.wte.weight.abs().sum() > 0
+
+    def test_tied_head_is_not_zeroed(self):
+        """Zeroing a tied head would zero wte with it and kill the embedding."""
+        model = GPT(tiny_config(use_weight_tying=True))
+        assert model.transformer.wte.weight is model.lm_head.weight
+        assert model.lm_head.weight.abs().sum() > 0
+
+    def test_non_residual_linears_keep_gaussian_init(self):
+        """Guards the name filter: only c_proj (and the untied head) get zeroed;
+        everything else keeps its N(0, 0.02)."""
+        block = GPT(tiny_config()).transformer.h[0]
+        assert block.attn.c_attn.weight.std().item() == pytest.approx(0.02, rel=0.15)
+        assert block.mlp.c_fc.weight.std().item() == pytest.approx(0.02, rel=0.15)
+
+
 class TestConfig:
     def test_head_dim(self):
         assert tiny_config().head_dim == 16
@@ -86,7 +119,7 @@ class TestCausality:
 
 class TestParameters:
     def test_weights_are_tied(self):
-        model = GPT(tiny_config())
+        model = GPT(tiny_config(use_weight_tying=True))
         assert model.transformer.wte.weight is model.lm_head.weight
 
     def test_num_params_excludes_position_embeddings(self):
@@ -96,17 +129,8 @@ class TestParameters:
 
     def test_gpt2_small_is_124m(self):
         """The Track A model, at the size the brief and the benchmark assume."""
-        model = GPT(GPTConfig())
+        model = GPT(GPTConfig(use_weight_tying=True))
         assert 123e6 < model.num_params(non_embedding=True) < 125e6
-
-    def test_residual_projections_get_scaled_init(self):
-        cfg = tiny_config(n_layer=8)
-        model = GPT(cfg)
-        expected = 0.02 / math.sqrt(2 * cfg.n_layer)
-        proj = model.transformer.h[0].attn.c_proj.weight
-        other = model.transformer.h[0].attn.c_attn.weight
-        assert proj.std().item() == pytest.approx(expected, rel=0.15)
-        assert other.std().item() == pytest.approx(0.02, rel=0.15)
 
 
 class TestDeterminism:

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import math
 import os
 import time
 from contextlib import nullcontext
@@ -75,13 +74,13 @@ class TrainConfig:
     bias: bool = False
 
     # optimization
-    learning_rate: float = 6e-4
-    min_lr: float = 6e-5
+    learning_rate: float = 0.0018
     weight_decay: float = 0.1
     betas: tuple[float, float] = (0.9, 0.95)
     grad_clip: float = 1.0
-    warmup_steps: int = 100
-    max_steps: int = 1000
+    warmup_steps: int = 250
+    warmdown_steps: int = 1000
+    max_steps: int = 2000
 
     # evaluation
     val_every: int = 100
@@ -151,14 +150,22 @@ def resolve_dtype(requested: str, device: str) -> torch.dtype:
 
 
 def lr_at(step: int, cfg: TrainConfig) -> float:
-    """Linear warmup then cosine decay to `min_lr`, as in nanoGPT."""
+    """ Trapezoidal learning rate decay scheduler (linear warmup and warmdown) from modded-nanogpt """
+    assert cfg.warmup_steps + cfg.warmdown_steps < cfg.max_steps, "Incorrect LR schedule, warmup + warmdown >= max_steps"
+    assert step <= cfg.max_steps
+    lr_multiplier = 1.0
+    # 1) linear warmup for warmup_iters steps
     if step < cfg.warmup_steps:
-        return cfg.learning_rate * (step + 1) / cfg.warmup_steps
-    if step >= cfg.max_steps:
-        return cfg.min_lr
-    progress = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return cfg.min_lr + coeff * (cfg.learning_rate - cfg.min_lr)
+        lr_multiplier = (step+1) / cfg.warmup_steps
+    # 2) constant lr for a while
+    elif step < cfg.max_steps - cfg.warmdown_steps:
+        lr_multiplier = 1.0
+    # 3) linear warmdown
+    else:
+        decay_ratio = (cfg.max_steps - step) / cfg.warmdown_steps
+        lr_multiplier = decay_ratio
+
+    return lr_multiplier * cfg.learning_rate
 
 
 def accelerator_synchronize(device: str) -> None:

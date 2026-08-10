@@ -12,25 +12,54 @@ from helpers import tiny_train_config
 
 
 class TestLRSchedule:
-    def test_warmup_rises_to_peak(self):
-        cfg = TrainConfig(learning_rate=1.0, min_lr=0.0, warmup_steps=10, max_steps=100)
-        assert lr_at(0, cfg) == pytest.approx(0.1)
-        assert lr_at(9, cfg) == pytest.approx(1.0)
+    """Trapezoid (modded-nanogpt): linear warmup, flat plateau, linear warmdown to 0.
 
-    def test_cosine_decays_to_min_lr(self):
-        cfg = TrainConfig(learning_rate=1.0, min_lr=0.1, warmup_steps=10, max_steps=100)
-        assert lr_at(10, cfg) == pytest.approx(1.0)
-        assert lr_at(99, cfg) == pytest.approx(0.1, abs=1e-3)
-        assert lr_at(1000, cfg) == pytest.approx(0.1)
+    Deliberately tested at learning_rate != 1.0: this function was ported from a
+    LambdaLR *multiplier*, and 1.0 is the one base LR at which returning the bare
+    multiplier is indistinguishable from returning a learning rate -- which is how
+    a 1.0-LR run got launched.
+    """
 
-    def test_monotonically_decreasing_after_warmup(self):
-        cfg = TrainConfig(learning_rate=1.0, min_lr=0.1, warmup_steps=10, max_steps=100)
-        values = [lr_at(s, cfg) for s in range(10, 100)]
+    def _cfg(self, **overrides):
+        base = {"learning_rate": 0.5, "warmup_steps": 10, "warmdown_steps": 20,
+                "max_steps": 100}
+        base.update(overrides)
+        return TrainConfig(**base)
+
+    def test_warmup_is_linear(self):
+        cfg = self._cfg()
+        assert lr_at(0, cfg) == pytest.approx(0.05)
+        assert lr_at(4, cfg) == pytest.approx(0.25)
+        assert lr_at(9, cfg) == pytest.approx(0.5)
+
+    def test_plateau_holds_peak_lr_exactly(self):
+        cfg = self._cfg()
+        assert lr_at(10, cfg) == 0.5
+        assert lr_at(79, cfg) == 0.5
+
+    def test_warmdown_is_linear_to_zero(self):
+        cfg = self._cfg()
+        assert lr_at(80, cfg) == pytest.approx(0.5)  # continuous at the boundary
+        assert lr_at(90, cfg) == pytest.approx(0.25)
+        assert lr_at(100, cfg) == pytest.approx(0.0)
+
+    def test_returns_a_learning_rate_not_a_multiplier(self):
+        """Regression: assigning the bare LambdaLR multiplier as the LR means
+        training at 1.0 on the plateau -- a 556x overshoot that exploded a run."""
+        cfg = self._cfg(learning_rate=3e-3)
+        assert lr_at(50, cfg) == pytest.approx(3e-3)
+
+    def test_never_increases_after_warmup(self):
+        cfg = self._cfg()
+        values = [lr_at(s, cfg) for s in range(10, 101)]
         assert all(a >= b for a, b in itertools.pairwise(values))
 
-    def test_midpoint_is_halfway(self):
-        cfg = TrainConfig(learning_rate=1.0, min_lr=0.0, warmup_steps=0, max_steps=100)
-        assert lr_at(50, cfg) == pytest.approx(0.5, abs=1e-2)
+    def test_rejects_schedule_longer_than_run(self):
+        """A run too short for its warmup+warmdown must fail loudly rather than
+        silently spend every step inside the warmdown ramp."""
+        cfg = self._cfg(warmup_steps=50, warmdown_steps=60)
+        with pytest.raises(AssertionError, match="Incorrect LR schedule"):
+            lr_at(0, cfg)
 
 
 class TestDtypeResolution:
@@ -99,12 +128,14 @@ class TestCheckpointing:
         with dropout 0 is deterministic -- so exact equality is the correct bar, and
         anything the checkpoint failed to carry would break it.
 
-        LR is pinned flat because the cosine schedule length derives from max_steps,
+        LR is pinned flat because the warmdown position derives from max_steps,
         and emulating the interrupt here means giving the first segment a smaller
         max_steps. A real resume reuses the same command line, so its schedule is
         identical across segments by construction.
         """
-        flat_lr = {"learning_rate": 3e-3, "min_lr": 3e-3, "warmup_steps": 0}
+        # explicit, not inherited: this test *requires* a schedule that is
+        # independent of max_steps, whatever helpers defaults become
+        flat_lr = {"learning_rate": 3e-3, "warmup_steps": 0, "warmdown_steps": 0}
         ckpt_dir = str(tiny_data / "ckpt")
         straight = train(tiny_train_config(tiny_data, max_steps=8, **flat_lr),
                          return_debug_values=["model"])

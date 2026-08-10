@@ -63,6 +63,9 @@ def build_command(label: str, args, train_args: list[str]) -> list[str]:
         "--log-every", "1",          # the parser needs every step's time
         "--val-every", "0",          # timing only; eval would pollute the clock
         "--no-trackio",
+        # flat LR: this measures step time, not learning, and the default
+        # warmup+warmdown cannot fit small --steps (lr_at asserts the fit)
+        "--warmup-steps", "0", "--warmdown-steps", "0",
         "--seq-len", str(args.seq_len),
         "--global-batch-seqs", str(args.per_gpu_batch * nproc),
         "--grad-accum-steps", "1",

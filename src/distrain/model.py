@@ -14,7 +14,6 @@ distributed layer alone.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -35,6 +34,7 @@ class GPTConfig:
     # GPT-2 used biases everywhere; omitting them is slightly faster and marginally
     # better. Kept configurable, but must not vary across configs within a study.
     bias: bool = False
+    use_weight_tying: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -59,6 +59,7 @@ class CausalSelfAttention(nn.Module):
         # (B, T, C) -> (B, n_head, T, head_dim)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm from modded-nanogpt
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         y = F.scaled_dot_product_attention(
             q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True
@@ -71,12 +72,12 @@ class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu = nn.GELU()
+        self.relu = nn.ReLU()
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
+        return self.dropout(self.c_proj(self.relu(self.c_fc(x)).square()))
 
 
 class Block(nn.Module):
@@ -107,14 +108,25 @@ class GPT(nn.Module):
             }
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # weight tying: the token embedding is the output projection
-        self.transformer.wte.weight = self.lm_head.weight
+
+        if self.config.use_weight_tying:
+            # weight tying: the token embedding is the output projection
+            self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
-        # GPT-2 paper: scale residual-projection init by 1/sqrt(2 * n_layer)
+        # modded-nanogpt: residual projections start at zero, so every block is the
+        # identity at init and the residual stream is calm regardless of depth.
+        # Supersedes GPT-2's 1/sqrt(2*n_layer) scaling of these same weights.
+        # Deliberately AFTER apply(): _init_weights sees modules without names, and
+        # anything set in a submodule constructor is overwritten by apply() -- zeroing
+        # there is a silent no-op.
         for name, p in self.named_parameters():
             if name.endswith("c_proj.weight"):
-                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+                nn.init.zeros_(p)
+        if not config.use_weight_tying:
+            # the untied head starts at zero too: uniform logits, initial loss exactly
+            # ln(vocab_size). Never zero a *tied* head -- it is wte.
+            nn.init.zeros_(self.lm_head.weight)
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:

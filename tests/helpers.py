@@ -13,10 +13,13 @@ def tiny_train_config(tiny_data, **overrides):
         "n_head": 2,
         "n_embd": 32,
         "vocab_size": 64,
-        "warmup_steps": 2,
+        # flat LR: lr_at asserts warmup + warmdown < max_steps, and tests override
+        # max_steps down to 2. The trapezoid's shape is covered by TestLRSchedule;
+        # end-to-end tests here are about the loop, not the schedule
+        "warmup_steps": 0,
+        "warmdown_steps": 0,
         "max_steps": 30,
         "learning_rate": 3e-3,
-        "min_lr": 3e-4,
         "val_every": 15,
         "val_tokens": 3200,
         # set explicitly rather than inherited: the eval batch must be identical across

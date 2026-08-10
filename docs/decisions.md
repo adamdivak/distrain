@@ -445,3 +445,62 @@ Consequences elsewhere:
   labeled "untuned DiLoCo". Its time-to-target depends heavily on tuning (inner
   steps, outer LR/momentum) — a time sink and a fairness confound; tuning it is
   explicitly out of scope.
+
+## 13. Track A model modernized with early modded-nanogpt improvements (2026-08-09)
+
+**Trigger.** The first full-length local run (vanilla architecture, 3B tokens)
+ended at val **3.50** with a flat tail — vanilla needs ~10B tokens to 3.28
+(consistent with llm.c), 3× the assumed cost per converged run.
+
+**Why this is allowed.** The load-bearing rule is *architecture identical across
+configs* (CLAUDE.md), not *architecture equal to GPT-2*; 3.28 is defined by the
+tokenizer and val slice, both untouched. What is given up is comparing our
+absolute times to llm.c's 45 min — which different hardware already precluded.
+
+**Adopted** (the record #2/#5/#8-era changes — the cheap, standard segment of the
+speedrun history; est. ~2.2× fewer tokens, to be *measured* by a calibration run
+before anything is rented):
+
+- Trapezoid LR (linear warmup, plateau, linear warmdown to zero), peak 0.0018.
+  `min_lr` is gone; `lr_at` asserts `warmup + warmdown < max_steps` so a run too
+  short for its schedule fails loudly. The resume caveat shrinks: only the
+  warmdown position depends on `max_steps` now.
+- QK-norm (parameterless `rms_norm` over head_dim), ReLU² MLP.
+- Zero-init residual projections (`c_proj`) and the **untied**, zero-init
+  `lm_head` (`use_weight_tying` in `GPTConfig`, default off). Untying adds ~39M
+  params ≈ +25% FLOPs/token; the MFU counter sees actual parameters, so the
+  accounting follows automatically.
+
+**Pending:** rotary embeddings (the biggest single early lever, ÷1.43 together
+with the LR tuning). **Skipped deliberately:** Muon (cut for schedule reasons,
+revisitable) and everything past record ~#9 — value embeddings, FlexAttention,
+FP8, custom kernels — per the brief's no-micro-optimizations rule.
+
+**Three port bugs, kept as lessons** (all found before any paid run):
+
+- modded-nanogpt's `get_lr` is a **LambdaLR multiplier**; assigning its return
+  value directly as the LR trained at 1.0 on the plateau — a 556× overshoot and
+  an exploding loss. The old LR tests used `learning_rate=1.0`, the one value at
+  which multiplier and LR are indistinguishable; the rewritten tests pin an LR
+  ≠ 1.0 and a regression test names the failure.
+- Zero-init done in submodule constructors was **silently undone** by
+  `GPT.__init__`'s `apply(_init_weights)` and the residual-scaling pass after
+  it. `apply` hands modules to the init fn without names by design; the
+  canonical fixes are a marker attribute checked inside `_init_weights`, or a
+  named `named_parameters()` post-pass after `apply` — the file already had one
+  for the GPT-2 1/sqrt(2L) scaling, which zero-init supersedes, so it lives
+  there now. `TestZeroInit` asserts the *finished* model, precisely because a
+  constructor-time check passes while the model ships gaussian weights. Never
+  zero a tied head — it is `wte`.
+- `relu(x²)` instead of `relu(x)²`: after squaring, everything is non-negative,
+  the ReLU becomes an identity and the activation turns symmetric — a silent
+  quality bug, the failure class this project fears most.
+
+Checkpoints from before this change no longer load (untied head, renamed
+schedule fields). Expected and accepted: nothing durable had been trained.
+
+**Next, in order:** rotary → 500-step sanity run on aurora (the LR incident is
+the argument for cheap sanity before long runs) → overnight calibration
+measuring tokens-to-3.28 → budget arithmetic with the measured number → first
+larger-GPU session (single 8-GPU node; the mode × compile matrix now includes
+the `ddp_torch` baseline).

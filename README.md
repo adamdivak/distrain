@@ -14,14 +14,19 @@ time-to-target-loss, and to quantify where and why the two diverge.
 
 ## Status
 
-Single-device training works end to end on CPU, MPS and CUDA, and all three hand-rolled
-DDP modes are correct, including under gradient accumulation. Mode 3 launches its
-collectives through a cursor in fixed bucket order (rank-invariant by construction, not
-by luck), and rebuilds its buckets after the first step in the measured
-gradient-arrival order — rank 0's, broadcast — so the fixed order also preserves
-overlap. 112 tests pass; the multi-rank ones run on gloo/CPU so they are exercisable
-without a GPU. The first real-data run (124M, FineWeb, ~3B tokens) is underway on
-aurora.
+Single-device training works end to end on CPU, MPS and CUDA; the three hand-rolled
+DDP modes are correct (cursor-ordered launches, measured-order bucket rebuild) and
+PyTorch's own DDP is wired in as a fourth, baseline mode. All four are NCCL-proven
+and timed on a rented 2×3090 ([session log](docs/sessions/2026-08-09-runpod-2x3090.md));
+headline finding: `torch.compile` defeats hook-based overlap, so uncompiled
+interleaved is the fastest configuration on that box.
+
+The model is no longer vanilla GPT-2: QK-norm, ReLU², zero-init residual
+projections, untied zero-init head, trapezoid LR at 0.0018 — the early
+modded-nanogpt improvements, adopted because the vanilla architecture measured
+val 3.50 after 3B tokens (~10B needed to 3.28, 3× the assumed cost). Rotary
+embeddings are next; see [`docs/decisions.md`](docs/decisions.md) §13. 121 tests
+pass; the multi-rank ones run on gloo/CPU so they are exercisable without a GPU.
 
 Validation runs on rank 0 only and the loss is broadcast, so every rank tests the same
 value against the 3.28 target without N ranks paying for the same number.
@@ -29,18 +34,18 @@ value against the 3.28 target without N ranks paying for the same number.
 | Piece | State |
 |---|---|
 | Shard IO + world-size-independent sharding | done, [`data.py`](src/distrain/data.py) |
-| 124M GPT, SDPA, bf16 + `torch.compile` | done, [`model.py`](src/distrain/model.py) |
+| 124M GPT: SDPA, QK-norm, ReLU², zero-init, untied head | done, [`model.py`](src/distrain/model.py); rotary pending |
 | FLOPs / MFU / HFU accounting | done, [`mfu.py`](src/distrain/mfu.py) |
-| Single-device loop, trackio logging | done, [`train.py`](src/distrain/train.py) |
+| Single-device loop, trapezoid LR, trackio logging | done, [`train.py`](src/distrain/train.py) |
 | Pinned Docker image (aurora + cloud parity) | builds + tests pass on aurora, [`Dockerfile`](Dockerfile) |
-| DDP mode 1 — naive per-parameter all-reduce | done, [`distributed_synchronizer.py`](src/distrain/distributed_synchronizer.py) |
-| DDP mode 2 — bucketed all-reduce | done |
-| DDP mode 3 — bucketed + backward-hook overlap | done: cursor-ordered launches, arrival-order bucket rebuild; overlap not yet timed |
+| DDP modes 1–3 (naive, bucketed, interleaved) | done, [`distributed_synchronizer.py`](src/distrain/distributed_synchronizer.py); NCCL-proven, timed on 2×3090 |
+| DDP mode 4 — `ddp_torch`, the upstream baseline | done, wraps `DistributedDataParallel` behind the same seam |
 | Checkpointing — basic single-file save/resume | done, in [`train.py`](src/distrain/train.py); DCP deferred — [`docs/decisions.md`](docs/decisions.md) §12 |
+| Bench harness for mode timing | done, [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) |
 | FSDP2, DiLoCo, run matrix | not started |
 
 The distributed layer is a single seam in the training loop — `finalize_gradients()`
-between the accumulation loop and gradient clipping — behind which all three modes
+between the accumulation loop and gradient clipping — behind which all four modes
 switch at runtime. See [`docs/decisions.md`](docs/decisions.md) §6 for the conventions
 it rests on and §10 for how the multi-rank tests are built.
 
@@ -199,40 +204,41 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ## Next steps
 
-De-risking is resequenced so the expensive cloud session starts with proven code
-([`docs/decisions.md`](docs/decisions.md) §12). In order:
+([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **Overnight real-FineWeb run on aurora** — *running* (started 2026-08-08, ~3B
-   tokens). Validates the real data path and the token-budget assumption (2–3B vs
-   5B to 3.28) before any paid run.
-2. ~~Fix the mode-3 launch order~~ — *done*: launch cursor plus measured-order
-   bucket rebuild ([`docs/decisions.md`](docs/decisions.md) §6).
-3. **Cheap 2-GPU session** (~$5, Vast/RunPod community) — the next action. First
-   NCCL contact, time the three DDP modes, verify mode 3 overlaps. Not for
-   reported numbers.
+1. **Rotary embeddings** — the last piece of the modernization pack (largest
+   single early-speedrun lever). Replaces the learned `wpe`.
+2. **500-step sanity run on aurora**, then the **overnight calibration run** —
+   measures tokens-to-3.28 for the modernized model; that number, not the
+   estimated ~2.2×, drives the final budget arithmetic.
+3. **First larger-GPU session** (single 8-GPU node, RunPod has capacity):
+   roofline + `nccl-tests`, image-parity check, then
+   [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) across the four
+   modes × compile on/off — the 2×3090 session showed compile kills hook-based
+   overlap, and `ddp_torch` (which gets dynamo's DDPOptimizer graph breaks)
+   is the interesting comparison. Then the first converged Track A run.
+4. DiLoCo and the netem bandwidth curve after that.
 
 ## Known gaps
 
 - **Image parity with the cloud is unproven.** The pinned image builds and its
-  tests pass on aurora (toolkit installed via
-  [`scripts/setup-docker-nvidia.sh`](scripts/setup-docker-nvidia.sh)), but "same
-  image everywhere" stays a claim until the first rented node runs it.
-- **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline script
-  first thing on any rented node, alongside `nccl-tests`.
-- **The three DDP modes have never been timed against each other**, which is the
-  measurement they exist for. It needs ≥2 GPUs — next-steps item 3 covers it, and
-  [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) is ready to run there;
-  correctness tests cannot tell a mode that overlaps from one that does not.
+  tests pass on aurora, but the 2×3090 session used a `uv` env on the provider's
+  template (RunPod pods cannot run Docker-in-Docker); parity needs a session
+  whose pod boots our image from a registry.
+- **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline
+  script first thing on any rented node. (Both 3090s measured so far differ by
+  9% — per-box measurement is mandatory.)
+- **Mode timings exist only at 2 ranks over SHM.** Naive-vs-bucketed differences
+  grow with world size and transport latency; the cluster session reruns the
+  bench at 8 ranks. The compile-vs-overlap question (session log, decisions §13)
+  is open and shapes the Track A matrix.
 - **No spot-preemption recovery.** Basic single-file save/resume exists
   (`--checkpoint-every N`, `--resume`), enough to interrupt a local run; the
   DCP/preemption hardening is deliberately deferred
   ([`docs/decisions.md`](docs/decisions.md) §12) — it only matters if spot is chosen.
-- **NCCL is untestable on aurora and stays unproven until first rented hardware.**
-  Two ranks cannot share one GPU: NCCL rejects it outright (`ncclInvalidUsage`,
-  duplicate GPU in the communicator), and there is no flag around it. What *does* run
-  locally is `torchrun --nproc_per_node=2 --device cuda:0 --distributed-backend gloo`,
-  which exercises `torchrun`, `cuda:{local_rank}` placement and collectives on CUDA
-  tensors — everything except NCCL itself. Next-steps item 3 closes this.
+- **Tokens-to-3.28 for the modernized model is unmeasured** — the calibration
+  run (next steps, item 2) exists to replace the ~2.2× estimate before any paid
+  converged run.
 
 ## Mac fallback
 

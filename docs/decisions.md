@@ -522,7 +522,22 @@ comparable — dashboard curves across code states mislead; (2) the zero-init
 head deliberately trades early loss (it must grow from zero) for the
 long-horizon win, so short-horizon comparisons penalize it by construction.
 
-**Next, in order:** overnight calibration
-measuring tokens-to-3.28 → budget arithmetic with the measured number → first
+**Calibration result (2026-08-13).** `rotary-calibration-3B`, 6000 steps /
+2.95B tokens, full trapezoid: final val **3.333** — the 3.28 target was *not*
+crossed (vanilla measured 3.502 at the same token count). The run was
+interrupted at step ~4990 and resumed from the 4750 checkpoint; the resume
+omitted `--run-name`, so its last 1250 steps are logged under
+`3090-fineweb-3B-modded` on the dashboard — the segments are one run (the
+checkpoint's `wpe`-less state dict only loads on rotary code, and the val
+curve is continuous). Two operational notes from this: pass `--run-name` on
+every resume, and `checkpoints/ckpt.pt` is a single shared path — a new run
+silently overwrites the previous run's checkpoint.
+
+**Next, in order:** observe the first 3.28 crossing by *continuing* the
+calibration run from its step-6000 checkpoint with `--max-steps 9000`
+(reuses the 12.8h already spent; the cost is a composite LR schedule — the
+model re-enters the 0.0018 plateau after having warmed down, so expect a
+transient bump and read the resulting tokens-to-3.28 as an upper bound)
+→ budget arithmetic with the measured number → first
 larger-GPU session (single 8-GPU node; the mode × compile matrix now includes
 the `ddp_torch` baseline).

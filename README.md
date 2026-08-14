@@ -206,10 +206,10 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **Overnight calibration run** (the 500-step sanity run passed, and a
-   controlled A/B put rotary 0.74 val ahead at step 500 — decisions §13) —
-   measures tokens-to-3.28 for the modernized model; that number, not the
-   estimated ~2.2×, drives the final budget arithmetic.
+1. **Measure the first 3.28 crossing.** The 6000-step calibration run ended at
+   val 3.333 — close, but not crossed (decisions §13); it is being continued
+   from its checkpoint to 9000 steps to observe the crossing. That number, not
+   the estimated ~2.2×, drives the final budget arithmetic.
 2. **First larger-GPU session** (single 8-GPU node, RunPod has capacity):
    roofline + `nccl-tests`, image-parity check, then
    [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) across the four
@@ -235,9 +235,10 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
   (`--checkpoint-every N`, `--resume`), enough to interrupt a local run; the
   DCP/preemption hardening is deliberately deferred
   ([`docs/decisions.md`](docs/decisions.md) §12) — it only matters if spot is chosen.
-- **Tokens-to-3.28 for the modernized model is unmeasured** — the calibration
-  run (next steps, item 2) exists to replace the ~2.2× estimate before any paid
-  converged run.
+- **Tokens-to-3.28 for the modernized model is bounded but not yet measured** —
+  the 6000-step calibration reached 3.333 at 2.95B tokens without crossing;
+  the 9000-step run (next steps, item 1) observes the actual crossing before
+  any paid converged run.
 
 ## Mac fallback
 

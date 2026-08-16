@@ -206,17 +206,17 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **Measure the first 3.28 crossing.** The 6000-step calibration run ended at
-   val 3.333 — close, but not crossed (decisions §13); it is being continued
-   from its checkpoint to 9000 steps to observe the crossing. That number, not
-   the estimated ~2.2×, drives the final budget arithmetic.
-2. **First larger-GPU session** (single 8-GPU node, RunPod has capacity):
+1. **First larger-GPU session** (single 8-GPU node, RunPod has capacity):
    roofline + `nccl-tests`, image-parity check, then
    [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) across the four
    modes × compile on/off — the 2×3090 session showed compile kills hook-based
    overlap, and `ddp_torch` (which gets dynamo's DDPOptimizer graph breaks)
-   is the interesting comparison. Then the first converged Track A run.
-3. DiLoCo and the netem bandwidth curve after that.
+   is the interesting comparison. Then the first converged Track A run at
+   9000 steps / 4.4B tokens — the calibration verdict (decisions §13): a
+   clean 6000-step schedule ended at 3.333, the 9000-step continuation was at
+   3.355 with 500 steps of warmdown left, so 9000 steps crosses 3.28 at or
+   near its end. Budgeted at ~$30–55 for the whole session.
+2. DiLoCo and the netem bandwidth curve after that.
 
 ## Known gaps
 
@@ -235,10 +235,11 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
   (`--checkpoint-every N`, `--resume`), enough to interrupt a local run; the
   DCP/preemption hardening is deliberately deferred
   ([`docs/decisions.md`](docs/decisions.md) §12) — it only matters if spot is chosen.
-- **Tokens-to-3.28 for the modernized model is bounded but not yet measured** —
-  the 6000-step calibration reached 3.333 at 2.95B tokens without crossing;
-  the 9000-step run (next steps, item 1) observes the actual crossing before
-  any paid converged run.
+- **Tokens-to-3.28 is bracketed (2.95B–4.4B), not observed.** The 9000-step
+  continuation died at step 8650 with val 3.355 at 8500 and the warmdown
+  accelerating; the crossing was extrapolated, not seen ([`docs/decisions.md`](docs/decisions.md)
+  §13). The first converged cloud run doubles as the measurement — its own
+  first unsmoothed crossing is the number that gets reported.
 
 ## Mac fallback
 

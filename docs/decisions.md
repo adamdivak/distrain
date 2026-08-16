@@ -533,11 +533,32 @@ curve is continuous). Two operational notes from this: pass `--run-name` on
 every resume, and `checkpoints/ckpt.pt` is a single shared path — a new run
 silently overwrites the previous run's checkpoint.
 
-**Next, in order:** observe the first 3.28 crossing by *continuing* the
-calibration run from its step-6000 checkpoint with `--max-steps 9000`
-(reuses the 12.8h already spent; the cost is a composite LR schedule — the
-model re-enters the 0.0018 plateau after having warmed down, so expect a
-transient bump and read the resulting tokens-to-3.28 as an upper bound)
-→ budget arithmetic with the measured number → first
-larger-GPU session (single 8-GPU node; the mode × compile matrix now includes
-the `ddp_torch` baseline).
+**Continuation outcome (2026-08-16).** The continuation (6000 → 9000 from the
+step-6000 checkpoint) behaved exactly as predicted: re-entry bump to 3.464,
+plateau grind back to 3.426 by step 8000, then the warmdown — 3.395 @ 8250,
+**3.355 @ 8500** (4.18B tokens), per-250-step drops accelerating (−0.031,
+−0.040) with 9.0e-4 of LR still to anneal. The process died at step 8650
+(Claude Code session teardown killed the detached process — twice, `setsid
+nohup` included) and the last 350 steps were abandoned rather than re-resumed.
+Extrapolating the warmdown puts the 9000-step val at ~3.26–3.29: the crossing
+sits right at the end of the composite schedule. Verdict, recorded in place of
+a measured crossing: **tokens-to-3.28 is >2.95B (a clean 6000-step schedule
+ended at 3.333) and ≈4.4B under a composite schedule that a clean one beats.**
+The converged-run recipe is therefore a clean 9000-step trapezoid — 4.42B
+tokens, expected to cross at or shortly before its end — versus ~10B for
+vanilla: the modernization delivered the estimated ~2.2×.
+
+**Budget arithmetic** (with N = 162.2M untied → 1.087e9 FLOPs/token by the §3
+convention): one converged run is 4.42e9 × 1.087e9 ≈ **4.8e18 FLOPs**. On
+8×A100 (312 TF dense each) at an assumed 35–45% MFU that is 1.3–1.7 h of node
+time — **$15–27** at RunPod's ~$10–15/h. Cross-check from aurora: the 3090 run
+took 19h at 84.7% MFU; an 8×A100 node has ~30× the peak, so ~1.4 h at 40% MFU.
+Roofline + nccl-tests + the 4-mode × compile bench add ~1–2 h more. The first
+8-GPU session, converged run included, fits in **~$30–55** — comfortably
+inside the $150 target even with a retry.
+
+**Next, in order:** first larger-GPU session — single 8-GPU node, *attended*
+(the §9 kill-switch launcher gates unattended runs only, matching the 2×3090
+precedent): roofline + `nccl-tests`, image-parity check, `bench_ddp_modes`
+across the four modes × compile, then the first converged Track A run at
+9000 steps → DiLoCo + netem after that.

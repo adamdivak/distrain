@@ -24,9 +24,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         iproute2 \
+        openssh-server \
+        rsync \
     && rm -rf /var/lib/apt/lists/*
 # iproute2 provides `tc`, needed for the netem slow-network trick (brief §5,
 # decisions §9). It does nothing without --cap-add=NET_ADMIN at run time.
+# openssh-server + rsync serve pods that boot this image directly on a cloud
+# provider (scripts/pod-entry.sh starts sshd there); both are inert on aurora.
+
+# nccl-tests, prebuilt so the bandwidth ceiling (all_reduce_perf) costs zero
+# paid minutes and no compiler friction on a rented node.
+RUN git clone --depth 1 https://github.com/NVIDIA/nccl-tests /opt/nccl-tests \
+    && make -C /opt/nccl-tests -j"$(nproc)" \
+    && rm -rf /opt/nccl-tests/src /opt/nccl-tests/.git
 
 # uv config, baked so `python`/`pytest`/`torchrun` Just Work at run time:
 #  - the project venv lives at /opt/venv, OUTSIDE /workspace, so bind-mounting a
@@ -46,12 +56,12 @@ WORKDIR /workspace
 # uv.lock is stale relative to pyproject.toml.
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --extra dev
+    uv sync --frozen --no-install-project --extra dev --extra data
 
 # Project layer: the source, then install the distrain package into the same venv.
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --extra dev
+    uv sync --frozen --extra dev --extra data
 
 # Baked venv first on PATH -> no `uv run` needed at run time; `uv run --no-sync`
 # also resolves to it via UV_PROJECT_ENVIRONMENT.

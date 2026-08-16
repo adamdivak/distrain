@@ -108,6 +108,14 @@ scripts/container.sh run torchrun --nproc_per_node=1 -m distrain.train --max-ste
 live without a rebuild (the venv lives at `/opt/venv`, outside the mount). `--no-mount`
 runs the code baked into the image — the reproducible mode for reported results.
 
+For cloud sessions the image is pushed to **`ghcr.io/adamdivak/distrain:<git-sha>`**
+(private, like the repo) and the pod boots it directly with
+[`scripts/pod-entry.sh`](scripts/pod-entry.sh) as the start command — it starts
+sshd from the provider-injected key and exports the baked env to SSH sessions.
+The image also carries a prebuilt `nccl-tests` (`/opt/nccl-tests/build/`) and the
+`data` extra, so a pod needs zero setup beyond booting. Build/push/provision
+steps: [`docs/runbook-8gpu-runpod.md`](docs/runbook-8gpu-runpod.md).
+
 ## Data
 
 The full FineWeb10B set (104 shards, ~19 GiB; see
@@ -206,7 +214,8 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **First larger-GPU session** (single 8-GPU node, RunPod has capacity):
+1. **First larger-GPU session** (single 8-GPU node, RunPod has capacity) —
+   runbook: [`docs/runbook-8gpu-runpod.md`](docs/runbook-8gpu-runpod.md):
    roofline + `nccl-tests`, image-parity check, then
    [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) across the four
    modes × compile on/off — the 2×3090 session showed compile kills hook-based
@@ -220,10 +229,11 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ## Known gaps
 
-- **Image parity with the cloud is unproven.** The pinned image builds and its
-  tests pass on aurora, but the 2×3090 session used a `uv` env on the provider's
-  template (RunPod pods cannot run Docker-in-Docker); parity needs a session
-  whose pod boots our image from a registry.
+- **Image parity with the cloud is unproven — but the path is built.** The
+  image now boots standalone (sshd via `pod-entry.sh`, rehearsed end-to-end on
+  aurora including SSH-session env propagation) and the 8-GPU runbook's step 3
+  is the parity proof: the full suite green on the baked code, no rsync, no
+  `uv sync`. Proven only when that session runs.
 - **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline
   script first thing on any rented node. (Both 3090s measured so far differ by
   9% — per-box measurement is mandatory.)

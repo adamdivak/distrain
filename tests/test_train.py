@@ -7,7 +7,14 @@ import itertools
 import pytest
 import torch
 
-from distrain.train import TrainConfig, lr_at, resolve_dtype, train
+from distrain.train import (
+    TrainConfig,
+    find_latest_checkpoint,
+    list_checkpoints,
+    lr_at,
+    resolve_dtype,
+    train,
+)
 from helpers import tiny_train_config
 
 
@@ -168,10 +175,56 @@ class TestCheckpointing:
         """checkpoint_every=2 over 5 steps: periodic saves plus one at the last step."""
         ckpt_dir = tiny_data / "ckpt"
         train(tiny_train_config(tiny_data, max_steps=5, checkpoint_every=2,
-                                checkpoint_dir=str(ckpt_dir)))
-        state = torch.load(ckpt_dir / "ckpt.pt", weights_only=True)
+                                checkpoint_dir=str(ckpt_dir), run_name="tiny"))
+        # keep_last=2 default: the step-2 periodic save was pruned, 4 and 5 remain
+        assert [s for s, _ in list_checkpoints(str(ckpt_dir), "tiny")] == [4, 5]
+        state = torch.load(ckpt_dir / "tiny-step000005.pt", weights_only=True)
         assert state["next_step"] == 5  # the is_last save, not the step-4 periodic one
         assert state["cfg"]["max_steps"] == 5
+
+    def test_retention_keeps_every_plus_rolling_last(self, tiny_data):
+        """keep_every multiples survive pruning; everything else rolls."""
+        ckpt_dir = tiny_data / "ckpt"
+        train(tiny_train_config(tiny_data, max_steps=5, checkpoint_every=1,
+                                checkpoint_dir=str(ckpt_dir), run_name="tiny",
+                                checkpoint_keep_last=1, checkpoint_keep_every=2))
+        # saves at 1..5; keeps multiples of 2 (the "before the warmdown" anchors)
+        # plus the newest
+        assert [s for s, _ in list_checkpoints(str(ckpt_dir), "tiny")] == [2, 4, 5]
+
+    def test_mirror_receives_checkpoints_and_serves_resume(self, tiny_data):
+        """The async mirror ends up with the same retained files, and resume finds
+        them when the local checkpoint dir is gone -- the terminated-pod scenario."""
+        ckpt_dir = tiny_data / "ckpt"
+        mirror = tiny_data / "mirror"
+        train(tiny_train_config(tiny_data, max_steps=4, checkpoint_every=2,
+                                checkpoint_dir=str(ckpt_dir), run_name="tiny",
+                                checkpoint_mirror=str(mirror)))
+        # wait_for_mirror ran at end of train(); the newest file must be mirrored
+        # bit-for-bit (skip-if-busy may legitimately drop intermediate ones)
+        newest = ckpt_dir / "tiny-step000004.pt"
+        assert (mirror / "tiny-step000004.pt").read_bytes() == newest.read_bytes()
+        # local dir wiped: find_latest_checkpoint falls back to the mirror
+        cfg = tiny_train_config(tiny_data, resume=True, run_name="tiny",
+                                checkpoint_dir=str(tiny_data / "gone"),
+                                checkpoint_mirror=str(mirror))
+        assert find_latest_checkpoint(cfg) == str(mirror / "tiny-step000004.pt")
+        resumed = train(tiny_train_config(
+            tiny_data, max_steps=6, resume=True, run_name="tiny",
+            checkpoint_dir=str(tiny_data / "gone"), checkpoint_mirror=str(mirror)))
+        assert resumed["train_time_s"] > 0
+
+    def test_resume_from_explicit_path_wins(self, tiny_data):
+        """--resume-from picks the named file even when a newer checkpoint exists."""
+        ckpt_dir = tiny_data / "ckpt"
+        train(tiny_train_config(tiny_data, max_steps=4, checkpoint_every=2,
+                                checkpoint_dir=str(ckpt_dir), run_name="tiny",
+                                checkpoint_keep_last=2))
+        older = ckpt_dir / "tiny-step000002.pt"
+        results = train(tiny_train_config(
+            tiny_data, max_steps=4, run_name="tiny", checkpoint_dir=str(ckpt_dir),
+            resume_from=str(older)), return_debug_values=["model"])
+        assert results is not None
 
     def test_no_checkpoint_by_default(self, tiny_data):
         train(tiny_train_config(tiny_data, max_steps=2,

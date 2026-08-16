@@ -69,3 +69,4 @@ wall-clock ceiling and teardown-on-exception (`docs/decisions.md` §9).
 - Real FineWeb shards are 190 MiB each, ~19 GiB for the full set. 
   Synthetic shards were used initially in local development.
 - Keep documents and code comments concise.
+- Do not add 'Co-authored by Claude' at the end of commit messages.

@@ -110,7 +110,9 @@ display-only — raw ms/step is unaffected either way.
 ```bash
 SSH 'cd /workspace && python scripts/make_synthetic_shards.py --out data/synthetic --shards 2'
 SSH 'cd /workspace && NCCL_DEBUG=INFO torchrun --standalone --nproc_per_node=8 -m distrain.train \
-     --distributed-mode ddp_naive --max-steps 5 --global-batch-seqs 64 --log-every 1 --no-trackio'
+     --distributed-mode ddp_naive --max-steps 5 --warmup-steps 0 --warmdown-steps 0 \
+     --global-batch-seqs 64 --log-every 1 --no-trackio'
+# --warmup/--warmdown 0: lr_at asserts the trapezoid fits inside max_steps
 # repeat: ddp_bucketed, ddp_interleaved, ddp_torch — losses must agree to ~1e-3
 ```
 
@@ -147,8 +149,8 @@ Sanity gates, in order — stop early rather than pay for a broken run:
 
 - step-0 val loss must print **10.8265** (= ln 50304): the zero-init-head
   fingerprint that the right code is running.
-- val at step 250 ≈ 5.7, step 500 ≈ 4.9 (aurora's curve; large deviation =
-  stop and pull logs).
+- val at step 250 ≈ 5.40, step 500 ≈ 4.51 (aurora's `rotary-calibration-3B`
+  curve, from the trackio DB; large deviation = stop and pull logs).
 - the number the session exists for: the loop's
   **`reached target 3.28 at step N after Xs`** line — first unsmoothed
   crossing, training time already excludes validation. Expected near the end

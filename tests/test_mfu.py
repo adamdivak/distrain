@@ -25,7 +25,7 @@ class TestPeakLookup:
             ("NVIDIA H100 80GB HBM3", 989.0),
             ("NVIDIA H100 PCIe", 756.0),
             ("NVIDIA H100 NVL", 835.0),
-            ("NVIDIA A100-SXM4-80GB", 312.0),
+            ("NVIDIA A100-SXM4-80GB", 269.9),
             ("NVIDIA A100-PCIE-40GB", 312.0),
             ("NVIDIA L40S", 181.0),
             ("NVIDIA GeForce RTX 3090", 82.6),
@@ -55,7 +55,13 @@ class TestPeakLookup:
 
     def test_unverified_entries_say_so(self):
         """Datacenter figures are datasheet values until a roofline is measured."""
-        assert "UNVERIFIED" in peak_bf16_spec("NVIDIA A100-SXM4-80GB").source
+        assert "UNVERIFIED" in peak_bf16_spec("NVIDIA A100-PCIE-40GB").source
+        assert "UNVERIFIED" in peak_bf16_spec("NVIDIA H100 80GB HBM3").source
+
+    def test_a100_sxm_is_measured(self):
+        """Measured on runpod 8xA100 (US-MD-1, 2026-08-16): 269.9 sustained bf16,
+        86.5% of the 312 datasheet figure the table previously carried."""
+        assert peak_bf16_spec("NVIDIA A100-SXM4-80GB").measured
 
     def test_unknown_device_raises(self):
         with pytest.raises(KeyError, match="no bf16 dense peak recorded"):

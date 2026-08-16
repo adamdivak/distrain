@@ -20,6 +20,9 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
+import shutil
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
@@ -101,12 +104,21 @@ class TrainConfig:
     compile: bool = False
     seed: int = 1337
 
-    # checkpointing: rank 0 writes {checkpoint_dir}/ckpt.pt every N steps (0 = never);
-    # --resume continues from it. Point checkpoint_dir somewhere run-specific when
-    # several runs share a working directory.
+    # checkpointing: rank 0 writes {checkpoint_dir}/{run_name}-step{N}.pt every N
+    # steps (0 = never); --resume continues from the newest one for this run name,
+    # --resume-from from an explicit file. Retention: the newest keep_last files,
+    # plus every keep_every'th step permanently (0 = off) — the permanent keeps are
+    # what make "re-enter before the warmdown started" possible after the fact.
     checkpoint_dir: str = "checkpoints"
     checkpoint_every: int = 0
     resume: bool = False
+    resume_from: str | None = None
+    checkpoint_keep_last: int = 2
+    checkpoint_keep_every: int = 2000
+    # off-box durability: after the atomic local save, a background thread copies
+    # the file here (e.g. a network volume) and applies the same retention. Copies
+    # are skip-if-busy so a slow volume can never stall the training loop.
+    checkpoint_mirror: str | None = None
 
     # distributed
     world_size: int = 1
@@ -242,11 +254,98 @@ def setup_distributed(world_size, rank, device, init_method="env://", distribute
 def cleanup_distributed():
     torch.distributed.destroy_process_group()
 
-def save_checkpoint(path: str, model: GPT, optimizer, cfg: TrainConfig,
-                    next_step: int, train_time_s: float, results: dict) -> None:
-    """Single-file checkpoint, written atomically by rank 0 only.
+_CKPT_STEP_RE = re.compile(r"-step(\d+)\.pt$")
+_mirror_thread: threading.Thread | None = None
 
-    `os.replace` means an interrupt mid-save leaves the previous checkpoint intact
+
+def checkpoint_stem(cfg: TrainConfig) -> str:
+    return (cfg.run_name or "run").replace(os.sep, "_")
+
+
+def list_checkpoints(ckpt_dir: str, stem: str) -> list[tuple[int, str]]:
+    """(step, path) pairs for this run in ckpt_dir, sorted by step."""
+    entries = []
+    for path in glob.glob(os.path.join(ckpt_dir, f"{stem}-step*.pt")):
+        m = _CKPT_STEP_RE.search(path)
+        if m:
+            entries.append((int(m.group(1)), path))
+    return sorted(entries)
+
+
+def find_latest_checkpoint(cfg: TrainConfig) -> str | None:
+    """Newest checkpoint for this run name: local dir first, then the mirror.
+
+    Local wins when both exist — the mirror is a copy of local, so local is never
+    behind it within one machine's lifetime; the mirror matters when the local disk
+    is gone (a terminated pod) and the volume is all that survived.
+    """
+    for d in (cfg.checkpoint_dir, cfg.checkpoint_mirror):
+        if d:
+            entries = list_checkpoints(d, checkpoint_stem(cfg))
+            if entries:
+                return entries[-1][1]
+    return None
+
+
+def _prune_checkpoints(ckpt_dir: str, stem: str, keep_last: int, keep_every: int) -> None:
+    entries = list_checkpoints(ckpt_dir, stem)
+    keep = {path for _, path in entries[-max(keep_last, 1):]}
+    if keep_every > 0:
+        keep |= {path for step, path in entries if step % keep_every == 0}
+    for _, path in entries:
+        if path not in keep:
+            os.remove(path)
+
+
+def _mirror_checkpoint(path: str, cfg: TrainConfig) -> None:
+    """Copy the just-saved checkpoint to cfg.checkpoint_mirror in the background.
+
+    Skip-if-busy: if the previous copy is still in flight the new one is dropped —
+    the next save catches the mirror up. Copy lands under a .tmp name and is
+    renamed, so the mirror never holds a truncated checkpoint.
+    """
+    global _mirror_thread
+    if _mirror_thread is not None and _mirror_thread.is_alive():
+        return
+
+    def copy() -> None:
+        os.makedirs(cfg.checkpoint_mirror, exist_ok=True)
+        dst = os.path.join(cfg.checkpoint_mirror, os.path.basename(path))
+        tmp = dst + ".tmp"
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, dst)
+        _prune_checkpoints(cfg.checkpoint_mirror, checkpoint_stem(cfg),
+                           cfg.checkpoint_keep_last, cfg.checkpoint_keep_every)
+
+    _mirror_thread = threading.Thread(target=copy, daemon=True)
+    _mirror_thread.start()
+
+
+def wait_for_mirror(cfg: TrainConfig) -> None:
+    """Drain the mirror at end of run: join any in-flight copy, then copy the
+    newest local checkpoint synchronously if skip-if-busy dropped it."""
+    if _mirror_thread is not None:
+        _mirror_thread.join()
+    stem = checkpoint_stem(cfg)
+    local = list_checkpoints(cfg.checkpoint_dir, stem)
+    if not local:
+        return
+    _, path = local[-1]
+    dst = os.path.join(cfg.checkpoint_mirror, os.path.basename(path))
+    if not os.path.exists(dst):
+        os.makedirs(cfg.checkpoint_mirror, exist_ok=True)
+        tmp = dst + ".tmp"
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, dst)
+        _prune_checkpoints(cfg.checkpoint_mirror, stem,
+                           cfg.checkpoint_keep_last, cfg.checkpoint_keep_every)
+
+
+def save_checkpoint(model: GPT, optimizer, cfg: TrainConfig,
+                    next_step: int, train_time_s: float, results: dict) -> str:
+    """Per-step checkpoint file, written atomically by rank 0 only.
+
+    `os.replace` means an interrupt mid-save leaves prior checkpoints intact
     instead of a truncated file. RNG state is deliberately not saved: with
     `dropout == 0` the training loop draws no random numbers -- seeding only affects
     init, which the checkpoint overwrites -- and per-rank streams would need
@@ -261,22 +360,32 @@ def save_checkpoint(path: str, model: GPT, optimizer, cfg: TrainConfig,
                     ("target_reached_step", "target_reached_train_time_s")},
         "cfg": asdict(cfg),
     }
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    stem = checkpoint_stem(cfg)
+    path = os.path.join(cfg.checkpoint_dir, f"{stem}-step{next_step:06d}.pt")
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     tmp = path + ".tmp"
     torch.save(state, tmp)
     os.replace(tmp, path)
+    _prune_checkpoints(cfg.checkpoint_dir, stem,
+                       cfg.checkpoint_keep_last, cfg.checkpoint_keep_every)
+    if cfg.checkpoint_mirror:
+        _mirror_checkpoint(path, cfg)
+    return path
 
 
-def load_checkpoint(path: str, model: GPT, optimizer, device: str) -> dict:
+def load_checkpoint(path: str | None, model: GPT, optimizer, device: str) -> dict:
     """Load model + optimizer state in place; the caller applies the rest."""
-    if not os.path.exists(path):
+    if path is None or not os.path.exists(path):
         raise FileNotFoundError(
-            f"--resume was given but no checkpoint exists at {path!r}. "
-            f"Drop --resume to start fresh, or point --checkpoint-dir at the run to continue."
+            f"--resume was given but no checkpoint was found"
+            f"{f' at {path!r}' if path else ''}. Drop --resume to start fresh, "
+            f"point --checkpoint-dir (or --checkpoint-mirror) at the run to "
+            f"continue, or name a file with --resume-from."
         )
     state = torch.load(path, map_location=device, weights_only=True)
     model.load_state_dict(state["model"])
     optimizer.load_state_dict(state["optimizer"])
+    state["path"] = path
     return state
 
 
@@ -368,11 +477,11 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
     # Resume before the synchronizer is built, so replica equality still comes from
     # its rank-0 broadcast (decisions.md section 6) rather than from every rank
     # having read the same file.
-    ckpt_path = os.path.join(cfg.checkpoint_dir, "ckpt.pt")
     start_step = 0
     resumed: dict | None = None
-    if cfg.resume:
-        resumed = load_checkpoint(ckpt_path, raw_model, optimizer, device)
+    if cfg.resume or cfg.resume_from:
+        resume_path = cfg.resume_from or find_latest_checkpoint(cfg)
+        resumed = load_checkpoint(resume_path, raw_model, optimizer, device)
         start_step = resumed["next_step"]
     # raw_model: DDP's wrapper (unlike torch.compile's) does not delegate
     # attribute access to the module it wraps
@@ -393,7 +502,7 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
 
     if is_primary:
         if resumed is not None:
-            print(f"resumed from {ckpt_path} at step {start_step}")
+            print(f"resumed from {resumed['path']} at step {start_step}")
         print(
             f"device={device} dtype={dtype} params={raw_model.num_params()/1e6:.1f}M "
             f"tokens/step={plan.global_batch_seqs * cfg.seq_len:,} steps={cfg.max_steps}"
@@ -506,8 +615,12 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
         # is captured. Rank 0 only: post-reduce state is identical on every rank.
         if (cfg.checkpoint_every > 0 and is_primary
                 and ((step + 1) % cfg.checkpoint_every == 0 or is_last)):
-            save_checkpoint(ckpt_path, raw_model, optimizer, cfg,
+            save_checkpoint(raw_model, optimizer, cfg,
                             step + 1, train_time_s, results)
+
+    # The final save's off-box copy must land before the process can exit.
+    if cfg.checkpoint_mirror and is_primary and cfg.checkpoint_every > 0:
+        wait_for_mirror(cfg)
 
     # No rank may start tearing down while another is still in a collective; see
     # DistributedSynchronizer.wait_for_all_ranks. Outside the timed region: this is

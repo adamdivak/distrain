@@ -682,21 +682,34 @@ measured, not a confound.
   momentum=0.9)` over a copy of the params, with the averaged Δ assigned
   into `.grad` — no hand-rolled momentum. Cost: two extra model-sized
   tensors per rank (round-start params + momentum buffer), trivial at 162M.
-- **Checkpoints carry the outer state** (round-start params + momentum
-  buffer). With that included, resume is exact at any step, mid-round or
-  boundary — round structure is a pure function of the step index, same as
-  LR and data (§12's resume rule extends: H and outer hypers must come from
-  the same command line).
+- **Checkpoints are per-rank in `diloco`** — the rank-0-only file is no
+  longer complete state. It suffices for DDP because post-reduce gradients
+  are identical on every rank, so every rank's AdamW state evolves
+  identically; `diloco` breaks exactly that premise: each rank's inner
+  (m, v) genuinely differs, and mid-round so do its params. Restoring
+  rank 0's state onto every rank is a silent trajectory change, not a
+  resume. So each rank saves `{run}-step{N}-rank{r}.pt` (its replica params
+  + its inner optimizer state); the outer state (round-start params +
+  momentum buffer) is identical everywhere by construction and lives in
+  rank 0's file only. With that, resume is exact at any step, mid-round or
+  boundary — round structure stays a pure function of the step index.
+  §12's resume rule extends: H, the outer hypers *and the world size* must
+  match the original command line — a `diloco` checkpoint set is
+  K-specific. Retention and mirroring treat a step's K files as one unit.
 
 **Validation and the crossing under DiLoCo.** Mid-round, replicas have
 genuinely diverged, so rank 0's val loss measures *rank 0's replica*, not
 "the model" — the shared model only exists at round boundaries, just after
-the outer step. Therefore: the **reported val curve and the §4 crossing use
-boundary evals only** (every H = 500 steps, evaluating the freshly synced
-params); mid-round evals at the usual 250 cadence are kept as a diagnostic
-curve, labeled per-replica, and never used for the crossing. This is the §4
-definition applied to the only model DiLoCo has, at the granularity it has
-it; the coarser 500-step crossing resolution is a property of the method.
+the outer step. This is not merely a labeling problem: the ≤ 3.28 check runs
+in the loop at every eval, so a mid-round eval of one lucky replica could
+cross before the synced model does and silently corrupt the headline metric.
+Therefore `diloco` **requires `val_every % H == 0`**, asserted at startup
+(`lr_at`-style, fails loudly), and at a boundary step the eval runs *after*
+the outer step, measuring the freshly synced params — every reported val
+point is the shared model by construction, and nothing alternates. A
+per-replica diagnostic eval can be added later behind an explicit flag; it
+must never share the reported metric's path. The coarser 500-step crossing
+resolution is a property of the method.
 
 **Invariants — load-bearing:**
 
@@ -724,9 +737,12 @@ it; the coarser 500-step crossing resolution is a property of the method.
    multiples of H, including under gradient accumulation (H counts
    optimizer steps, not micro-batches).
 5. *Resume:* checkpoint mid-round and at a boundary; both continue
-   bit-identically, momentum buffer included.
-6. *Eval placement:* boundary evals see the synced model (a mid-round eval
-   on a diverged replica must not be reported as the shared curve).
+   bit-identically **on every rank** — specifically rank ≠ 0's inner Adam
+   state must round-trip, because a rank-0-only restore passes a
+   parameter-equality check and still diverges.
+6. *Eval placement:* `val_every % H != 0` fails at startup; at a boundary
+   step the eval observes the post-outer-step (synced) params, not the
+   pre-outer-step replica.
 
 **Open measurement:** tokens-to-3.28 under untuned DiLoCo — expected above
 DDP's 4.92B; how much above *is* the result. One converged anchor in the

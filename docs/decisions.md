@@ -604,3 +604,131 @@ what supersedes §13's bracket:
   crossing). §13's estimate said $30–55: the overrun bought a credit-death
   lesson, a checkpoint system, and both the 9000- and 10000-step schedule
   endpoints. Project spend to date ≈ $83 of the $150 target.
+
+## 15. The netem curve: converged runs only where the math changes — **load-bearing** (2026-08-17)
+
+The naive netem plan — a converged run per (bandwidth × method) point — does
+not fit the remaining budget and is not necessary:
+
+- **DDP's val-vs-step curve is transport-invariant.** netem changes how long
+  an all-reduce takes, never what it computes; data order and LR are pure
+  functions of the step (§7, §13). The §14 replication (three runs, different
+  hardware *and* chunkings, ≤0.01 at every shared val point) bounds the
+  residual reduction-order noise. So the crossing stays at step 9999 — up to
+  ±one val interval, since the crossing margin (3.2730 vs 3.28) is inside
+  that ±0.01 band — and **DDP time-to-3.28 at bandwidth *b* is
+  9999 × steady-state step time measured at *b***. A step-time measurement
+  costs minutes per point; a throttled converged run costs hours (step time
+  grows several-fold as comm dominates).
+- **Guard per setting**: a few hundred steps at one throttled bandwidth,
+  checking the early val gates (≈5.40 @ 250, ≈4.50 @ 500), confirms netem
+  moved nothing but the clock. Cheap, and it catches a transport-dependent
+  NCCL algorithm switch actually changing numerics.
+- **Converged runs are reserved for methods that change the math.** DiLoCo's
+  loss-vs-tokens curve genuinely differs from DDP's, so it needs (one or two)
+  converged runs to anchor its tokens-to-target — but its wall-clock is
+  roughly bandwidth-insensitive by construction (communication every H
+  steps), so step-time measurements extend its point across the bandwidth
+  axis the same way.
+
+Consequence: the whole curve is one attended session — bench-style step-time
+sweeps for DDP across netem settings, one sanity-gated throttled segment, and
+DiLoCo's converged anchor — instead of a matrix of converged runs.
+
+## 16. DiLoCo spec (2026-08-17)
+
+**Algorithm: original DiLoCo ([arXiv 2311.08105](https://arxiv.org/abs/2311.08105)),
+untuned, per the §12 scope-box.** Rejected alternatives, both for the same
+reason (their contribution doesn't exist in this study's setting):
+*Streaming DiLoCo* (2501.18512) syncs parameter fragments on a schedule with
+overlap and 4-bit outer gradients — a peak-bandwidth optimization, write-up
+mention only. *Decoupled DiLoCo* (2604.21428) makes the sync asynchronous via
+a CPU-side synchronizer with quorum and grace windows — a fault-tolerance
+system whose point requires stragglers/failures/multi-region; on one netem
+node it degenerates to synchronous DiLoCo plus unused machinery.
+
+**The algorithm.** K replicas start each round with identical params θ. Each
+runs H inner AdamW steps on its own data shard, ending at θᵢ. The outer
+gradient is Δᵢ = θ − θᵢ (the round's displacement, sign-flipped so it points
+like a gradient); replicas all-reduce it, and the mean Δ is applied to the
+round-start θ by an outer SGD-with-Nesterov-momentum step. Inner optimizer
+state (Adam m, v) is per-replica: never communicated, never reset —
+resetting forces Adam's cold start every round, and averaging would double
+the comm volume to synchronize statistics that track each other anyway.
+
+**Hyperparameters — published values, labeled "untuned DiLoCo" (§12):**
+H = 500, outer lr 0.7, Nesterov momentum 0.9. Inner optimizer and trapezoid
+schedule identical to the DDP configs (the paper used cosine; one honest
+sentence in the write-up). Per-rank batch stays 60 seqs, so global token
+throughput matches the DDP config exactly — but there is no gradient
+averaging, so each replica's effective batch is 60, and K× more optimizer
+steps happen per token globally. That is the method difference being
+measured, not a confound.
+
+**Mode design.** `diloco` is a fifth `DistributedSynchronizer` mode:
+
+- `finalize_gradients()` is a **no-op**: no collective, and **no
+  `/ world_size`** — a deliberate carve-out from §6, since nothing was
+  summed across ranks. The accumulation divisor stays in the loop, untouched.
+- One new seam call after `optimizer.step()`: `maybe_outer_step(step)`. At
+  every H-th optimizer step (never micro-step): compute Δ per rank iterating
+  parameters in fixed order (§6 collective-order discipline), all-reduce
+  `SUM`, divide by K, outer-step the round-start params, copy the result
+  into the model on every rank. Every rank computes the identical update
+  from identical inputs, so replica equality is preserved by construction;
+  the §6 init broadcast anchors round 0. For the other four modes the call
+  is a no-op, so the training loop stays mode-blind.
+- The outer optimizer is `torch.optim.SGD(nesterov=True, lr=0.7,
+  momentum=0.9)` over a copy of the params, with the averaged Δ assigned
+  into `.grad` — no hand-rolled momentum. Cost: two extra model-sized
+  tensors per rank (round-start params + momentum buffer), trivial at 162M.
+- **Checkpoints carry the outer state** (round-start params + momentum
+  buffer). With that included, resume is exact at any step, mid-round or
+  boundary — round structure is a pure function of the step index, same as
+  LR and data (§12's resume rule extends: H and outer hypers must come from
+  the same command line).
+
+**Validation and the crossing under DiLoCo.** Mid-round, replicas have
+genuinely diverged, so rank 0's val loss measures *rank 0's replica*, not
+"the model" — the shared model only exists at round boundaries, just after
+the outer step. Therefore: the **reported val curve and the §4 crossing use
+boundary evals only** (every H = 500 steps, evaluating the freshly synced
+params); mid-round evals at the usual 250 cadence are kept as a diagnostic
+curve, labeled per-replica, and never used for the crossing. This is the §4
+definition applied to the only model DiLoCo has, at the granularity it has
+it; the coarser 500-step crossing resolution is a property of the method.
+
+**Invariants — load-bearing:**
+
+- No `/ world_size` anywhere in the `diloco` per-step path.
+- Outer-step collectives iterate parameters in fixed order, unconditionally
+  (§6).
+- **Never compare inner optimizer state across ranks** — (m, v) are
+  *expected* to differ; the invariant is parameter equality at round
+  boundaries only. A test asserting state equality would be asserting a bug.
+- Data sharding is unchanged (§7): each replica consumes its own
+  world-size-independent stream, so token accounting stays comparable
+  with DDP.
+
+**Test matrix (gloo/CPU, §10 harness):**
+
+1. *Identity:* K = 1, outer lr 1.0, momentum 0 → **bitwise** equal to plain
+   `train()` — the outer step reduces to copying θᵢ back over θ, so any
+   deviation is delta/copy plumbing, not tuning.
+2. *Degenerate averaging:* K = 2 with both ranks fed identical data →
+   identical deltas → equal to the K = 1 run.
+3. *Replica equality at boundaries*, fault-injected per §10: scramble one
+   rank's delta before the reduce and the cross-rank agreement test must
+   fail — otherwise it is vacuous.
+4. *Round arithmetic:* the outer step fires exactly at optimizer-step
+   multiples of H, including under gradient accumulation (H counts
+   optimizer steps, not micro-batches).
+5. *Resume:* checkpoint mid-round and at a boundary; both continue
+   bit-identically, momentum buffer included.
+6. *Eval placement:* boundary evals see the synced model (a mid-round eval
+   on a diverged replica must not be reported as the shared curve).
+
+**Open measurement:** tokens-to-3.28 under untuned DiLoCo — expected above
+DDP's 4.92B; how much above *is* the result. One converged anchor in the
+netem session (§15), extendable via checkpoint anchors if the first schedule
+guess lands short, exactly as §14 did.

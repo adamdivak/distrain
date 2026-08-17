@@ -10,7 +10,7 @@ of truth; this file is only what a session needs before touching anything.
 | Machine | Role |
 |---|---|
 | `aurora` (RTX 3090), `adam@aurora` over Tailscale, `~/work/distrain` | **default**: editing, tests, all CUDA work, long runs |
-| rented cloud nodes | all reported results — none rented yet |
+| rented cloud nodes | all reported results |
 | the Mac (arm64, no NVIDIA) | fallback editor; CPU/MPS correctness only |
 
 Work directly on aurora: `uv run pytest -q`. Real FineWeb data is at

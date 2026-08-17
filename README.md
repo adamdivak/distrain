@@ -68,7 +68,7 @@ Correctness only — a consumer card's numbers do not transfer (`project_brief.m
 | Machine | Role |
 |---|---|
 | `aurora` (RTX 3090, via Tailscale) | default development — editing, tests, all CUDA work, `~/work/distrain` |
-| rented cloud nodes | all reported results — none yet |
+| rented cloud nodes | all reported results |
 | MacBook Pro (arm64) | fallback editor, CPU/MPS correctness only |
 
 Day-to-day work happens directly on aurora (`ssh adam@aurora`); git is for
@@ -226,7 +226,10 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 1. **DiLoCo + the netem bandwidth curve** — the slow-transport side of the
    study, against the fast-interconnect anchor measured on 2026-08-16
-   (3147.1 s / 4.92B tokens to 3.28 on 8×A100 NVLink). Rerun the bench
+   (3147.1 s / 4.92B tokens to 3.28 on 8×A100 NVLink). Only DiLoCo needs
+   converged runs on the curve: DDP's crossing step is transport-invariant,
+   so its time-to-target at each bandwidth is step-time × 9999 — see
+   [`docs/decisions.md`](docs/decisions.md) §15. Rerun the bench
    matrix once under netem: the per-transport compile × overlap result
    predicts uncompiled interleaved retakes the lead once comm dominates.
 2. Track B (FSDP2 at ~7B on one 8-GPU node) after that.

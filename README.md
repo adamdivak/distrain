@@ -14,12 +14,22 @@ time-to-target-loss, and to quantify where and why the two diverge.
 
 ## Status
 
+**The first Track A number exists** ([session log](docs/sessions/2026-08-16-runpod-8xa100.md)):
+on a rented 8×A100-SXM4 node, the 124M/162M model reached the 3.28 val-loss
+target at **4.92B tokens / 3147.1 s of training time** (clean 10000-step
+trapezoid, first unsmoothed crossing, ~79% MFU against the measured 269.9
+TFLOP/s roofline, `ddp_torch --compile`). A clean 9000-step schedule ends
+measurably short at 3.2849 / 4.42B tokens.
+
 Single-device training works end to end on CPU, MPS and CUDA; the three hand-rolled
 DDP modes are correct (cursor-ordered launches, measured-order bucket rebuild) and
 PyTorch's own DDP is wired in as a fourth, baseline mode. All four are NCCL-proven
-and timed on a rented 2×3090 ([session log](docs/sessions/2026-08-09-runpod-2x3090.md));
-headline finding: `torch.compile` defeats hook-based overlap, so uncompiled
-interleaved is the fastest configuration on that box.
+and timed on a rented 2×3090 ([session log](docs/sessions/2026-08-09-runpod-2x3090.md))
+and at 8 ranks on the A100 node. The compile × overlap question resolved
+per-transport: over NVLink every compiled config beats every uncompiled one
+(`ddp_torch --compile` fastest); over the 3090s' Socket+SHM, uncompiled
+interleaved wins — overlap buys more than compilation only once communication
+dominates.
 
 The model is no longer vanilla GPT-2: rotary embeddings (replacing `wpe`),
 QK-norm, ReLU², zero-init residual projections, untied zero-init head, trapezoid
@@ -40,7 +50,7 @@ value against the 3.28 target without N ranks paying for the same number.
 | Pinned Docker image (aurora + cloud parity) | builds + tests pass on aurora, [`Dockerfile`](Dockerfile) |
 | DDP modes 1–3 (naive, bucketed, interleaved) | done, [`distributed_synchronizer.py`](src/distrain/distributed_synchronizer.py); NCCL-proven, timed on 2×3090 |
 | DDP mode 4 — `ddp_torch`, the upstream baseline | done, wraps `DistributedDataParallel` behind the same seam |
-| Checkpointing — basic single-file save/resume | done, in [`train.py`](src/distrain/train.py); DCP deferred — [`docs/decisions.md`](docs/decisions.md) §12 |
+| Checkpointing — per-step files, retention anchors, async off-box mirror | done, in [`train.py`](src/distrain/train.py); survived a real pod termination. DCP deferred — [`docs/decisions.md`](docs/decisions.md) §12 |
 | Bench harness for mode timing | done, [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) |
 | FSDP2, DiLoCo, run matrix | not started |
 
@@ -214,42 +224,26 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **First larger-GPU session** (single 8-GPU node, RunPod has capacity) —
-   runbook: [`docs/runbook-8gpu-runpod.md`](docs/runbook-8gpu-runpod.md):
-   roofline + `nccl-tests`, image-parity check, then
-   [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) across the four
-   modes × compile on/off — the 2×3090 session showed compile kills hook-based
-   overlap, and `ddp_torch` (which gets dynamo's DDPOptimizer graph breaks)
-   is the interesting comparison. Then the first converged Track A run at
-   9000 steps / 4.4B tokens — the calibration verdict (decisions §13): a
-   clean 6000-step schedule ended at 3.333, the 9000-step continuation was at
-   3.355 with 500 steps of warmdown left, so 9000 steps crosses 3.28 at or
-   near its end. Budgeted at ~$30–55 for the whole session.
-2. DiLoCo and the netem bandwidth curve after that.
+1. **DiLoCo + the netem bandwidth curve** — the slow-transport side of the
+   study, against the fast-interconnect anchor measured on 2026-08-16
+   (3147.1 s / 4.92B tokens to 3.28 on 8×A100 NVLink). Rerun the bench
+   matrix once under netem: the per-transport compile × overlap result
+   predicts uncompiled interleaved retakes the lead once comm dominates.
+2. Track B (FSDP2 at ~7B on one 8-GPU node) after that.
 
 ## Known gaps
 
-- **Image parity with the cloud is unproven — but the path is built.** The
-  image now boots standalone (sshd via `pod-entry.sh`, rehearsed end-to-end on
-  aurora including SSH-session env propagation) and the 8-GPU runbook's step 3
-  is the parity proof: the full suite green on the baked code, no rsync, no
-  `uv sync`. Proven only when that session runs.
-- **H100/A100/L40S peaks are unverified datasheet values.** Run the roofline
-  script first thing on any rented node. (Both 3090s measured so far differ by
-  9% — per-box measurement is mandatory.)
-- **Mode timings exist only at 2 ranks over SHM.** Naive-vs-bucketed differences
-  grow with world size and transport latency; the cluster session reruns the
-  bench at 8 ranks. The compile-vs-overlap question (session log, decisions §13)
-  is open and shapes the Track A matrix.
-- **No spot-preemption recovery.** Basic single-file save/resume exists
-  (`--checkpoint-every N`, `--resume`), enough to interrupt a local run; the
-  DCP/preemption hardening is deliberately deferred
-  ([`docs/decisions.md`](docs/decisions.md) §12) — it only matters if spot is chosen.
-- **Tokens-to-3.28 is bracketed (2.95B–4.4B), not observed.** The 9000-step
-  continuation died at step 8650 with val 3.355 at 8500 and the warmdown
-  accelerating; the crossing was extrapolated, not seen ([`docs/decisions.md`](docs/decisions.md)
-  §13). The first converged cloud run doubles as the measurement — its own
-  first unsmoothed crossing is the number that gets reported.
+- **H100/L40S/A100-PCIe peaks are unverified datasheet values.** A100-SXM4
+  is measured (269.9). Run the roofline script first thing on any new GPU
+  class; per-box measurement is mandatory (the two 3090s differ by 9%).
+- **No spot-preemption recovery.** Per-step checkpoints with retention
+  anchors, `--resume`/`--resume-from` and async off-box mirroring exist and
+  survived a real pod termination; DCP/preemption hardening is deliberately
+  deferred ([`docs/decisions.md`](docs/decisions.md) §12) — it only matters
+  if spot is chosen.
+- **Trackio curves from cloud sessions live in per-session DB copies**
+  (`out/runpod-8gpu/trackio/`), not aurora's dashboard DB — a merge story
+  is unbuilt.
 
 ## Mac fallback
 

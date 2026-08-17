@@ -561,4 +561,46 @@ inside the $150 target even with a retry.
 (the §9 kill-switch launcher gates unattended runs only, matching the 2×3090
 precedent): roofline + `nccl-tests`, image-parity check, `bench_ddp_modes`
 across the four modes × compile, then the first converged Track A run at
-9000 steps → DiLoCo + netem after that.
+9000 steps → DiLoCo + netem after that. *(Executed 2026-08-16 — §14.)*
+
+## 14. First 8×A100 session: tokens-to-3.28 measured (2026-08-16)
+
+Full narrative in the [session log](sessions/2026-08-16-runpod-8xa100.md);
+what supersedes §13's bracket:
+
+- **Tokens-to-3.28 = 4.92B, measured**: first unsmoothed crossing at step
+  9999 of a clean 10000-step trapezoid (val 3.2730), **3147.1 s** of
+  training time on 8×A100-SXM4 at ~79% MFU. The clean 9000-step schedule
+  ends at **3.2849 / 4.42B tokens** — short by 0.005: the §13 extrapolation
+  (~3.26–3.29) was right and the 9000-step recipe sat on the wrong side.
+  The converged-run recipe is now **10000 steps / 4.92B tokens**.
+- **A 9000→10000 plateau extension is a clean run, not a composite.**
+  Resuming the warmdown-start anchor (step 8000) under `--max-steps 10000`
+  reproduces the clean longer schedule exactly — LR and data are functions
+  of the step, and the 0–8000 history is shared by construction. This is
+  the cheap recovery §13's post-warmdown continuation was not: re-enter at
+  the *last checkpoint where LR was still at peak*, never after an anneal.
+- **Checkpointing grew retention + mirroring** (prompted by a real loss:
+  RunPod *terminates* pods when account credit drains, and the first pod
+  died at ~step 7800 with the run's only `ckpt.pt`): per-step files
+  `{run}-step{N}.pt`, rolling `keep_last` + permanent `keep_every` anchors
+  (default 2000 = warmdown start), `--resume-from`, and an async off-box
+  mirror (skip-if-busy, atomic, drained at exit). Operational rules that
+  came with it: monitor the provider balance during paid runs, and mirror
+  continuously off the pod — container disks do not survive termination.
+- **Compile × overlap is a per-transport decision** (the §13 open question):
+  on NVLink (154 GB/s bus) every compiled config beats every uncompiled one
+  — `ddp_torch --compile` fastest, 0.88 scaling at 8 ranks — while
+  uncompiled interleaved is best-in-class uncompiled (0.94). On Socket+SHM
+  (2×3090) uncompiled interleaved beat everything. Track A fast-transport
+  configs run `ddp_torch --compile`; expect the lead to flip back under
+  netem, and re-verify with one bench rerun there.
+- **Replication for free**: aurora 1×3090 (accum 60) and two 8×A100 DDP
+  runs agree at every shared val point to ≤0.01 — the §7/§11
+  world-size-independence invariants demonstrated on real data, not just
+  gloo tests.
+- **Budget actuals**: session ~$82 (~2.2 h + ~4.2 h of node time at
+  $12.72/h; ceiling was $80, the ~$3 extension overshoot approved for the
+  crossing). §13's estimate said $30–55: the overrun bought a credit-death
+  lesson, a checkpoint system, and both the 9000- and 10000-step schedule
+  endpoints. Project spend to date ≈ $83 of the $150 target.

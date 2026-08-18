@@ -57,6 +57,23 @@ class DistributedSynchronizerBase(abc.ABC):
         dist.broadcast(tensor, src=src)
         return tensor.item()
 
+    def gather_scalars(self, value: float) -> list[float]:
+        """Every rank's value of a scalar, returned on every rank in rank order.
+
+        Diagnostics only -- the reported val loss goes through `broadcast_scalar`,
+        which exists to make one number identical everywhere. This one exists to
+        show where ranks *differ*, which under diloco is a real quantity: mid-round
+        each replica is its own model.
+
+        Same device rule as `broadcast_scalar`: NCCL cannot collect a CPU tensor,
+        and no gloo test can catch that.
+        """
+        device = next(self.model.parameters()).device
+        tensor = torch.tensor([value], dtype=torch.float32, device=device)
+        gathered = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, tensor)
+        return [t.item() for t in gathered]
+
     def wait_for_all_ranks(self) -> None:
         """Block until every rank has finished all of its collectives.
 

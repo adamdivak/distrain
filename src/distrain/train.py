@@ -102,6 +102,11 @@ class TrainConfig:
     # both break that and make eval -- which never shards -- the memory high-water
     # mark of a multi-GPU run, since it would not shrink as ranks are added.
     eval_batch_seqs: int = 32
+    # Per-replica diagnostic eval, 0 = off. Strictly a diagnostic: it logs under
+    # diag/ keys, never feeds the target check, and never touches val/loss, whose
+    # cadence stays mode-independent (decisions.md sections 4 and 16). Free to use
+    # a finer cadence than val_every -- it carries no comparability obligation.
+    diag_val_every: int = 0
 
     # runtime
     device: str = "auto"
@@ -484,12 +489,38 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
 
         is_last = step == cfg.max_steps - 1
 
+        # Per-replica diagnostic eval. Deliberately placed *before* the outer step:
+        # at a diloco boundary this measures the pre-sync replicas while the val
+        # block below measures the post-sync model, so the pair shows whether the
+        # outer step helped or hurt. Off the reported path entirely (diag/ keys, no
+        # target check). Every rank evaluates its own replica and the gather is
+        # unconditional inside a branch whose condition is a function of the step
+        # alone, so collective order stays rank-invariant (decisions.md section 6).
+        # Excluded from step_time: it is measurement, not training.
+        diag_time = 0.0
+        if cfg.diag_val_every > 0 and (step % cfg.diag_val_every == 0 or is_last):
+            accelerator_synchronize(device)
+            diag_start = time.perf_counter()
+            diag_loss = evaluate(raw_model if use_torch_ddp else model,
+                                 val_stream, cfg, device, autocast_ctx)
+            diag_losses = (dist_sync.gather_scalars(diag_loss)
+                           if is_distributed(cfg) else [diag_loss])
+            if is_primary:
+                diag_metrics = {f"diag/val_rank{r}": v for r, v in enumerate(diag_losses)}
+                if len(diag_losses) > 1:
+                    diag_metrics["diag/val_replica_spread"] = max(diag_losses) - min(diag_losses)
+                _log(cfg, diag_metrics, step)
+                print(f"step {step:5d} | diag pre-sync val "
+                      + " ".join(f"r{r}={v:.4f}" for r, v in enumerate(diag_losses)))
+            accelerator_synchronize(device)
+            diag_time = time.perf_counter() - diag_start
+
         # Perform synchronization / outer training step when using DiLoCo, after the inner optimization is done
         if is_distributed(cfg):
             dist_sync.maybe_outer_step(step, is_last)
 
         accelerator_synchronize(device) # cuda sync, only for timing
-        step_time = time.perf_counter() - step_start
+        step_time = time.perf_counter() - step_start - diag_time
         train_time_s += step_time
 
         if is_primary and (step % cfg.log_every == 0 or step == cfg.max_steps - 1):

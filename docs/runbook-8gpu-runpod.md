@@ -42,23 +42,39 @@ arithmetic).
   package is private because the repo is; RunPod needs its own pull
   credential, not the login above).
 
-## 1. Provision (console, ~5 min)
+## 1. Provision (~5 min)
 
-- Secure Cloud → **8× A100 80 GB** on one host (SXM preferred — NVLink is the
-  interesting contrast with the 2×3090 PCIe numbers). Fallback: 8× A100 PCIe.
-  H100 only if neither exists (~3× the price for the same measurements).
-- **Custom image**: `ghcr.io/adamdivak/distrain:<SHA>`, with the GHCR
-  credential selected.
-- **Container Start Command**: `/workspace/scripts/pod-entry.sh`
-  (starts sshd from the injected `PUBLIC_KEY`, idles; without it the image's
-  default CMD prints a GPU report and exits — the pod would boot-loop).
+[`scripts/runpod_session.py`](../scripts/runpod_session.py) does all of it —
+network volume, pod, GHCR pull credential, start command, SSH wait — and is
+idempotent, so a re-run reuses a live session instead of renting a second box:
+
+```bash
+uv run --script scripts/runpod_session.py avail            # which DCs have 8xA100 now
+uv run --script scripts/runpod_session.py up --dry-run     # the plan + the price, free
+uv run --script scripts/runpod_session.py up --max-hours 8 # rents; prints the ssh line
+uv run --script scripts/runpod_session.py guard &          # the ceiling, enforced
+```
+
+`up` refuses to start what the balance cannot fund for `--max-hours`, and
+terminates the pod itself if anything fails after creation. `guard` terminates
+at the ceiling and warns on a low balance — credit exhaustion killed a
+nearly-converged run on 2026-08-16. `ssh` prints (or with `--exec` runs) the
+session's ssh line; `down` terminates. `SSH` below abbreviates that line.
+
+What the script pins, and why the console path must match it if it is ever used
+instead (Secure Cloud → 8× A100 80 GB on one host, SXM preferred for NVLink;
+fallback 8× A100 PCIe, H100 only if neither exists):
+
+- **Custom image** `ghcr.io/adamdivak/distrain:<SHA>` with the GHCR credential.
+- **Container Start Command** `/workspace/scripts/pod-entry.sh` (starts sshd
+  from the injected `PUBLIC_KEY`, idles; without it the image's default CMD
+  prints a GPU report and exits — the pod would boot-loop).
 - **Expose TCP port 22**; container disk **80 GB**.
 - **No volume mounted at `/workspace`** — it would shadow the baked code and
   silently run whatever was on the volume instead of the pushed image. That
-  would fake the parity check, not fail it. If a volume is wanted, mount it
-  at `/data`.
-- Deploy → copy the SSH-over-exposed-TCP line; `<IP>`/`<PORT>` below.
-  `SSH` abbreviates `ssh -p <PORT> root@<IP>`.
+  would fake the parity check, not fail it. A network volume mounts at `/data`
+  (`--volume-gb 0` to skip it; it bills until deleted, and it pins the pod to
+  its data center).
 
 ## 2. First contact + start the data download (~5 min)
 
@@ -168,9 +184,19 @@ rsync -avz -e "ssh -p <PORT>" root@<IP>:/workspace/checkpoints/ckpt.pt \
       ~/work/distrain/out/runpod-8gpu/   # final model, ~1.9 GB, optional
 ```
 
-Nothing survives termination — pull first, verify locally (`ls -la`, open the
-train log tail), then console **Stop → Terminate** and confirm the billing
-page shows no running spend.
+Nothing survives termination — pull first, check locally (`ls -la`, open the
+train log tail), then tear down and prove it:
+
+```bash
+uv run --script scripts/runpod_session.py down     # terminates, then runs verify
+uv run --script scripts/runpod_session.py verify   # exits non-zero if anything bills
+```
+
+`verify` fails on anything metered hourly — running pods, *stopped* pods (their
+disks still bill), serverless endpoints, or a non-zero account
+`currentSpendPerHr` that no listed pod explains. A network volume is reported
+with its ~$/month but does not fail the check; `--strict`, or
+`down --delete-volume`, when it should be gone too.
 
 ## Afterwards (aurora, free)
 

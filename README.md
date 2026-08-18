@@ -123,8 +123,45 @@ For cloud sessions the image is pushed to **`ghcr.io/adamdivak/distrain:<git-sha
 [`scripts/pod-entry.sh`](scripts/pod-entry.sh) as the start command — it starts
 sshd from the provider-injected key and exports the baked env to SSH sessions.
 The image also carries a prebuilt `nccl-tests` (`/opt/nccl-tests/build/`) and the
-`data` extra, so a pod needs zero setup beyond booting. Build/push/provision
-steps: [`docs/runbook-8gpu-runpod.md`](docs/runbook-8gpu-runpod.md).
+`data` extra, so a pod needs zero setup beyond booting. Build/push steps:
+[`docs/runbook-8gpu-runpod.md`](docs/runbook-8gpu-runpod.md).
+
+### Renting the box
+
+[`scripts/runpod_session.py`](scripts/runpod_session.py) provisions the pod over
+the RunPod API instead of the console — ensure the network volume, ensure the
+pod, boot the pinned image, wait for SSH:
+
+```bash
+uv run --script scripts/runpod_session.py status           # balance, pods, volumes
+uv run --script scripts/runpod_session.py avail            # which DCs have 8xA100 now
+uv run --script scripts/runpod_session.py up --dry-run     # the plan + the price, free
+uv run --script scripts/runpod_session.py up --max-hours 8
+uv run --script scripts/runpod_session.py guard &          # ceiling + balance watch
+uv run --script scripts/runpod_session.py ssh --exec
+uv run --script scripts/runpod_session.py down
+uv run --script scripts/runpod_session.py verify           # is anything still billing?
+```
+
+`verify` is the end-of-session proof, and `down` ends by running it. It separates
+what is metered **by the hour** — running pods, stopped pods (no GPU charge, but
+their disks bill), serverless endpoints, and the account's own
+`currentSpendPerHr` — from what is metered **by the month**: network volumes,
+~$0.07/GB. The hourly tier must be empty and any of it exits non-zero; volumes
+are reported with a price but pass, since a volume is the thing meant to outlive
+a pod. `verify --strict` requires those gone too — the end of the project rather
+than the end of a session.
+
+It is idempotent (a second `up` reuses the live pod rather than renting another)
+and it is where the cost kill-switch of [`docs/decisions.md`](docs/decisions.md)
+§9 lives: `up` refuses a ceiling the balance cannot fund and terminates the pod
+if provisioning fails partway; `guard` terminates at the wall-clock ceiling. The
+`runpod` SDK comes from the script's own inline dependency block (`uv run
+--script`), never from the training environment; the API key comes from
+`RUNPOD_API_KEY` in the environment or the gitignored `.env`. The mechanics are
+tested offline against a fake API in
+[`tests/test_runpod_session.py`](tests/test_runpod_session.py) — no credentials,
+nothing rented.
 
 ## Data
 

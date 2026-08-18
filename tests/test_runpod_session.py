@@ -135,11 +135,19 @@ class FakeAPI:
     def delete_volume(self, volume_id):
         self._volumes = [v for v in self._volumes if v["id"] != volume_id]
 
-    def gpu_price(self, gpu_type, gpu_count, data_center_id=None):
+    def gpu_price(self, gpu_type, gpu_count, data_center_id=None, secure=None):
         # `price` is the per-GPU secure rate (1.59 x 8 = the $12.72/h an 8x A100
         # pod really bills); lowestPrice is the community rate, and only its
         # presence means capacity.
-        available = data_center_id in (None, "US-KS-2", "EU-RO-1")
+        #
+        # `secure=False` asks for community stock, which real hosts report only
+        # on the unscoped query -- they carry no data center id, so pairing it
+        # with one is always empty. Modelled here so a per-DC community lookup
+        # cannot silently look available in tests when it never is in practice.
+        if secure is False and data_center_id is not None:
+            available = False
+        else:
+            available = data_center_id in (None, "US-KS-2", "EU-RO-1")
         return {"id": gpu_type, "maxGpuCount": 8,
                 "securePrice": self._price, "communityPrice": self._price * 0.5,
                 "lowestPrice": {

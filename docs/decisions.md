@@ -795,3 +795,64 @@ Deciding this is a prerequisite for the netem session, not for the DiLoCo one.
 `runpod_session.py` budgets on `securePrice`. Account billing also lags a
 termination by ~75 s, so `verify` re-reads the spend once before calling a
 non-zero figure a leak.
+
+## 18. Inner batch size is a DiLoCo knob, at fixed token budget (2026-08-18)
+
+§16 fixes the global batch at 480 and *splits* it across K islands, so at K=8
+each island trains on 60 sequences. Two different things can be meant by
+"give each island a bigger batch", and they cost wildly different amounts:
+
+- **The paper's regime (not adopted).** Each worker carries a full batch and
+  the *step count is held fixed*, so total tokens scale as K x. A converged
+  run at K=8 would be ~10000 steps x 3840 seqs x 1024 = **39B tokens**, four
+  epochs of FineWeb10B and ~8x the DDP anchor's wall clock (~7 h on 8xA100,
+  ~$89). Out of budget, out of corpus.
+- **Bigger inner batch at fixed tokens (the variant worth running).** Hold the
+  token budget at the DDP anchor's 4.92B and raise per-island batch `b`. The
+  step count falls out of it: `S = T / (K*b*1024)`. Raising `b` 8x cuts S 8x,
+  and with H fixed it cuts the number of outer steps 8x too. **Same data
+  budget, same throughput, therefore the same wall clock and cost as the DDP
+  anchor.**
+
+**Why it should stabilise the outer step.** From the K analysis: the averaged
+outer gradient's noise is `sigma_dbar ~ lr*sigma*sqrt(H/(K*b))`. It is
+independent of K (a smaller per-island batch exactly cancels the sqrt(K)
+averaging gain) but *not* of `b` -- raising the inner batch cuts outer-gradient
+noise by sqrt(b). Since Nesterov at momentum 0.9 with outer lr 0.7 amplifies
+the mean delta by up to `lr/(1-mu) = 7x` at steady state, feeding it a quieter
+delta is the one lever that reduces overshoot without touching the outer
+hyperparameters -- i.e. without breaking §12's "untuned DiLoCo" box.
+
+**The trade, which is real and not a flaw.** At fixed tokens and fixed K you
+cannot match DDP on both batch size and update count:
+
+| config | per-island batch | updates per replica | global batch |
+|---|---|---|---|
+| DDP anchor | 480 | 10000 | 480 seqs |
+| A (§16, implemented) | 60 | 10000 | 480 seqs |
+| bigger-b variant | 480 | 1250 | 3840 seqs |
+
+Config A matches DDP's step count at an eighth of its batch; the variant
+matches DDP's batch at an eighth of its updates. At b=480 the global batch is
+3.9M tokens/step, almost certainly past critical batch size for a 162M model,
+so token efficiency would fall for reasons that have nothing to do with
+DiLoCo. **Test intermediate values** -- b in {120, 240} gives 5000 / 2500
+steps at the same 4.92B budget and stays in a sane batch regime -- rather than
+jumping to the extreme and confounding two effects.
+
+**What it buys the write-up.** The aurora K=2 smoke shows a sawtooth (gap
+1.138 -> 0.489 -> 0.353 -> 0.532 -> 0.728 -> 0.298 at steps 500...3000, with a
+descending envelope: 4.1396 @ 1500 -> 3.8804 @ 3000). That cannot distinguish
+*"DiLoCo oscillates"* from *"published hyperparameters are mis-tuned for a
+regime they were never fitted to"*. If the sawtooth flattens as `b` rises at
+constant tokens, the oscillation is a regime artefact, and §12's "untuned
+DiLoCo" label needs the batch regime stated beside it or it misleads.
+
+**Corpus ceiling, independent of all this.** `DataLoader.sequence` wraps with
+`% num_sequences`, so a run that outlasts its shards silently repeats data
+rather than failing. At global batch 480 the full FineWeb10B corpus is
+**~20,345 steps**; the 55-chunk subset the §14 runbook fetches wraps at
+~11,190. Config A at the observed ~2.5x token ratio would need ~24,900 steps
+to reach DDP's crossing -- past the corpus. Any run crossing that line must
+disclose the second epoch, not absorb it. Raising `b` also raises this
+ceiling in steps, since each step consumes more of the corpus.

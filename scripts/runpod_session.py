@@ -65,9 +65,11 @@ VOLUME_MOUNT_PATH = "/data"
 IMAGE_REPO = "ghcr.io/adamdivak/distrain"
 VOLUME_USD_PER_GB_MONTH = 0.07         # list price under 1 TB; only used to print an estimate
 
-# Every RunPod data center as of the current API. Ordered arbitrarily; `avail`
-# reports which of them actually has the GPUs, and that drives the choice.
-DATA_CENTERS = [
+# Fallback only -- the live list comes from `RunpodAPI.data_centers()`. This
+# snapshot was 28 entries against the API's 49, so half the fleet was never
+# scanned and `avail` could report "no capacity" for a GPU that was rentable.
+# Kept solely so a failed query degrades instead of provisioning nothing.
+FALLBACK_DATA_CENTERS = [
     "EU-RO-1", "CA-MTL-1", "EU-SE-1", "US-IL-1", "EUR-IS-1", "EU-CZ-1", "US-TX-3",
     "EUR-IS-2", "US-KS-2", "US-GA-2", "US-WA-1", "US-TX-1", "CA-MTL-3", "EU-NL-1",
     "US-TX-4", "US-CA-2", "US-NC-1", "OC-AU-1", "US-DE-1", "EUR-IS-3", "CA-MTL-2",
@@ -162,7 +164,24 @@ class RunpodAPI:
 
     # -- availability ------------------------------------------------------ #
 
-    def gpu_price(self, gpu_type: str, gpu_count: int, data_center_id: str | None = None) -> dict:
+    def data_centers(self) -> list[str]:
+        """Every data center id the API currently reports, sorted.
+
+        Queried rather than hardcoded: a stale snapshot silently shrinks the
+        search, and a data center that is missing from the list is
+        indistinguishable from one with no capacity. Falls back to the frozen
+        list only if the query fails, so a network blip degrades the search
+        instead of emptying it.
+        """
+        try:
+            dcs = self.gql("query { dataCenters { id } }")["dataCenters"]
+            ids = sorted(d["id"] for d in dcs if d.get("id"))
+            return ids or list(FALLBACK_DATA_CENTERS)
+        except Exception:  # noqa: BLE001 -- availability must not hard-fail here
+            return list(FALLBACK_DATA_CENTERS)
+
+    def gpu_price(self, gpu_type: str, gpu_count: int, data_center_id: str | None = None,
+                  secure: bool | None = None) -> dict:
         """Two different numbers, and mixing them up costs money.
 
         `lowestPrice` is the *availability* signal -- it is null in a data center
@@ -171,12 +190,21 @@ class RunpodAPI:
         `securePrice` per GPU: measured, a 3090 pod billed $0.50/h against a
         $0.22 `lowestPrice`, and 8x A100 bills 8 x $1.59 = $12.72/h, exactly what
         the 2026-08-16 session paid. So availability comes from one field and the
-        money from the other."""
+        money from the other.
+
+        `data_center_id` is not merely a narrowing filter: **community hosts
+        carry no data center id**, so every per-data-center query returns null
+        for them no matter how many data centers are swept. Asking only per-DC
+        therefore reports "no capacity" for GPUs the console rents happily --
+        measured 2026-08-18, when 8x 4090 was null in all 49 data centers while
+        the unscoped query returned $2.72/h. Pass `secure=False` and no data
+        center to see community stock."""
         dc = f', dataCenterId: "{data_center_id}"' if data_center_id else ""
+        sec = "" if secure is None else f", secureCloud: {'true' if secure else 'false'}"
         types = self.gql(
             f'query {{ gpuTypes(input: {{id: "{gpu_type}"}}) {{ id maxGpuCount '
             f"securePrice communityPrice "
-            f"lowestPrice(input: {{gpuCount: {gpu_count}{dc}}}) "
+            f"lowestPrice(input: {{gpuCount: {gpu_count}{dc}{sec}}}) "
             "{ uninterruptablePrice minimumBidPrice stockStatus } } }"
         )["gpuTypes"]
         if not types:
@@ -423,15 +451,24 @@ def cmd_avail(api: RunpodAPI, args: argparse.Namespace) -> int:
           f"(community ${float(overall.get('communityPrice') or 0) * args.gpu_count:.2f}/h)\n")
 
     found = []
-    for dc in (args.data_centers or DATA_CENTERS):
-        low = api.gpu_price(args.gpu_type, args.gpu_count, dc).get("lowestPrice") or {}
+    for dc in (args.data_centers or api.data_centers()):
+        low = api.gpu_price(args.gpu_type, args.gpu_count, dc, secure=True).get("lowestPrice") or {}
         if low.get("uninterruptablePrice"):
             found.append(dc)
-            print(f"  {dc:10s} capacity  {low.get('stockStatus') or ''}")
+            print(f"  SECURE     {dc:10s} capacity  {low.get('stockStatus') or ''}")
     if not found:
-        print("  no data center reports capacity for that GPU count right now.")
-        return 1
-    return 0
+        print("  SECURE     no data center reports capacity for that GPU count.")
+
+    # Community hosts have no data center id, so the loop above can never see
+    # them; ask unscoped or they look permanently sold out (see gpu_price).
+    comm = api.gpu_price(args.gpu_type, args.gpu_count, secure=False).get("lowestPrice") or {}
+    if comm.get("uninterruptablePrice"):
+        print(f"  COMMUNITY  (no data center)  capacity  {comm.get('stockStatus') or ''}  "
+              f"-- provision with --cloud-type COMMUNITY --volume-gb 0")
+        found.append("COMMUNITY")
+    else:
+        print("  COMMUNITY  no capacity for that GPU count.")
+    return 0 if found else 1
 
 
 def secure_price(gpu_type_info: dict, gpu_count: int) -> float:
@@ -439,16 +476,55 @@ def secure_price(gpu_type_info: dict, gpu_count: int) -> float:
     return float(gpu_type_info.get("securePrice") or 0) * gpu_count
 
 
-def _pick_data_center(api: RunpodAPI, args: argparse.Namespace) -> tuple[str, float]:
-    """(data center with capacity, the price a SECURE pod there will bill)."""
-    candidates = [args.data_center] if args.data_center else (args.data_centers or DATA_CENTERS)
+def community_price(gpu_type_info: dict, gpu_count: int) -> float:
+    """What a COMMUNITY pod bills per hour: per-GPU community price x count."""
+    return float(gpu_type_info.get("communityPrice") or 0) * gpu_count
+
+
+def _pick_placement(api: RunpodAPI, args: argparse.Namespace) -> tuple[str | None, float]:
+    """(data center or None, the hourly price that cloud type will bill).
+
+    SECURE pods are placed in a named data center, so the per-DC query is both
+    the availability signal and the placement decision. COMMUNITY hosts carry
+    no data center id -- every per-DC query is null for them -- so there is
+    nothing to pick and RunPod places the pod itself; `None` says exactly that.
+    Asking per-DC for a community pod is what made 8x 4090 look sold out while
+    the console rented it (see `RunpodAPI.gpu_price`).
+    """
+    if args.skip_capacity_check:
+        # The precheck is advisory, and measured 2026-08-18 it is not even
+        # reliable: 8x 4090 was null in all 49 data centers and under both cloud
+        # filters while the console rented one at the secure price. RunPod's
+        # deploy call does its own placement, so let it be the capacity signal --
+        # a failed deploy costs nothing, an unrentable precheck costs the session.
+        info = api.gpu_price(args.gpu_type, args.gpu_count)
+        price = (community_price if args.cloud_type == "COMMUNITY" else secure_price)(
+            info, args.gpu_count)
+        print(f"capacity precheck skipped; letting the deploy call place the pod "
+              f"({args.cloud_type}, ${price:.2f}/h)")
+        return args.data_center, price
+
+    if args.cloud_type == "COMMUNITY":
+        if args.data_center:
+            sys.exit("--data-center cannot be combined with --cloud-type COMMUNITY: "
+                     "community hosts carry no data center id.")
+        info = api.gpu_price(args.gpu_type, args.gpu_count, secure=False)
+        if (info.get("lowestPrice") or {}).get("uninterruptablePrice"):
+            return None, community_price(info, args.gpu_count)
+        sys.exit(f"no capacity for {args.gpu_count}x {args.gpu_type} on COMMUNITY hosts "
+                 f"right now (check `avail`)")
+
+    candidates = ([args.data_center] if args.data_center
+                  else (args.data_centers or api.data_centers()))
     for dc in candidates:
-        info = api.gpu_price(args.gpu_type, args.gpu_count, dc)
+        info = api.gpu_price(args.gpu_type, args.gpu_count, dc, secure=True)
         if (info.get("lowestPrice") or {}).get("uninterruptablePrice"):
             return dc, secure_price(info, args.gpu_count)
-    sys.exit(f"no capacity for {args.gpu_count}x {args.gpu_type} in "
+    sys.exit(f"no capacity for {args.gpu_count}x {args.gpu_type} on SECURE hosts in "
              f"{'/'.join(candidates) if args.data_center else 'any data center'} right now "
-             f"(check `avail`)")
+             f"(check `avail`; --cloud-type COMMUNITY searches the hosts that have no "
+             f"data center id, and --skip-capacity-check lets the deploy call decide -- "
+             f"the query has known false negatives)")
 
 
 def _ensure_volume(api: RunpodAPI, args: argparse.Namespace, account: dict,
@@ -559,7 +635,11 @@ def cmd_up(api: RunpodAPI, args: argparse.Namespace) -> int:
         print(f"\n  {ssh_command(*ssh_target(pod))}\n")
         return 0
 
-    data_center, price = _pick_data_center(api, args)
+    data_center, price = _pick_placement(api, args)
+    if data_center is None and args.volume_gb:
+        sys.exit("a network volume must live in a data center, and a COMMUNITY pod has "
+                 "none. Pass --volume-gb 0 (the session needs no volume) or use "
+                 "--cloud-type SECURE.")
     refusal = budget_verdict(balance, price, args.max_hours)
     if refusal:
         if args.dry_run:                     # a dry run reports the problem, it isn't blocked by it
@@ -584,7 +664,9 @@ def cmd_up(api: RunpodAPI, args: argparse.Namespace) -> int:
 
     plan = {
         "name": args.name, "image": image, "gpu": f"{args.gpu_count}x {args.gpu_type}",
-        "data_center": data_center, "price_per_hr": price, "container_disk_gb":
+        "cloud_type": args.cloud_type,
+        "data_center": data_center or "(unpinned: RunPod places it)",
+        "price_per_hr": price, "container_disk_gb":
         args.container_disk_gb, "pod_volume_gb": 0, "start_cmd": START_CMD,
         "network_volume": (volume or {}).get("id"),
         "volume_mount_path": args.volume_mount_path if volume else None,
@@ -604,7 +686,7 @@ def cmd_up(api: RunpodAPI, args: argparse.Namespace) -> int:
         image_name=image,
         gpu_type_id=args.gpu_type,
         gpu_count=args.gpu_count,
-        cloud_type="SECURE",
+        cloud_type=args.cloud_type,
         data_center_id=data_center,
         template_id=template["id"],
         docker_args=START_CMD,               # empty here would boot the image CMD and exit
@@ -753,6 +835,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="pod name; defaults to distrain-<gpu>x<count>")
     parser.add_argument("--gpu-type", default=GPU_TYPE)
     parser.add_argument("--gpu-count", type=int, default=GPU_COUNT)
+    parser.add_argument("--skip-capacity-check", action="store_true",
+                        help="do not gate on the lowestPrice availability query; let the "
+                             "deploy call place the pod (the precheck has false negatives)")
+    parser.add_argument("--cloud-type", choices=["SECURE", "COMMUNITY"],
+                        default="SECURE",
+                        help="COMMUNITY is cheaper and often the only stock for "
+                             "consumer GPUs, but has no data center id, so it "
+                             "cannot carry a network volume")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("status", help="balance, pods, volumes, registry credentials")

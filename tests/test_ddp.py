@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from distrain.data import DataLoader, ShardingPlan, TokenStream
-from distrain.distributed_synchronizer import DistributedSynchronizer
+from distrain.ddp_synchronizer import DdpSynchronizer
 from distrain.model import GPT, GPTConfig
 from distrain.train import (
     TrainConfig,
@@ -108,7 +108,7 @@ def calc_backward_save_grad(rank, cfg: TrainConfig, tmp_path):
         # )
         
         if is_distributed(cfg):
-            dist_sync = DistributedSynchronizer(
+            dist_sync = DdpSynchronizer(
                 model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
 
         # Make exactly two steps, as there might be some state in some communication
@@ -167,7 +167,7 @@ def init_model_save_params(rank, cfg: TrainConfig, tmp_path):
 
         if is_distributed(cfg):
             # The constructor makes sure all ranks have the same model
-            DistributedSynchronizer(
+            DdpSynchronizer(
                 model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
 
         # Save parameters
@@ -196,7 +196,7 @@ def broadcast_scalar_save_result(rank, cfg: TrainConfig, tmp_path):
                 bias=cfg.bias,
             )
         )
-        dist_sync = DistributedSynchronizer(
+        dist_sync = DdpSynchronizer(
             model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
 
         # Stand in for the val loss: only rank 0 has the real one, every other rank
@@ -289,7 +289,7 @@ def record_overlap(rank, cfg: TrainConfig, tmp_path):
         for param in model.parameters():
             param.register_post_accumulate_grad_hook(probe)
 
-        dist_sync = DistributedSynchronizer(
+        dist_sync = DdpSynchronizer(
             model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
         holder["sync"] = dist_sync
         dist_sync.set_last_iteration()
@@ -342,7 +342,7 @@ def record_launch_order(rank, cfg: TrainConfig, tmp_path):
         torch.manual_seed(cfg.seed + cfg.rank)
 
         model = ReversedExecutionModel().to(device)
-        dist_sync = DistributedSynchronizer(
+        dist_sync = DdpSynchronizer(
             model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
         dist_sync.set_last_iteration()
 
@@ -387,7 +387,7 @@ def record_rebuild(rank, cfg: TrainConfig, tmp_path):
         for param in model.parameters():
             param.register_post_accumulate_grad_hook(probe)
 
-        dist_sync = DistributedSynchronizer(
+        dist_sync = DdpSynchronizer(
             model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
         holder["sync"] = dist_sync
         param_names = {id(p): n for n, p in model.named_parameters()}
@@ -662,7 +662,7 @@ class TestScalarBroadcast:
             broadcast_devices.append(tensor.device)
 
         with mock.patch("torch.distributed.broadcast", side_effect=record):
-            dist_sync = DistributedSynchronizer(
+            dist_sync = DdpSynchronizer(
                 model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
             dist_sync.broadcast_scalar(3.14159)
 

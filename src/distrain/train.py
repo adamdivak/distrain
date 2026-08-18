@@ -20,9 +20,6 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-import re
-import shutil
-import threading
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
@@ -30,8 +27,16 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 import torch
 
+from distrain.checkpoints import (
+    find_latest_checkpoint,
+    list_checkpoints,
+    load_checkpoint,
+    rank_checkpoint_path,
+    save_checkpoint,
+    wait_for_mirror,
+)
 from distrain.data import DataLoader, ShardingPlan, TokenStream
-from distrain.distributed_synchronizer import DistributedSynchronizer
+from distrain.ddp_synchronizer import DdpSynchronizer, DiLoCoSynchronizer
 from distrain.mfu import PeakSpec, counter_for, peak_bf16_spec
 from distrain.model import GPT, GPTConfig
 
@@ -124,9 +129,13 @@ class TrainConfig:
     world_size: int = 1
     rank: int = 0 # rank in the whole training - [0, world_size)
     local_rank: int = 0 # rank (i.e. GPU) within the current machine - [0, num_gpus_in_current_machine]
-    distributed_mode: str | None = None # ddp_naive, ddp_bucketed or others to be implemented
+    distributed_mode: str | None = None # ddp_naive, ddp_bucketed, ddp_interleaved, ddp_torch, diloco
     distributed_backend: str = "auto" # auto for torch to suggest based on the host
     ddp_bucket_size: int | None = 25 * 1024 * 1024 # bucket size in bytes when using bucketed ddp
+    outer_sync_every: int | None = 500 # H in the DiLoCO paper
+    outer_lr: float | None = 0.7
+    outer_moment: float | None = 0.9
+
 
     # logging
     project: str = "distrain"
@@ -160,6 +169,30 @@ def resolve_dtype(requested: str, device: str) -> torch.dtype:
         return torch.bfloat16 if is_cuda(device) else torch.float32
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[requested]
 
+
+# single source for every mode gate, so the CLI check cannot drift from what
+# resolve_distributed_synchronizer actually dispatches on
+DISTRIBUTED_MODES = {"diloco", *DdpSynchronizer.ddp_modes}
+
+
+def resolve_distributed_synchronizer(cfg: TrainConfig, model):
+    if cfg.distributed_mode == "diloco":
+        if cfg.outer_sync_every is None:
+            raise ValueError(f"{cfg.outer_sync_every=} must not be None when using DiLoCo")
+        if cfg.outer_lr is None:
+                raise ValueError(f"{cfg.outer_lr=} must not be None when using DiLoCo")
+        if cfg.outer_moment is None:
+                raise ValueError(f"{cfg.outer_moment=} must not be None when using DiLoCo")
+        if cfg.val_every % cfg.outer_sync_every > 0:
+            raise ValueError(f"Validation must happen at intervals that are divisible by diloco synchronization intervals, \
+                                otherwise evaluation would be performed on a non-synchronized local variation of the model. \
+                                {cfg.val_every=}, {cfg.outer_sync_every=}")
+        return DiLoCoSynchronizer(model, cfg.world_size, cfg.outer_sync_every, cfg.outer_lr, cfg.outer_moment)
+    elif cfg.distributed_mode in DdpSynchronizer.ddp_modes:
+        return DdpSynchronizer(
+            model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
+    else:
+        raise ValueError(f"Invalid value {cfg.distributed_mode=}")
 
 def lr_at(step: int, cfg: TrainConfig) -> float:
     """ Trapezoidal learning rate decay scheduler (linear warmup and warmdown) from modded-nanogpt """
@@ -254,141 +287,6 @@ def setup_distributed(world_size, rank, device, init_method="env://", distribute
 def cleanup_distributed():
     torch.distributed.destroy_process_group()
 
-_CKPT_STEP_RE = re.compile(r"-step(\d+)\.pt$")
-_mirror_thread: threading.Thread | None = None
-
-
-def checkpoint_stem(cfg: TrainConfig) -> str:
-    return (cfg.run_name or "run").replace(os.sep, "_")
-
-
-def list_checkpoints(ckpt_dir: str, stem: str) -> list[tuple[int, str]]:
-    """(step, path) pairs for this run in ckpt_dir, sorted by step."""
-    entries = []
-    for path in glob.glob(os.path.join(ckpt_dir, f"{stem}-step*.pt")):
-        m = _CKPT_STEP_RE.search(path)
-        if m:
-            entries.append((int(m.group(1)), path))
-    return sorted(entries)
-
-
-def find_latest_checkpoint(cfg: TrainConfig) -> str | None:
-    """Newest checkpoint for this run name: local dir first, then the mirror.
-
-    Local wins when both exist — the mirror is a copy of local, so local is never
-    behind it within one machine's lifetime; the mirror matters when the local disk
-    is gone (a terminated pod) and the volume is all that survived.
-    """
-    for d in (cfg.checkpoint_dir, cfg.checkpoint_mirror):
-        if d:
-            entries = list_checkpoints(d, checkpoint_stem(cfg))
-            if entries:
-                return entries[-1][1]
-    return None
-
-
-def _prune_checkpoints(ckpt_dir: str, stem: str, keep_last: int, keep_every: int) -> None:
-    entries = list_checkpoints(ckpt_dir, stem)
-    keep = {path for _, path in entries[-max(keep_last, 1):]}
-    if keep_every > 0:
-        keep |= {path for step, path in entries if step % keep_every == 0}
-    for _, path in entries:
-        if path not in keep:
-            os.remove(path)
-
-
-def _mirror_checkpoint(path: str, cfg: TrainConfig) -> None:
-    """Copy the just-saved checkpoint to cfg.checkpoint_mirror in the background.
-
-    Skip-if-busy: if the previous copy is still in flight the new one is dropped —
-    the next save catches the mirror up. Copy lands under a .tmp name and is
-    renamed, so the mirror never holds a truncated checkpoint.
-    """
-    global _mirror_thread
-    if _mirror_thread is not None and _mirror_thread.is_alive():
-        return
-
-    def copy() -> None:
-        os.makedirs(cfg.checkpoint_mirror, exist_ok=True)
-        dst = os.path.join(cfg.checkpoint_mirror, os.path.basename(path))
-        tmp = dst + ".tmp"
-        shutil.copyfile(path, tmp)
-        os.replace(tmp, dst)
-        _prune_checkpoints(cfg.checkpoint_mirror, checkpoint_stem(cfg),
-                           cfg.checkpoint_keep_last, cfg.checkpoint_keep_every)
-
-    _mirror_thread = threading.Thread(target=copy, daemon=True)
-    _mirror_thread.start()
-
-
-def wait_for_mirror(cfg: TrainConfig) -> None:
-    """Drain the mirror at end of run: join any in-flight copy, then copy the
-    newest local checkpoint synchronously if skip-if-busy dropped it."""
-    if _mirror_thread is not None:
-        _mirror_thread.join()
-    stem = checkpoint_stem(cfg)
-    local = list_checkpoints(cfg.checkpoint_dir, stem)
-    if not local:
-        return
-    _, path = local[-1]
-    dst = os.path.join(cfg.checkpoint_mirror, os.path.basename(path))
-    if not os.path.exists(dst):
-        os.makedirs(cfg.checkpoint_mirror, exist_ok=True)
-        tmp = dst + ".tmp"
-        shutil.copyfile(path, tmp)
-        os.replace(tmp, dst)
-        _prune_checkpoints(cfg.checkpoint_mirror, stem,
-                           cfg.checkpoint_keep_last, cfg.checkpoint_keep_every)
-
-
-def save_checkpoint(model: GPT, optimizer, cfg: TrainConfig,
-                    next_step: int, train_time_s: float, results: dict) -> str:
-    """Per-step checkpoint file, written atomically by rank 0 only.
-
-    `os.replace` means an interrupt mid-save leaves prior checkpoints intact
-    instead of a truncated file. RNG state is deliberately not saved: with
-    `dropout == 0` the training loop draws no random numbers -- seeding only affects
-    init, which the checkpoint overwrites -- and per-rank streams would need
-    per-rank files.
-    """
-    state = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "next_step": next_step,
-        "train_time_s": train_time_s,
-        "results": {k: results[k] for k in
-                    ("target_reached_step", "target_reached_train_time_s")},
-        "cfg": asdict(cfg),
-    }
-    stem = checkpoint_stem(cfg)
-    path = os.path.join(cfg.checkpoint_dir, f"{stem}-step{next_step:06d}.pt")
-    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    tmp = path + ".tmp"
-    torch.save(state, tmp)
-    os.replace(tmp, path)
-    _prune_checkpoints(cfg.checkpoint_dir, stem,
-                       cfg.checkpoint_keep_last, cfg.checkpoint_keep_every)
-    if cfg.checkpoint_mirror:
-        _mirror_checkpoint(path, cfg)
-    return path
-
-
-def load_checkpoint(path: str | None, model: GPT, optimizer, device: str) -> dict:
-    """Load model + optimizer state in place; the caller applies the rest."""
-    if path is None or not os.path.exists(path):
-        raise FileNotFoundError(
-            f"--resume was given but no checkpoint was found"
-            f"{f' at {path!r}' if path else ''}. Drop --resume to start fresh, "
-            f"point --checkpoint-dir (or --checkpoint-mirror) at the run to "
-            f"continue, or name a file with --resume-from."
-        )
-    state = torch.load(path, map_location=device, weights_only=True)
-    model.load_state_dict(state["model"])
-    optimizer.load_state_dict(state["optimizer"])
-    state["path"] = path
-    return state
-
-
 def is_distributed(cfg: TrainConfig) -> bool:
     return cfg.world_size > 1
 
@@ -396,9 +294,8 @@ def is_cuda(device: str) -> bool:
     return "cuda" in device
 
 def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dict:
-    distributed_modes = {"ddp_naive", "ddp_bucketed", "ddp_interleaved", "ddp_torch"}
-    if is_distributed(cfg) and cfg.distributed_mode not in distributed_modes:
-        choices = ", ".join(sorted(distributed_modes))
+    if is_distributed(cfg) and cfg.distributed_mode not in DISTRIBUTED_MODES:
+        choices = ", ".join(sorted(DISTRIBUTED_MODES))
         raise ValueError(
             f"world_size={cfg.world_size} requires --distributed-mode to be one of: {choices}"
         )
@@ -474,13 +371,27 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
         cfg.weight_decay, cfg.learning_rate, cfg.betas, fused=(is_cuda(device))
     )
 
-    # Resume before the synchronizer is built, so replica equality still comes from
-    # its rank-0 broadcast (decisions.md section 6) rather than from every rank
-    # having read the same file.
+    # The synchronizer is built *before* any resume: its rank-0 broadcast anchors
+    # a fresh start (decisions.md section 6), and the checkpoint must win over it
+    # on resume. For DDP the order is indifferent (every rank loads the same
+    # file), but for diloco it is load-bearing the other way around: mid-round
+    # replicas legitimately differ per rank, and a post-load broadcast would
+    # clobber every rank's restored replica with rank 0's.
+    if is_distributed(cfg):
+        dist_sync = resolve_distributed_synchronizer(cfg, model)
+
+    # diloco checkpoints are per-rank files: each rank resumes its own replica and
+    # inner optimizer state, since post-reduce identity across ranks -- what makes
+    # the single rank-0 file sufficient for DDP -- does not hold there (section 16)
+    ckpt_rank = cfg.rank if is_distributed(cfg) and cfg.distributed_mode == "diloco" else None
     start_step = 0
     resumed: dict | None = None
     if cfg.resume or cfg.resume_from:
-        resume_path = cfg.resume_from or find_latest_checkpoint(cfg)
+        if cfg.resume_from:
+            resume_path = (rank_checkpoint_path(cfg.resume_from, ckpt_rank)
+                           if ckpt_rank is not None else cfg.resume_from)
+        else:
+            resume_path = find_latest_checkpoint(cfg, rank=ckpt_rank)
         resumed = load_checkpoint(resume_path, raw_model, optimizer, device)
         start_step = resumed["next_step"]
     # raw_model: DDP's wrapper (unlike torch.compile's) does not delegate
@@ -490,9 +401,19 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
     peak = peak_spec.tflops * 1e12 if peak_spec else None
     tokens_per_step_this_rank = plan.seqs_per_rank * cfg.seq_len
 
-    if is_distributed(cfg):
-        dist_sync = DistributedSynchronizer(
-            model, cfg.distributed_mode, cfg.world_size, cfg.ddp_bucket_size)
+    if is_distributed(cfg) and resumed is not None:
+        # Ranks resolved their resume files independently; a rank resuming at
+        # a different step than rank 0 would silently walk a different data
+        # and LR schedule, so disagreement is fatal, not recoverable.
+        rank0_step = int(dist_sync.broadcast_scalar(float(start_step)))
+        if rank0_step != start_step:
+            raise RuntimeError(
+                f"rank {cfg.rank} resumed at step {start_step} but rank 0 at "
+                f"step {rank0_step}; a per-rank checkpoint set must come from "
+                f"one save")
+        # diloco only (no-op otherwise): rank 0 restores the round-start
+        # baseline + outer momentum from its file and broadcasts them
+        dist_sync.restore_outer_state(resumed.get("outer"))
 
     is_primary = cfg.rank == 0
     if cfg.trackio and is_primary:
@@ -561,6 +482,12 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
 
+        is_last = step == cfg.max_steps - 1
+
+        # Perform synchronization / outer training step when using DiLoCo, after the inner optimization is done
+        if is_distributed(cfg):
+            dist_sync.maybe_outer_step(step, is_last)
+
         accelerator_synchronize(device) # cuda sync, only for timing
         step_time = time.perf_counter() - step_start
         train_time_s += step_time
@@ -586,7 +513,6 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
                 + (f" | mfu {metrics['perf/mfu'] * 100:.1f}%" if peak else "")
             )
 
-        is_last = step == cfg.max_steps - 1
         if cfg.val_every > 0 and (step % cfg.val_every == 0 or is_last):
             # Only rank 0 evaluates - every rank computing the identical full val pass
             # is N x the cost for one number. The broadcast is unconditional within this
@@ -612,15 +538,21 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
                           f"after {train_time_s:.1f}s of training")
 
         # Outside the timed region, and after eval so a crossing recorded this step
-        # is captured. Rank 0 only: post-reduce state is identical on every rank.
-        if (cfg.checkpoint_every > 0 and is_primary
+        # is captured. Rank 0 only for the DDP modes (post-reduce state is
+        # identical on every rank); every rank for diloco, where each replica's
+        # params and inner optimizer state are its own (decisions.md section 16).
+        if (cfg.checkpoint_every > 0 and (is_primary or ckpt_rank is not None)
                 and ((step + 1) % cfg.checkpoint_every == 0 or is_last)):
+            outer_state = (dist_sync.outer_state_dict()
+                           if ckpt_rank is not None and is_primary else None)
             save_checkpoint(raw_model, optimizer, cfg,
-                            step + 1, train_time_s, results)
+                            step + 1, train_time_s, results,
+                            rank=ckpt_rank, outer_state=outer_state)
 
     # The final save's off-box copy must land before the process can exit.
-    if cfg.checkpoint_mirror and is_primary and cfg.checkpoint_every > 0:
-        wait_for_mirror(cfg)
+    if (cfg.checkpoint_mirror and (is_primary or ckpt_rank is not None)
+            and cfg.checkpoint_every > 0):
+        wait_for_mirror(cfg, rank=ckpt_rank)
 
     # No rank may start tearing down while another is still in a collective; see
     # DistributedSynchronizer.wait_for_all_ranks. Outside the timed region: this is

@@ -697,19 +697,29 @@ measured, not a confound.
   match the original command line — a `diloco` checkpoint set is
   K-specific. Retention and mirroring treat a step's K files as one unit.
 
-**Validation and the crossing under DiLoCo.** Mid-round, replicas have
-genuinely diverged, so rank 0's val loss measures *rank 0's replica*, not
-"the model" — the shared model only exists at round boundaries, just after
-the outer step. This is not merely a labeling problem: the ≤ 3.28 check runs
+**Validation and the crossing under DiLoCo (convention settled 2026-08-17).**
+Mid-round, replicas have genuinely diverged, so rank 0's val loss measures
+*rank 0's replica*, not "the model" — the shared model only exists just after
+an outer step. This is not merely a labeling problem: the ≤ 3.28 check runs
 in the loop at every eval, so a mid-round eval of one lucky replica could
 cross before the synced model does and silently corrupt the headline metric.
-Therefore `diloco` **requires `val_every % H == 0`**, asserted at startup
-(`lr_at`-style, fails loudly), and at a boundary step the eval runs *after*
-the outer step, measuring the freshly synced params — every reported val
-point is the shared model by construction, and nothing alternates. A
-per-replica diagnostic eval can be added later behind an explicit flag; it
-must never share the reported metric's path. The coarser 500-step crossing
-resolution is a property of the method.
+
+The eval cadence itself is **mode-independent** (`step % val_every == 0`
+plus the final step): the eval schedule is part of the measurement, and the
+measurement must not vary with the communication mechanism being measured.
+To make boundary vals see the shared model under that cadence, the outer
+step fires at **`step > 0 and step % H == 0`** (and on the final step) — the
+same iterations the val cadence uses, executed before the val block — with
+`val_every % H == 0` required at startup (`lr_at`-style, fails loudly). Two
+consequences, accepted: the *first* round is H+1 inner steps rather than H
+(the price of aligning to a val grid that starts at step 0), and the
+**step-0 val is rank 0's replica after one inner step** — the same one-step
+init fingerprint every DDP run prints (data-independent ~10.8 under the
+zero-init head), and incapable of recording a real crossing. Every val from
+step H onward measures the freshly synced params. A per-replica diagnostic
+eval can be added later behind an explicit flag; it must never share the
+reported metric's path. The coarser crossing resolution (multiples of H) is
+a property of the method.
 
 **Invariants — load-bearing:**
 
@@ -733,9 +743,10 @@ resolution is a property of the method.
 3. *Replica equality at boundaries*, fault-injected per §10: scramble one
    rank's delta before the reduce and the cross-rank agreement test must
    fail — otherwise it is vacuous.
-4. *Round arithmetic:* the outer step fires exactly at optimizer-step
-   multiples of H, including under gradient accumulation (H counts
-   optimizer steps, not micro-batches).
+4. *Round arithmetic:* the outer step fires exactly at positive
+   optimizer-step multiples of H (never at step 0) and on the final step,
+   including under gradient accumulation (H counts optimizer steps, not
+   micro-batches).
 5. *Resume:* checkpoint mid-round and at a boundary; both continue
    bit-identically **on every rank** — specifically rank ≠ 0's inner Adam
    state must round-trip, because a rank-0-only restore passes a

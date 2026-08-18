@@ -2,12 +2,204 @@
 import torch
 from torch import distributed as dist
 from torch import nn
+import abc
+
+class DistributedSynchronizerBase(abc.ABC):
+    def __init__(self, model):
+        self.model = model
+
+        # using torch.no_grad to avoid
+        # "an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it"
+        # warnings. Honestly it's a bit too much PyTorch internals
+        # for me to fully understand how this works, but it does
+        with torch.no_grad():
+            # Distribute model parameters from rank 0 to all other ranks
+            # to ensure all start from the same state, regardless of random
+            # seeds and different initialization
+            for param in self.model.parameters():
+                dist.broadcast(param, src=0)
+
+            for buffer in self.model.buffers():
+                dist.broadcast(buffer, src=0)
+
+    def finalize_gradients(self):
+        pass
+
+    def set_last_iteration(self):
+        """ Signal that the next iteration is the last on the rank, so hooks should perform communication """
+        pass
+
+    def maybe_outer_step(self, step: int, is_last: bool):
+        pass
+
+    def restore_outer_state(self, state: dict | None):
+        """No-op outside diloco: DDP has no state beyond what the rank-0
+        checkpoint already restores."""
+        pass
+
+    def broadcast_scalar(self, value: float, src: int = 0) -> float:
+        """Give every rank `src`'s value of a Python scalar.
+
+        Used for the validation loss, which only rank 0 computes. Every rank must
+        come back with the *identical* float, because each one independently tests it
+        against the target loss -- if src kept its own value and the others took the
+        broadcast one, the two could differ in the last bits and ranks could disagree
+        about which step first crossed 3.28. So src reads its result back out of the
+        tensor too, rather than returning what it passed in.
+
+        The tensor is allocated on the model's device on purpose: NCCL cannot
+        broadcast a CPU tensor, and no test in this repo can catch that, since every
+        multi-rank test runs on gloo (which accepts both). Taking the device from a
+        parameter means it cannot drift from where the model actually lives.
+        """
+        device = next(self.model.parameters()).device
+        tensor = torch.tensor([value], dtype=torch.float32, device=device)
+        dist.broadcast(tensor, src=src)
+        return tensor.item()
+
+    def wait_for_all_ranks(self) -> None:
+        """Block until every rank has finished all of its collectives.
+
+        Called once at the end of training, before any rank can tear its process
+        group down. Without it, ranks leave the last collective at slightly different
+        times -- and since only rank 0 evaluates, the others leave the final val
+        broadcast first, destroy the process group and exit while rank 0 is still
+        completing its side of that same broadcast. Rank 0's peer connection then
+        drops mid-teardown and gloo aborts the process (SIGABRT, "terminate called
+        without an active exception") after training has otherwise succeeded.
+
+        Deliberately at the end of a *successful* run rather than inside
+        `cleanup_distributed`: on the error path the surviving ranks would block here
+        until the gloo timeout, turning one rank's crash into a hang.
+        """
+        dist.barrier()
+
+class DiLoCoSynchronizer(DistributedSynchronizerBase):
+    """ DiLoCo (Distributed Low Communication) Synchronizer
+      Currently it can not be combined with DDP, meaning that the DiLoCo islands can not
+      use DDP themselves, but this can easily be introduced
+      by passing a process_group parameter as well in the init. """
+    def __init__(self, model: nn.Module, world_size: int, outer_sync_every: int, outer_lr: float, outer_moment: float):
+        super().__init__(model=model)
+        self.world_size = world_size
+        self.sync_every = outer_sync_every
+        self.last_synced_at = None
+        self.outer_lr = outer_lr
+        self.outer_moment = outer_moment
+
+        # For calculating the 
+        self.model_copy = [p.detach().clone() for p in self.model.parameters()]
+
+        # Outer Nesterov optimizer. PyTorch refuses nesterov=True at momentum 0
+        # (the lookahead is the identity there), so the flag tracks the momentum
+        self.outer_opt = torch.optim.SGD(self.model_copy, lr=self.outer_lr,
+                                         momentum=self.outer_moment,
+                                         nesterov=self.outer_moment > 0)
+
+    def maybe_outer_step(self, step: int, is_last: bool):
+        """ Perform outer optimization and synchronization step.
+
+        Fires in the same iterations the val cadence uses (step % H == 0), and
+        before the val block -- so every boundary eval measures the freshly
+        synced model under the mode-independent eval schedule. Never at step 0:
+        no round has finished there (the step-0 val is the same one-step init
+        fingerprint DDP runs print). Consequence: the first round is H+1 inner
+        steps, every later round exactly H. See decisions.md section 16.
+        """
+        if step > 0 and (step % self.sync_every == 0 or is_last):
+            # no_grad for the whole delta computation: the live parameters require
+            # grad, so without it the subtraction builds autograd graph edges that
+            # follow the tensors through the collective for nothing
+            with torch.no_grad():
+                # -1. Calculate the delta wrt. to the last synchronized model state (technically it would be okay
+                # to communicate the weights, and only calculate the delta on rank 0, no? In this case only rank 0
+                # would need to store an extra copy of the model, not all of them)
+                # 0. Combine all weight diffs to a single parameter for faster communication (no bucketing here)
+                # It's a virtual gradient over the outer optimization steps. It's inverted, to make it look like a real gradient,
+                # hence the opposite subtraction order.
+                weight_diffs = [param_baseline - param for param, param_baseline in zip(self.model.parameters(), self.model_copy)]
+                flat_weight_diffs = torch._utils._flatten_dense_tensors(weight_diffs)
+
+                # 1. Gather average weight diffs to all ranks
+                dist.all_reduce(flat_weight_diffs, dist.ReduceOp.SUM)
+                # ReduceOp.AVG is NCCL-only; gloo is the correctness backend (decisions.md section 6)
+                flat_weight_diffs /= self.world_size
+
+                unflat_weight_diffs = torch._utils._unflatten_dense_tensors(flat_weight_diffs, weight_diffs)
+                for param, synced_weight_diff in zip(self.model_copy, unflat_weight_diffs):
+                    param.grad = synced_weight_diff
+
+            # 2. Perform outer optimization
+            # This works because we deliberately copied the previously calculated average model weight diff
+            # (virtual gradient) into the gradient property of self.model_copy
+            self.outer_opt.step()
+
+            # 3. Save the current state as a baseline as it will be used in the next round
+            # Nothing to do, self.model_copy already contains there parameters correctly, thanks to the 
+            # previous optimization step
+
+            # 4. Save the updated weights to the live model, to actually continue traning from there
+            with torch.no_grad():
+                for live, synced in zip(self.model.parameters(), self.model_copy):
+                    live.copy_(synced)
+
+    def outer_state_dict(self) -> dict:
+        """What a resume needs beyond each rank's model + inner optimizer: the
+        round-start baseline and the outer momentum. Identical on every rank by
+        construction, so it is saved in rank 0's checkpoint only
+        (decisions.md section 16)."""
+        return {"model_copy": self.model_copy,
+                "outer_opt": self.outer_opt.state_dict()}
+
+    def restore_outer_state(self, state: dict | None):
+        """Adopt rank 0's outer state after a resume.
+
+        `state` comes from rank 0's checkpoint and is None on every other rank;
+        the broadcasts then make rank 0 the authority, the same pattern as the
+        init broadcast. Restoring the baseline matters even at momentum 0: a
+        mid-round checkpoint holds the *replica's* params, and cloning the
+        baseline from them (what __init__ just did) would silently shrink the
+        round's delta to only the post-resume steps.
+
+        If rank 0's checkpoint has no outer state (resumed from a single-file,
+        non-diloco checkpoint), what gets broadcast is the freshly initialized
+        state -- baseline = loaded params, no momentum -- i.e. a new round
+        starts at the checkpoint, the best available meaning.
+        """
+        with torch.no_grad():
+            if state is not None:
+                for copy, saved in zip(self.model_copy, state["model_copy"]):
+                    copy.copy_(saved)
+                self.outer_opt.load_state_dict(state["outer_opt"])
+            else:
+                # No saved outer state: the baseline in model_copy still holds
+                # the *init* params (the synchronizer is built before the resume
+                # load), so re-derive it from the just-loaded live params
+                for copy, live in zip(self.model_copy, self.model.parameters()):
+                    copy.copy_(live)
+            for copy in self.model_copy:
+                dist.broadcast(copy, src=0)
+            # Momentum buffers only exist once an outer step has run, and only
+            # rank 0 knows which case applies -- so ranks agree on it first,
+            # keeping the collective sequence rank-invariant (section 6)
+            device = self.model_copy[0].device
+            has_momentum = torch.tensor(
+                [float(len(self.outer_opt.state) > 0)], device=device)
+            dist.broadcast(has_momentum, src=0)
+            if has_momentum.item():
+                for copy in self.model_copy:
+                    buffer = self.outer_opt.state.setdefault(copy, {}).setdefault(
+                        "momentum_buffer", torch.zeros_like(copy))
+                    dist.broadcast(buffer, src=0)
 
 
-class DistributedSynchronizer:
+class DdpSynchronizer(DistributedSynchronizerBase):
+    ddp_modes = ["ddp_naive", "ddp_bucketed", "ddp_interleaved", "ddp_torch"]
+    
     def __init__(self, model: nn.Module, mode: str | None, world_size: int,
                  bucket_size: int | None = None):
-        self.model = model
+        super().__init__(model=model)
+        
         self.world_size = world_size
         self.mode = mode
 
@@ -40,20 +232,6 @@ class DistributedSynchronizer:
 
         # Only for debug prints
         self._param_names = {id(p): n for n, p in self.model.named_parameters()}
-
-        # using torch.no_grad to avoid
-        # "an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it"
-        # warnings. Honestly it's a bit too much PyTorch internals
-        # for me to fully understand how this works, but it does
-        with torch.no_grad():
-            # Distribute model parameters from rank 0 to all other ranks
-            # to ensure all start from the same state, regardless of random
-            # seeds and different initialization
-            for param in self.model.parameters():
-                dist.broadcast(param, src=0)
-
-            for buffer in self.model.buffers():
-                dist.broadcast(buffer, src=0)
 
     def _build_buckets(self, params_in_order = None):
         """Group parameters into all-reduce buckets.
@@ -288,40 +466,3 @@ class DistributedSynchronizer:
             pass
         else:
             raise NotImplementedError()
-
-    def broadcast_scalar(self, value: float, src: int = 0) -> float:
-        """Give every rank `src`'s value of a Python scalar.
-
-        Used for the validation loss, which only rank 0 computes. Every rank must
-        come back with the *identical* float, because each one independently tests it
-        against the target loss -- if src kept its own value and the others took the
-        broadcast one, the two could differ in the last bits and ranks could disagree
-        about which step first crossed 3.28. So src reads its result back out of the
-        tensor too, rather than returning what it passed in.
-
-        The tensor is allocated on the model's device on purpose: NCCL cannot
-        broadcast a CPU tensor, and no test in this repo can catch that, since every
-        multi-rank test runs on gloo (which accepts both). Taking the device from a
-        parameter means it cannot drift from where the model actually lives.
-        """
-        device = next(self.model.parameters()).device
-        tensor = torch.tensor([value], dtype=torch.float32, device=device)
-        dist.broadcast(tensor, src=src)
-        return tensor.item()
-
-    def wait_for_all_ranks(self) -> None:
-        """Block until every rank has finished all of its collectives.
-
-        Called once at the end of training, before any rank can tear its process
-        group down. Without it, ranks leave the last collective at slightly different
-        times -- and since only rank 0 evaluates, the others leave the final val
-        broadcast first, destroy the process group and exit while rank 0 is still
-        completing its side of that same broadcast. Rank 0's peer connection then
-        drops mid-teardown and gloo aborts the process (SIGABRT, "terminate called
-        without an active exception") after training has otherwise succeeded.
-
-        Deliberately at the end of a *successful* run rather than inside
-        `cleanup_distributed`: on the error path the surviving ranks would block here
-        until the gloo timeout, turning one rank's crash into a hang.
-        """
-        dist.barrier()

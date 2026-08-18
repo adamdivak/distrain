@@ -759,3 +759,39 @@ a property of the method.
 DDP's 4.92B; how much above *is* the result. One converged anchor in the
 netem session (§15), extendable via checkpoint anchors if the first schedule
 guess lands short, exactly as §14 did.
+
+## 17. netem cannot run on RunPod — measured (2026-08-18)
+
+§9 recorded that netem needs `NET_ADMIN` on the container and filed it as "a
+provisioning flag to remember." There is no such flag. Measured on a rented
+1×3090 pod (EU-CZ-1, $0.50/h, ~10 min, ~$0.09), booting the pinned image
+through `scripts/runpod_session.py`:
+
+- `CapEff: 00000000a80425fb` — Docker's default set. `cap_net_raw` is present,
+  **`cap_net_admin` is not**.
+- `tc qdisc add dev eth0 root netem rate 100mbit delay 10ms` →
+  `RTNETLINK answers: Operation not permitted`.
+- The namespace workaround is closed too: `unshare -U`, `-n`, `-Ur`, `-Urn`
+  and `-m` all fail with `Operation not permitted`, so a private netns whose
+  `lo` we *could* throttle cannot be created. (`kernel.unprivileged_userns_clone`
+  is 1, so this is the runtime's seccomp policy, not the kernel's.)
+- The API has no way to ask for it: `capAdd`, `privileged`, `capabilities` and
+  `securityOpt` are all rejected as unknown fields by
+  `PodFindAndDeployOnDemandInput`, and the REST pod schema has no equivalent.
+
+**Consequence for §15.** The netem half of the curve — DDP step-time sweeps
+across bandwidths and the throttled sanity segment — has no home on RunPod
+pods. DiLoCo's converged anchor is unaffected: it needs no throttling, so the
+next session's headline measurement stands as planned. Options for the curve,
+undecided: run it on `aurora` in Docker with `NET_ADMIN=1` (already supported
+by `scripts/container.sh`; 1–2 GPUs, so it measures transport shape rather
+than the 8-GPU anchor), or find a provider that permits privileged containers.
+Deciding this is a prerequisite for the netem session, not for the DiLoCo one.
+
+**Pricing, also measured.** `lowestPrice` from the GPU-type query is the
+*community* rate and is only an availability signal; a SECURE pod bills
+`securePrice × gpuCount` — the 3090 pod billed $0.50/h against a $0.22
+`lowestPrice`, and 8×A100 is 8 × $1.59 = $12.72/h, exactly what §14 paid.
+`runpod_session.py` budgets on `securePrice`. Account billing also lags a
+termination by ~75 s, so `verify` re-reads the spend once before calling a
+non-zero figure a leak.

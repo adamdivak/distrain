@@ -163,9 +163,19 @@ class RunpodAPI:
     # -- availability ------------------------------------------------------ #
 
     def gpu_price(self, gpu_type: str, gpu_count: int, data_center_id: str | None = None) -> dict:
+        """Two different numbers, and mixing them up costs money.
+
+        `lowestPrice` is the *availability* signal -- it is null in a data center
+        with no capacity -- but it is the lowest across cloud types, i.e. the
+        community rate. This script deploys `cloudType: SECURE`, which bills
+        `securePrice` per GPU: measured, a 3090 pod billed $0.50/h against a
+        $0.22 `lowestPrice`, and 8x A100 bills 8 x $1.59 = $12.72/h, exactly what
+        the 2026-08-16 session paid. So availability comes from one field and the
+        money from the other."""
         dc = f', dataCenterId: "{data_center_id}"' if data_center_id else ""
         types = self.gql(
             f'query {{ gpuTypes(input: {{id: "{gpu_type}"}}) {{ id maxGpuCount '
+            f"securePrice communityPrice "
             f"lowestPrice(input: {{gpuCount: {gpu_count}{dc}}}) "
             "{ uninterruptablePrice minimumBidPrice stockStatus } } }"
         )["gpuTypes"]
@@ -373,8 +383,19 @@ def cmd_verify(api: RunpodAPI, args: argparse.Namespace) -> int:
     if endpoints:
         leaks.append(f"{len(endpoints)} serverless endpoint(s)")
     if reported_spend > 0 and not running:
-        # the account's own number disagrees with the pod list: trust the money
-        leaks.append(f"account reports ${reported_spend:.2f}/h with no running pod listed")
+        # The account's own number disagrees with the pod list. Measured: after a
+        # termination it keeps reporting the old rate for ~75 s, so re-read it
+        # once before calling it a leak -- otherwise every `down` fails its own
+        # check. Still a failure if it persists: trust the money over the list.
+        settle = getattr(args, "settle_seconds", 45)
+        if settle:
+            print(f"\naccount reports ${reported_spend:.2f}/h with no running pod listed; "
+                  f"re-reading in {settle}s (billing lags a termination by ~a minute)...")
+            time.sleep(settle)
+            reported_spend = float(api.account().get("currentSpendPerHr") or 0)
+            print(f"  now ${reported_spend:.2f}/h")
+        if reported_spend > 0:
+            leaks.append(f"account reports ${reported_spend:.2f}/h with no running pod listed")
     if strict and volumes:
         leaks.append(f"{len(volumes)} network volume(s) at ~${monthly:.2f}/mo (--strict)")
 
@@ -397,35 +418,37 @@ def cmd_avail(api: RunpodAPI, args: argparse.Namespace) -> int:
     now. This is what picks the data center -- and, with a network volume, the
     volume must live in the same one, so the choice is sticky."""
     overall = api.gpu_price(args.gpu_type, args.gpu_count)
-    price = (overall.get("lowestPrice") or {}).get("uninterruptablePrice")
     print(f"{args.gpu_type} x{args.gpu_count}  max/host {overall.get('maxGpuCount')}  "
-          f"lowest ${price if price is not None else 'n/a'}/h\n")
+          f"secure ${secure_price(overall, args.gpu_count):.2f}/h  "
+          f"(community ${float(overall.get('communityPrice') or 0) * args.gpu_count:.2f}/h)\n")
 
     found = []
     for dc in (args.data_centers or DATA_CENTERS):
         low = api.gpu_price(args.gpu_type, args.gpu_count, dc).get("lowestPrice") or {}
         if low.get("uninterruptablePrice"):
-            found.append((dc, float(low["uninterruptablePrice"]), low.get("stockStatus")))
-            print(f"  {dc:10s} ${low['uninterruptablePrice']:.2f}/h  {low.get('stockStatus') or ''}")
+            found.append(dc)
+            print(f"  {dc:10s} capacity  {low.get('stockStatus') or ''}")
     if not found:
         print("  no data center reports capacity for that GPU count right now.")
         return 1
     return 0
 
 
+def secure_price(gpu_type_info: dict, gpu_count: int) -> float:
+    """What a SECURE pod actually bills per hour: per-GPU secure price x count."""
+    return float(gpu_type_info.get("securePrice") or 0) * gpu_count
+
+
 def _pick_data_center(api: RunpodAPI, args: argparse.Namespace) -> tuple[str, float]:
-    """Cheapest data center with capacity, or the one the caller pinned."""
+    """(data center with capacity, the price a SECURE pod there will bill)."""
     candidates = [args.data_center] if args.data_center else (args.data_centers or DATA_CENTERS)
-    priced = []
     for dc in candidates:
-        low = api.gpu_price(args.gpu_type, args.gpu_count, dc).get("lowestPrice") or {}
-        if low.get("uninterruptablePrice"):
-            priced.append((dc, float(low["uninterruptablePrice"])))
-    if not priced:
-        sys.exit(f"no capacity for {args.gpu_count}x {args.gpu_type} in "
-                 f"{'/'.join(candidates) if args.data_center else 'any data center'} right now "
-                 f"(check `avail`)")
-    return min(priced, key=lambda pair: pair[1])
+        info = api.gpu_price(args.gpu_type, args.gpu_count, dc)
+        if (info.get("lowestPrice") or {}).get("uninterruptablePrice"):
+            return dc, secure_price(info, args.gpu_count)
+    sys.exit(f"no capacity for {args.gpu_count}x {args.gpu_type} in "
+             f"{'/'.join(candidates) if args.data_center else 'any data center'} right now "
+             f"(check `avail`)")
 
 
 def _ensure_volume(api: RunpodAPI, args: argparse.Namespace, account: dict,
@@ -740,6 +763,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--strict", action="store_true",
                         help="network volumes count as billing too (end of project, not of a "
                              "session)")
+    verify.add_argument("--settle-seconds", type=int, default=45,
+                        help="how long to let billing catch up before believing a spend figure "
+                             "no pod explains; 0 to answer immediately")
 
     avail = subparsers.add_parser("avail", help="per-data-center capacity for the GPU type")
     avail.add_argument("--data-centers", nargs="*", default=None)

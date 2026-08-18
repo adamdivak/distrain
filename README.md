@@ -261,15 +261,21 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **DiLoCo + the netem bandwidth curve** — the slow-transport side of the
-   study, against the fast-interconnect anchor measured on 2026-08-16
-   (3147.1 s / 4.92B tokens to 3.28 on 8×A100 NVLink). Only DiLoCo needs
-   converged runs on the curve: DDP's crossing step is transport-invariant,
-   so its time-to-target at each bandwidth is step-time × 9999 — see
-   [`docs/decisions.md`](docs/decisions.md) §15. Rerun the bench
-   matrix once under netem: the per-transport compile × overlap result
-   predicts uncompiled interleaved retakes the lead once comm dominates.
-2. Track B (FSDP2 at ~7B on one 8-GPU node) after that.
+1. **DiLoCo's converged anchor** — the slow-transport side of the study,
+   against the fast-interconnect anchor measured on 2026-08-16 (3147.1 s /
+   4.92B tokens to 3.28 on 8×A100 NVLink). Only DiLoCo needs converged runs:
+   DDP's crossing step is transport-invariant, so its time-to-target at each
+   bandwidth is step-time × 9999 — see [`docs/decisions.md`](docs/decisions.md)
+   §15. This needs no throttling and is unblocked.
+2. **Decide where the netem curve runs.** It cannot run on RunPod:
+   containers there have no `NET_ADMIN`, `unshare` is blocked, and the API has
+   no way to ask for either — measured 2026-08-18,
+   [`docs/decisions.md`](docs/decisions.md) §17. Candidates: aurora in Docker
+   with `NET_ADMIN=1` (1–2 GPUs, transport shape rather than the 8-GPU anchor),
+   or a provider allowing privileged containers. The bench matrix rerun under
+   netem — testing whether uncompiled interleaved retakes the lead once comm
+   dominates — waits on that.
+3. Track B (FSDP2 at ~7B on one 8-GPU node) after that.
 
 ## Known gaps
 

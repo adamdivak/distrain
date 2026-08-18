@@ -64,7 +64,7 @@ class FakeAPI:
     """Records what the script would have done to the account."""
 
     def __init__(self, pods=None, volumes=None, balance=500.0, templates=None,
-                 creds=None, price=12.72, ready_pod=None, endpoints=None,
+                 creds=None, price=1.59, ready_pod=None, endpoints=None,
                  reported_spend=None):
         self._endpoints = list(endpoints or [])
         self.reported_spend = reported_spend
@@ -80,9 +80,12 @@ class FakeAPI:
     def account(self):
         spend = sum(float(p.get("costPerHr") or 0) for p in self._pods
                     if p.get("desiredStatus") == "RUNNING")
+        if isinstance(self.reported_spend, list):      # one value per account() call
+            spend = self.reported_spend.pop(0) if self.reported_spend else 0.0
+        elif self.reported_spend is not None:
+            spend = self.reported_spend
         return {"id": "u1", "pubKey": "ssh-ed25519 ACCOUNT", "clientBalance": self._balance,
-                "currentSpendPerHr": self.reported_spend if self.reported_spend is not None
-                else spend,
+                "currentSpendPerHr": spend,
                 "networkVolumes": self._volumes,
                 "containerRegistryCreds": self._creds, "podTemplates": self._templates}
 
@@ -133,11 +136,16 @@ class FakeAPI:
         self._volumes = [v for v in self._volumes if v["id"] != volume_id]
 
     def gpu_price(self, gpu_type, gpu_count, data_center_id=None):
+        # `price` is the per-GPU secure rate (1.59 x 8 = the $12.72/h an 8x A100
+        # pod really bills); lowestPrice is the community rate, and only its
+        # presence means capacity.
         available = data_center_id in (None, "US-KS-2", "EU-RO-1")
-        return {"id": gpu_type, "maxGpuCount": 8, "lowestPrice": {
-            "uninterruptablePrice": self._price if available else None,
-            "minimumBidPrice": self._price if available else None,
-            "stockStatus": "High" if available else None}}
+        return {"id": gpu_type, "maxGpuCount": 8,
+                "securePrice": self._price, "communityPrice": self._price * 0.5,
+                "lowestPrice": {
+                    "uninterruptablePrice": self._price * 0.5 if available else None,
+                    "minimumBidPrice": self._price * 0.5 if available else None,
+                    "stockStatus": "High" if available else None}}
 
 
 def up_args(tmp_path, **overrides):
@@ -173,6 +181,14 @@ class TestPureHelpers:
         assert rps.runway_hours(100.0, 0) == float("inf")
         started = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
         assert rps.deadline_iso(started, 8) == "2026-08-18T20:00:00+00:00"
+
+    def test_secure_price_is_per_gpu_times_count(self):
+        """Measured on a real pod: a 3090 billed $0.50/h while `lowestPrice`
+        said $0.22 (that is the community rate). SECURE pods bill securePrice."""
+        info = {"securePrice": 1.59, "communityPrice": 1.39,
+                "lowestPrice": {"uninterruptablePrice": 1.39}}
+        assert rps.secure_price(info, 8) == pytest.approx(12.72)
+        assert rps.secure_price({}, 8) == 0.0
 
     def test_lookups_by_name_and_size(self):
         pods = [pod_fixture(id="a", name="other"), pod_fixture(id="b", name="distrain-a100x8")]
@@ -381,8 +397,9 @@ class TestDown:
 
 
 class TestVerify:
-    def _verify_args(self, tmp_path, strict=False):
-        argv = ["--session-file", str(tmp_path / "session.json"), "verify"]
+    def _verify_args(self, tmp_path, strict=False, settle=0):
+        argv = ["--session-file", str(tmp_path / "session.json"), "verify",
+                "--settle-seconds", str(settle)]
         args = rps.build_parser().parse_args(argv + (["--strict"] if strict else []))
         args.name = "distrain-a100x8"
         return args
@@ -429,6 +446,20 @@ class TestVerify:
         api = FakeAPI(reported_spend=3.5)
         assert rps.cmd_verify(api, self._verify_args(tmp_path)) == 1
         assert "no running pod listed" in capsys.readouterr().out
+
+    def test_billing_lag_right_after_a_teardown_is_not_a_leak(self, tmp_path, monkeypatch, capsys):
+        """Measured: the account kept reporting the terminated pod's rate for
+        ~75 s. Without the settle re-read, every `down` would fail its own check."""
+        monkeypatch.setattr(rps.time, "sleep", lambda _s: None)
+        api = FakeAPI(reported_spend=[0.50, 0.0])          # stale, then caught up
+        assert rps.cmd_verify(api, self._verify_args(tmp_path, settle=45)) == 0
+        out = capsys.readouterr().out
+        assert "re-reading in 45s" in out and "CLEAN" in out
+
+    def test_spend_that_survives_the_settle_window_is_a_leak(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rps.time, "sleep", lambda _s: None)
+        api = FakeAPI(reported_spend=[0.50, 0.50])
+        assert rps.cmd_verify(api, self._verify_args(tmp_path, settle=45)) == 1
 
     def test_down_ends_with_the_check(self, tmp_path, capsys):
         api = FakeAPI(pods=[pod_fixture()], ready_pod=pod_fixture())

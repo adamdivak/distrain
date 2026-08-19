@@ -525,6 +525,15 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
                 _log(cfg, diag_metrics, step)
                 print(f"step {step:5d} | diag pre-sync val "
                       + " ".join(f"r{r}={v:.4f}" for r, v in enumerate(diag_losses)))
+            # Hand the diag pass's blocks back to the driver. Where ranks share a
+            # GPU this is not optional: the diag batch is small, so the pass leaves
+            # the caching allocator carved into blocks smaller than the one
+            # contiguous eval_batch_seqs-sized tensor the *reported* val then asks
+            # for, and rank 0 OOMs holding GiBs of reserved-but-unusable pool.
+            # Numerically inert -- it frees cache, never live tensors -- and the
+            # diag path is already outside the timed region.
+            if is_cuda(device):
+                torch.cuda.empty_cache()
             accelerator_synchronize(device)
             diag_time = time.perf_counter() - diag_start
 

@@ -237,3 +237,36 @@ class TestCheckpointing:
                                 checkpoint_dir=str(tiny_data / "nowhere"))
         with pytest.raises(FileNotFoundError, match="--resume"):
             train(cfg)
+
+
+class TestDiagEvalBatch:
+    """The diag eval runs on *every* rank at once, unlike the reported val, which
+    runs on rank 0 alone. Where ranks share a GPU that multiplies the logits
+    tensor by world_size, so the diag pass needs its own smaller batch — and the
+    number it reports must still mean the same thing."""
+
+    def _eval(self, tiny_data, batch_seqs):
+        import contextlib
+
+        from distrain.data import TokenStream
+        from distrain.model import GPT, GPTConfig
+        from distrain.train import evaluate
+
+        cfg = tiny_train_config(tiny_data, eval_batch_seqs=8)
+        torch.manual_seed(0)
+        model = GPT(GPTConfig(block_size=cfg.seq_len, vocab_size=cfg.vocab_size,
+                              n_layer=cfg.n_layer, n_head=cfg.n_head,
+                              n_embd=cfg.n_embd, dropout=cfg.dropout, bias=cfg.bias))
+        stream = TokenStream(sorted((tiny_data).glob("t_val_*.bin")))
+        return evaluate(model, stream, cfg, "cpu", contextlib.nullcontext(),
+                        batch_seqs=batch_seqs)
+
+    def test_batch_override_does_not_change_the_value(self, tiny_data):
+        """Same sequences, same order, token-weighted mean — only the grouping
+        differs, so a smaller diag batch must not move the loss."""
+        full = self._eval(tiny_data, None)
+        small = self._eval(tiny_data, 2)
+        assert small == pytest.approx(full, rel=1e-5)
+
+    def test_default_is_the_reported_batch(self, tiny_data):
+        assert self._eval(tiny_data, None) == pytest.approx(self._eval(tiny_data, 8))

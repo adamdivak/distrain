@@ -107,6 +107,13 @@ class TrainConfig:
     # cadence stays mode-independent (decisions.md sections 4 and 16). Free to use
     # a finer cadence than val_every -- it carries no comparability obligation.
     diag_val_every: int = 0
+    # Eval batch for the diag pass only, 0 = use eval_batch_seqs. Unlike the
+    # reported val, which runs on rank 0 alone, every rank runs the diag pass at
+    # once — so on a box where ranks share one GPU (aurora's 2-rank gloo smoke)
+    # the logits tensor is allocated world_size times over. At eval_batch_seqs=32
+    # that is 3.07 GiB per rank and a 3090 OOMs. Reported-path comparability
+    # (decisions.md section 4) is untouched: this never reaches val/loss.
+    diag_eval_batch_seqs: int = 0
 
     # runtime
     device: str = "auto"
@@ -234,12 +241,17 @@ def to_device(batch: np.ndarray, device: str) -> torch.Tensor:
 
 @torch.no_grad()
 def evaluate(model: GPT, stream: TokenStream, cfg: TrainConfig, device: str,
-             autocast_ctx) -> float:
+             autocast_ctx, batch_seqs: int | None = None) -> float:
     """Mean cross-entropy over the first `val_tokens` tokens of the val stream.
 
     Deterministic and identical across configs: the same sequences in the same order,
     in batches of `cfg.eval_batch_seqs`, every time. That is what makes the 3.28
     crossing comparable between runs.
+
+    `batch_seqs` overrides the batch for callers off the reported path (the diag
+    eval), which needs a smaller footprint because every rank runs it at once.
+    Grouping does not change the result beyond float reduction order: the mean is
+    token-weighted over the same sequences in the same order.
 
     Never sharded -- this is one rank's full pass over the val split. Under DDP the
     caller runs it on rank 0 only and broadcasts the scalar, so every rank tests the
@@ -250,7 +262,7 @@ def evaluate(model: GPT, stream: TokenStream, cfg: TrainConfig, device: str,
     """
     plan = ShardingPlan(
         seq_len=cfg.seq_len,
-        global_batch_seqs=cfg.eval_batch_seqs,
+        global_batch_seqs=batch_seqs or cfg.eval_batch_seqs,
         world_size=1,
         rank=0,
     )
@@ -502,7 +514,8 @@ def train(cfg: TrainConfig, return_debug_values: list[str] | None = None) -> dic
             accelerator_synchronize(device)
             diag_start = time.perf_counter()
             diag_loss = evaluate(raw_model if use_torch_ddp else model,
-                                 val_stream, cfg, device, autocast_ctx)
+                                 val_stream, cfg, device, autocast_ctx,
+                                 batch_seqs=cfg.diag_eval_batch_seqs or None)
             diag_losses = (dist_sync.gather_scalars(diag_loss)
                            if is_distributed(cfg) else [diag_loss])
             if is_primary:

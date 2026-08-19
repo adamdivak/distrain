@@ -856,3 +856,49 @@ rather than failing. At global batch 480 the full FineWeb10B corpus is
 to reach DDP's crossing -- past the corpus. Any run crossing that line must
 disclose the second epoch, not absorb it. Raising `b` also raises this
 ceiling in steps, since each step consumes more of the corpus.
+
+## 19. The aurora excursion probe: two arms, one variable each (2026-08-19)
+
+§18 framed the inner batch as `b` at K=8, where the §16 split gives b=60. The
+aurora smoke runs K=2, so `b` is already 240 and the noise term collapses:
+`sigma_dbar ~ lr*sigma*sqrt(H/(K*b))` and `K*b` **is** `global_batch_seqs`. At
+fixed K the only knobs are H and the global batch, so "raise b" on aurora means
+"raise the global batch and cut H to match". §18's `b in {120, 240}` is a K=8
+prescription and does not transfer.
+
+Two arms, each changing exactly one thing against the `diloco-smoke-b480`
+baseline, both at the baseline's token budget and wall clock:
+
+| arm | global batch | H | steps | rounds | outer moment | sigma_dbar |
+|---|---|---|---|---|---|---|
+| baseline (have) | 480 | 500 | 6000 | 12 | 0.9 | 1.00x |
+| A `diloco-b480-mom05` | 480 | 500 | 6000 | 12 | **0.5** | 1.00x |
+| B `diloco-b960-h250` | **960** | **250** | **3000** | 12 | 0.9 | **0.50x** |
+
+Arm B holds tokens per round (240k seqs), round count, total tokens and wall
+clock all identical to the baseline; only the inner batch and the inner step
+count per round change, and `sqrt(H/B)` falls exactly 2x. Its trapezoid is
+scaled with the step count (warmup 125, warmdown 500) so the LR multiplier
+matches the baseline at equal token positions. Arm A keeps the baseline's
+6000-step schedule verbatim, so its LR prefix is identical step for step.
+
+**Inner LR is deliberately not scaled in arm B.** Doubling the batch at fixed
+`learning_rate` leaves it mildly under-tuned per token, which biases *against*
+the arm -- if the excursion damps anyway, the result is conservative. Scaling it
+would confound the batch-size effect with an LR change.
+
+**Why momentum is the other arm.** A sawtooth is a momentum signature; outer LR
+alone would overshoot proportionally, not oscillate. At mu=0.5 the steady-state
+amplification `lr/(1-mu)` is 1.4x instead of 7x. This deliberately leaves §12's
+"untuned DiLoCo" box -- that box is already measured, and the rented K=8 run
+needs chosen hyperparameters, not published ones.
+
+**Both arms run `--diag-val-every 250`.** With H=500 that yields a mid-round and
+a pre-sync point per round, so replica spread -- the quantity the noise algebra
+is about -- is observed directly rather than inferred from the post-sync curve.
+Cost is ~4% of wall clock and it never feeds the 3.28 check (§16).
+
+**Sequential, not parallel.** One 3090, ~8.7 s/step either way: ~7.3 h to reach
+step 3000 (where the baseline's excursion peaked and recovered), ~14.5 h for a
+full schedule. `--checkpoint-every 500` on both, so the endpoint survives an
+interruption -- the baseline's was lost to its omission.

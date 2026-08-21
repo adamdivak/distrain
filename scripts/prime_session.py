@@ -99,6 +99,29 @@ def load_api_key(env_file: Path = REPO_ROOT / ".env") -> str:
     return key
 
 
+def load_team_id(env_file: Path = REPO_ROOT / ".env") -> str | None:
+    """PRIME_TEAM_ID, else `.env`, else the `prime` CLI's own `team_id`.
+
+    Console top-ups land on a team wallet, and a bare key sees only the personal
+    one -- so the team is part of the credentials, not an option.
+    """
+    team = os.environ.get("PRIME_TEAM_ID", "").strip()
+    if not team and env_file.exists():
+        for line in env_file.read_text().splitlines():
+            name, _, value = line.partition("=")
+            if name.strip() == "PRIME_TEAM_ID":
+                team = value.strip().strip("'\"")
+                break
+    if not team:
+        cfg = Path.home() / ".prime" / "config.json"
+        if cfg.exists():
+            try:
+                team = str(json.loads(cfg.read_text()).get("team_id") or "").strip()
+            except (json.JSONDecodeError, OSError):
+                team = ""
+    return team or None
+
+
 # --------------------------------------------------------------------------- #
 # API surface -- one seam, so the tests can drive the whole script with a fake
 # --------------------------------------------------------------------------- #
@@ -110,14 +133,22 @@ class PrimeAPI:
     prose docs, which lag it.
     """
 
-    def __init__(self, api_key: str, base_url: str = BASE_URL, timeout: int = 60) -> None:
+    def __init__(self, api_key: str, base_url: str = BASE_URL, timeout: int = 60,
+                 team_id: str | None = None) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # A key resolves to the *personal* wallet unless every call carries the
+        # team. Money added in the console lands on a team wallet by default, so
+        # without this the balance reads $0.00 and `up` refuses a funded account.
+        self.team_id = team_id
 
     def _request(self, method: str, path: str, *, params: dict | None = None,
                  body: dict | None = None) -> dict | list:
         url = f"{self.base_url}{path}"
+        params = dict(params or {})
+        if self.team_id:
+            params.setdefault("teamId", self.team_id)
         if params:
             url += "?" + urllib.parse.urlencode(params)
         data = json.dumps(body).encode() if body is not None else None
@@ -141,6 +172,10 @@ class PrimeAPI:
 
     def whoami(self) -> dict:
         return self._request("GET", "/api/v1/user/whoami")
+
+    def teams(self) -> list[dict]:
+        got = self._request("GET", "/api/v1/user/teams")
+        return (got or {}).get("data", []) if isinstance(got, dict) else []
 
     def registry_credentials(self) -> list[dict]:
         """Private-registry credentials registered in the console. Needed for the
@@ -176,6 +211,10 @@ class PrimeAPI:
         return got if isinstance(got, dict) else None
 
     def create_pod(self, payload: dict) -> dict:
+        # Pod creation takes the team in the *body*, not as a query param -- and
+        # it decides which wallet the pod bills to, so it must not be omitted.
+        if self.team_id:
+            payload = {**payload, "team": {"teamId": self.team_id}}
         got = self._request("POST", "/api/v1/pods/", body=payload)
         return got if isinstance(got, dict) else {}
 
@@ -357,7 +396,15 @@ def read_session(path: Path = SESSION_FILE) -> dict:
 def cmd_status(api: PrimeAPI, args: argparse.Namespace) -> int:
     wallet = api.wallet()
     balance = float(wallet.get("balance_usd") or 0.0)
-    print(f"balance    ${balance:.2f}")
+    scope = f"team {wallet.get('team_id')}" if wallet.get("team_id") else "personal"
+    print(f"balance    ${balance:.2f}  ({scope} wallet {wallet.get('wallet_id')})")
+    if balance == 0.0 and not api.team_id:
+        teams = api.teams()
+        if teams:
+            print("           this is the personal wallet and it is empty. Funds added in "
+                  "the console land on a team wallet -- try --team-id:")
+            for team in teams:
+                print(f"             {team.get('teamId')}  {team.get('name')}")
 
     pods = api.pods()
     live = [p for p in pods if str(p.get("status")) in LIVE_STATUSES]
@@ -701,6 +748,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="pin an upstream provider (lambdalabs, vultr, ...)")
     parser.add_argument("--session-file", type=Path, default=SESSION_FILE)
     parser.add_argument("--name", default="distrain")
+    parser.add_argument("--team-id", default=None,
+                        help="bill this team's wallet (default: PRIME_TEAM_ID, .env, "
+                             "or the `prime` CLI's config; --team-id '' forces personal)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -758,7 +808,10 @@ COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    api = PrimeAPI(load_api_key())
+    # `--team-id ''` is the explicit way back to the personal wallet; absent, the
+    # discovered team wins, because that is where a console top-up actually goes.
+    team = args.team_id if args.team_id is not None else load_team_id()
+    api = PrimeAPI(load_api_key(), team_id=team or None)
     return COMMANDS[args.command](api, args)
 
 

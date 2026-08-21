@@ -941,7 +941,25 @@ Three refusals are load-bearing in that script:
 - **`autoRestart=False` and `maxPrice` = the quoted offer +5%.** A restart after
   our deadline would bill on unattended; an absent `maxPrice` is an open cheque.
 
-**Two one-time console steps have no API** and must be done by hand:
-funding the wallet, and adding a ghcr.io private-registry credential so a custom
-template can be built (`/api/v1/template/registry-credentials` is GET-only). This
-is the same shape as the RunPod GHCR credential in runbook §0.
+**The team is part of the credentials, not an option.** A console top-up lands on
+a *team* wallet, and a bare API key resolves only to the personal one -- so a
+funded account reads `balance_usd: 0.0` and `up` refuses it. The team travels as
+a `teamId` **query param** on reads and as a `team: {teamId}` field in the **body**
+of pod creation, where it decides which wallet is billed. `--team-id ''` forces
+the personal wallet back. Note the casing: `team_id` is silently ignored, which is
+the failure mode that cost an hour here -- the endpoint returns 200 with the wrong
+wallet rather than erroring. `status` prints which wallet it read, and points at
+the teams when an empty personal wallet is the likely explanation.
+
+That was found by reading Prime Intellect's own CLI (`prime`, installed as a `uv`
+tool, never in the project venv) rather than their OpenAPI document, which does
+not list the parameter.
+
+**One console step still has no API**: adding a ghcr.io private-registry
+credential so a custom template can be built
+(`/api/v1/template/registry-credentials` is GET-only, and the CLI's `registry`
+command has only `list` and `check-docker-image`). This is the same shape as the
+RunPod GHCR credential in runbook §0. The alternative is `prime images push`,
+which builds our Dockerfile into Prime Intellect's own registry and needs no GHCR
+credential at all -- untried, and it re-builds rather than shipping the byte-identical
+image, so it trades a console step for a parity question.

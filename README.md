@@ -172,9 +172,14 @@ teardown-on-exception) against Prime Intellect, a compute exchange that resells
 lambdalabs, vultr, hyperstack and others. It is stdlib-only — no SDK — and pins
 the socket to SXM4 so a PCIe A100 cannot silently break comparability with the
 §14 NVLink anchor. `up` refuses to provision without `--template-id` rather than
-boot Prime Intellect's stock image. Two one-time steps have no API and must be
-done in their console: funding the wallet, and adding a ghcr.io registry
-credential so a custom template on the pinned image can be created. See
+boot Prime Intellect's stock image.
+
+Money added in their console lands on a **team** wallet, which a bare API key
+cannot see — so the team id is picked up from `PRIME_TEAM_ID`, `.env`, or the
+`prime` CLI's config and sent with every call (`--team-id ''` forces the personal
+wallet). `status` prints which wallet it read. One step still has no API and must
+be done in their console: adding a ghcr.io registry credential so a custom
+template on the pinned image can be created. See
 [`docs/decisions.md`](docs/decisions.md) §20 — including why SkyPilot was
 evaluated and rejected as the broker.
 

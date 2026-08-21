@@ -58,22 +58,29 @@ def pod_fixture(**overrides) -> dict:
 
 class FakeAPI:
     def __init__(self, pods=None, balance=500.0, offers=None, ssh_keys=None,
-                 registry=None, fail_create=False):
+                 registry=None, fail_create=False, team_id="team-1", teams=None):
         self._pods = list(pods or [])
         self._balance = balance
         self._offers = offers if offers is not None else [offer_fixture()]
         self._ssh_keys = list(ssh_keys or [])
         self._registry = list(registry or [])
         self._fail_create = fail_create
+        self.team_id = team_id
+        self._teams = teams if teams is not None else [
+            {"teamId": "team-1", "name": "Private", "role": "ADMIN"}]
         self.created_pods: list[dict] = []
         self.terminated: list[str] = []
         self.created_keys: list[dict] = []
 
     def wallet(self):
-        return {"balance_usd": self._balance}
+        return {"balance_usd": self._balance, "team_id": self.team_id,
+                "wallet_id": "wallet-1"}
 
     def whoami(self):
         return {"data": {"email": "test@example.com"}}
+
+    def teams(self):
+        return list(self._teams)
 
     def registry_credentials(self):
         return list(self._registry)
@@ -362,6 +369,71 @@ class TestAvailAndVerify:
         api = FakeAPI()
         assert ps.cmd_status(api, self._args("status")) == 0
         assert "no private-registry credential" in capsys.readouterr().out
+
+    def test_status_names_the_wallet_it_read(self, capsys):
+        api = FakeAPI(balance=20.0)
+        assert ps.cmd_status(api, self._args("status")) == 0
+        assert "team team-1" in capsys.readouterr().out
+
+    def test_empty_personal_wallet_points_at_the_team_that_holds_the_money(self, capsys):
+        """A console top-up lands on a team wallet; a bare key reads $0.00 and
+        `up` would refuse a funded account. The hint is what makes that legible."""
+        api = FakeAPI(balance=0.0, team_id=None)
+        assert ps.cmd_status(api, self._args("status")) == 0
+        out = capsys.readouterr().out
+        assert "team-1" in out and "Private" in out
+
+    def test_no_team_hint_when_the_personal_wallet_is_funded(self, capsys):
+        api = FakeAPI(balance=50.0, team_id=None)
+        assert ps.cmd_status(api, self._args("status")) == 0
+        assert "land on a team wallet" not in capsys.readouterr().out
+
+
+class TestTeamScoping:
+    """The team is part of the credentials: reads carry it as a query param,
+    pod creation carries it in the body, and it decides which wallet is billed."""
+
+    def _api(self, team_id):
+        return ps.PrimeAPI("pit_fake", team_id=team_id)
+
+    def _capture_url(self, monkeypatch) -> list[str]:
+        """Intercept at urlopen, so the assertion covers the URL actually built."""
+        urls: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            urls.append(req.full_url)
+            raise RuntimeError("stopped after the URL was built")
+
+        monkeypatch.setattr(ps.urllib.request, "urlopen", fake_urlopen)
+        return urls
+
+    def test_reads_carry_the_team_as_a_query_param(self, monkeypatch):
+        urls = self._capture_url(monkeypatch)
+        with pytest.raises(RuntimeError):
+            self._api("team-1").wallet()
+        assert "teamId=team-1" in urls[0]
+
+    def test_reads_without_a_team_stay_on_the_personal_wallet(self, monkeypatch):
+        urls = self._capture_url(monkeypatch)
+        with pytest.raises(RuntimeError):
+            self._api(None).wallet()
+        assert "teamId" not in urls[0]
+
+    def test_pod_creation_carries_the_team_in_the_body(self):
+        api = self._api("team-1")
+        captured = {}
+        api._request = lambda m, p, params=None, body=None: captured.update(body=body) or {}
+        api.create_pod({"pod": {"name": "distrain"}})
+        assert captured["body"]["team"] == {"teamId": "team-1"}
+
+    def test_no_team_means_no_team_key_at_all(self):
+        """An empty `team` object is not the same as omitting it -- the personal
+        wallet is the fallback and must stay reachable."""
+        api = self._api(None)
+        captured = {}
+        api._request = lambda m, p, params=None, body=None: captured.update(body=body) or {}
+        api.create_pod({"pod": {"name": "distrain"}})
+        assert "team" not in captured["body"]
 
 
 class TestDown:

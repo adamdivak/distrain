@@ -185,6 +185,14 @@ evaluated and rejected as the broker.
 
 `scripts/watch_capacity.sh` polls both venues.
 
+A Prime Intellect pod is a **KVM VM with root**, so the session boots their stock
+Ubuntu and runs our own container inside it — which pulls the byte-identical
+aurora image, better parity than their registry (which rebuilds), and gives
+`NET_ADMIN`, so netem runs in the same container as the training. That is the one
+thing RunPod cannot do (§17). Two sessions are written up in
+[`docs/runbook-prime-intellect.md`](docs/runbook-prime-intellect.md): the netem
+curve (§15) and the DiLoCo K=8 converged anchor (§16, §19).
+
 ## Data
 
 The full FineWeb10B set (104 shards, ~19 GiB; see

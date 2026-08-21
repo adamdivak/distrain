@@ -56,6 +56,21 @@ than a crash. Each is enforced by a test — do not weaken them to make a test p
   invocation, not by tensor name. A rank-dependent sequence deadlocks or silently
   pairs the wrong tensors. Never make participation conditional on per-rank state.
 
+## Rented venues
+
+Two, with different strengths. **RunPod** is cheaper for plain A100 DDP work when
+it has stock, but its pods are containers without `cap_net_admin`, so netem is
+impossible there (`docs/decisions.md` §17). **Prime Intellect** pods are KVM VMs
+with root: boot their stock Ubuntu, then `docker pull` our image and run it —
+byte-identical parity, and netem works inside that container (§20). Their `image`
+enum cannot take a custom image, so `--allow-stock-image` is the correct route,
+not a fallback. Session steps for both PI sessions:
+[`docs/runbook-prime-intellect.md`](docs/runbook-prime-intellect.md).
+
+Money added in PI's console lands on a **team** wallet that a bare API key cannot
+see; the team id travels as a `teamId` query param, and `prime_session.py status`
+prints which wallet it read.
+
 ## Costs are real
 
 Budget is $150 target / $400 ceiling of the user's own money. Never debug on rented

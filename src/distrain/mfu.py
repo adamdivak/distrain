@@ -53,6 +53,7 @@ _PEAK_BF16: tuple[tuple[str, PeakSpec], ...] = (
     ("H100 NVL", PeakSpec(835.0, "datasheet dense, UNVERIFIED")),
     ("H100", PeakSpec(989.0, "datasheet dense SXM, UNVERIFIED")),
     ("A100-SXM4-80GB", PeakSpec(269.9, "measured on runpod 8xA100 US-MD-1 2026-08-16, 16384^3 bf16 GEMM")),
+    ("A100-SXM4-40GB", PeakSpec(270.1, "measured on prime/lambdalabs 8xA100 us-east-1 2026-08-21, 16384^3 bf16 GEMM")),
     ("A100", PeakSpec(312.0, "datasheet dense, PCIe unmeasured, UNVERIFIED")),
     ("L40S", PeakSpec(181.0, "datasheet dense, UNVERIFIED")),
     ("RTX 3090", PeakSpec(82.6, "measured on aurora 2026-07-28, 16384^3 bf16 GEMM")),

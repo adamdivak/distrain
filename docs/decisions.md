@@ -1118,3 +1118,51 @@ carried §16's converged anchor and a trimmed version of §15's curve.
   mirrored `session_out/`. The trackio DB did not survive — it lives in
   `~/.cache` inside the container, which is not a mounted path. Either mount it
   or accept `train.log` as the record.
+
+## 22. The single-GPU baseline, and what scaling efficiency depends on (2026-08-21)
+
+Full narrative in the [session log](sessions/2026-08-21-prime-single-gpu-scaling.md).
+One 8×A100-SXM4-40GB rental (Prime Intellect / lambdalabs, $15.92/h, 31 min,
+$8.24), bought to close the two weakest bullets in the write-up.
+
+- **Time-to-3.28 on one A100 is 7.19 h, measured** — 2589.1 ms/step at global
+  batch 480 (30 seqs × 16 accumulation), 76.4% MFU against a measured 270.1
+  TFLOP/s. Until now the study's single-GPU claim was a 3090 extrapolation
+  (~21 h) and its A100 counterpart was pure arithmetic. Per §15 this is
+  `9999 × step time`, not a converged run, and must be labelled that way.
+- **8 GPUs deliver 7.66× — 95.8% scaling efficiency** — measured on one box at
+  one micro-batch, so the ratio is self-contained. A `ddp_torch` wrapper at one
+  rank costs 0.3% over unwrapped single-device.
+- **§14's 0.88 scaling figure is an artefact of the bench's default batch, and
+  should not be quoted as "the" scaling efficiency.** At 8 seqs/GPU a fixed
+  648 MB all-reduce sits on ~50 ms of compute; at the anchor's 480 there is 6.6×
+  more compute per optimizer step and the same reduction. **Scaling efficiency
+  is a function of the batch — always quote the batch with it.** This is the
+  same lesson as §21's "mode choice matters in the middle regime", seen from the
+  other side: what regime you are in is set by the compute-to-comm ratio, and
+  batch size moves it as surely as bandwidth does.
+- **A slow transport is a 3.8× tax, not a dealbreaker.** Forcing NCCL onto
+  TCP sockets (`NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1`) at the anchor's batch
+  costs 338 → 1218 ms, i.e. 0.94 h → 3.38 h to 3.28. Still 2.1× faster than one
+  GPU, so eight badly-connected GPUs beat one well-connected one for this model.
+  Overlap earns its keep here: `ddp_interleaved` beats `ddp_torch` by 4.1% on
+  sockets versus 0.7% on NVLink.
+- **The §21 netem reconstruction is an upper bound of about +23%**, now
+  calibrated rather than asserted: `scripts/transport_curve.py` reconstructed the
+  socket point at 1566 ms where direct measurement gave 1270 ms. Report the
+  netem-derived rows as bounds. The script also reports **measured effective
+  bandwidth instead of netem's nominal rate** — nominal 10 gbit delivered
+  1.2 Gbit/s, which is the number a real network can be compared against.
+- **`--socket PCIe` is provider metadata, not a fabric guarantee.** The
+  `A100_40GB / PCIe` offer delivered an **SXM4 box on a full NV12 mesh**. §20's
+  socket pin still protects the anchor (asking for SXM4 yields SXM4), but the
+  flag must never be read as proof of a transport. `nvidia-smi topo -m` before
+  trusting any number — the same rule §21 applied to `via NET/Socket/0`.
+  **PCIe therefore remains unmeasured**, and is not purchasable here under a
+  label that can be trusted.
+- **The generic `A100` entry in `_PEAK_BF16` was silently catching 40 GB
+  cards** with the `UNVERIFIED` 312.0 datasheet figure instead of refusing to
+  start, because `"A100"` substring-matches `NVIDIA A100-SXM4-40GB`. Measured
+  270.1 now sits ahead of it. When adding a peak, check what the *generic*
+  patterns already swallow — "measured, not cited" fails quietly when a broad
+  pattern shadows a narrow one.

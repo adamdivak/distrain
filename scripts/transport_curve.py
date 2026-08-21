@@ -87,7 +87,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ranks", type=int, default=8)
     p.add_argument("--crossing-step", type=int, default=9999,
                    help="first unsmoothed crossing of 3.28 (decisions section 14)")
+    p.add_argument("--measured", action="append", default=[], metavar="LABEL=MS",
+                   help="a step time measured directly at the anchor batch; where the "
+                        "label also has a reconstruction, the two are compared")
     args = p.parse_args(argv)
+
+    measured = {}
+    for spec in args.measured:
+        label, _, ms = spec.partition("=")
+        measured[label] = float(ms)
 
     reduced = args.params * args.grad_bytes
     anchor_comm_ms = comm_seconds(reduced, args.anchor_bus_gbps, args.ranks) * 1e3
@@ -118,12 +126,21 @@ def main(argv: list[str] | None = None) -> int:
         bus = bus_bandwidth_gbps(reduced, comm_ms / 1e3, args.ranks)
         rows.append((label, bus, comm_ms, anchor_compute_ms + comm_ms, "reconstructed"))
 
+    # A label with both a reconstruction and a direct measurement calibrates the
+    # additive model. Without one, "reconstructed" is an unfalsifiable label.
+    errors = []
+    for label, _, _, step_ms, source in rows:
+        if source == "reconstructed" and label in measured:
+            errors.append((label, step_ms, measured[label]))
+
     hdr = (f"| transport | effective bus BW | comm/step | step @ batch 480 | "
            f"time to 3.28 | vs NVLink | source |")
     print(hdr)
     print("|---|---|---|---|---|---|---|")
     base = None
     for label, bus, comm_ms, step_ms, source in rows:
+        if label in measured:                      # a real number always wins
+            step_ms, source = measured[label], "measured"
         hours = args.crossing_step * step_ms / 1e3 / 3600
         base = base or hours
         print(f"| {label} | {bus:.2f} GB/s ({bus * 8:.1f} Gbit/s) | {comm_ms:.0f} ms | "
@@ -131,6 +148,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\nReconstructed rows are anchor_compute + measured comm, not converged runs.")
     print("Bandwidth is measured effective throughput, not netem's nominal rate.")
+    for label, predicted, actual in errors:
+        print(f"\ncalibration on '{label}': reconstructed {predicted:.0f} ms vs measured "
+              f"{actual:.0f} ms -- the additive model runs "
+              f"{(predicted / actual - 1) * 100:+.0f}%.")
+        print("Treat the reconstructed rows as an upper bound of about that size.")
     return 0
 
 

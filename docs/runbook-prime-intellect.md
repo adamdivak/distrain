@@ -334,17 +334,24 @@ terminates pods (§14 lost a run at ~step 7800 that way).
 
 ---
 
-# Session C — the PCIe scaling arm
+# Session C — the single-GPU baseline and same-box scaling
 
-**What it closes.** Two gaps the study carried into its write-up: there was no
-*measured* single-GPU time-to-3.28 on any datacenter GPU (only a 3090
-extrapolation), and PCIe — the interconnect most people can actually rent — was
-never measured, only simulated with netem at ~8× off nominal (§21). Both come
-from one box, which is the point: 1-GPU and 8-GPU numbers off the *same*
-hardware make the scaling ratio self-contained, needing no cross-box bridge.
+**Ran 2026-08-21, $8.24, results in §22** — kept here because the shape is
+reusable and two of its traps cost real money.
 
-**Shape**: `--gpu-type A100_40GB --gpu-count 8 --socket PCIe`, lambdalabs,
-~$15.92/h. **Ceilings: 1 h, $16.** Estimated happy path ~40 min.
+**What it closes.** There was no *measured* single-GPU time-to-3.28 on any
+datacenter GPU, only a 3090 extrapolation. The 1-GPU and 8-GPU arms come off the
+*same* box, which is the point: the scaling ratio is then self-contained and
+needs no cross-box bridge.
+
+**It was planned as a PCIe session and could not be one.** The
+`A100_40GB / PCIe` offer delivered an **SXM4 box on a full NV12 mesh** — see the
+topology gate in C1, which is the only reason this was caught before the numbers
+were written up as "PCIe". Do not plan another PCIe session on this venue
+without a way to verify the fabric *before* renting.
+
+**Shape**: `--gpu-type A100_40GB --gpu-count 8`, lambdalabs, ~$15.92/h.
+**Ceilings: 1 h, $16.** Actual: 31 min, $8.24.
 
 ### C0. Deviations from §§0–5, and why
 
@@ -382,11 +389,12 @@ SSH 'systemd-detect-virt; nproc; nvidia-smi --query-gpu=name,memory.total --form
      nvidia-smi topo -m'
 ```
 
-**The topology line is a gate, not a formality.** Some A100-PCIe boxes carry
-NVLink bridges across GPU *pairs*; if `topo -m` shows any `NV#`, this box is a
-hybrid and the "PCIe" label on every number below is false. Expect `PHB`/`NODE`/`SYS`
-throughout. Record the matrix verbatim — the §21 habit of verifying the transport
-before trusting a number applies here exactly.
+**The topology line is a gate, not a formality — and on 2026-08-21 it fired.**
+`--socket PCIe` returned `NVIDIA A100-SXM4-40GB` with `NV12` between every GPU
+pair: a full NVLink mesh sold under a PCIe label. The socket field is provider
+metadata, not a fabric guarantee. If `topo -m` shows any `NV#`, no number from
+the box may be published as PCIe. Record the matrix verbatim — the §21 habit of
+verifying the transport before trusting a number applies here exactly.
 
 ### C2. Container, data, roofline, bandwidth
 
@@ -429,8 +437,14 @@ comm volume per optimizer step are all unchanged by the chunking.
 batch from `--per-gpu-batch × nproc`; both are overridden by the pass-through
 args after `--`, which argparse resolves last-wins. Data globs go there too.
 
+**Quote the glob values.** Unquoted, the pod's shell expands
+`fineweb_train_*.bin` into the actual shard names and argparse rejects the second
+as a stray positional — all five arms died in 90 seconds this way, ~$1 and one
+relaunch (2026-08-21).
+
 ```bash
-GLOBS='--train-glob data/fineweb10B/fineweb_train_*.bin --val-glob data/fineweb10B/fineweb_val_*.bin'
+TG='data/fineweb10B/fineweb_train_*.bin'; VG='data/fineweb10B/fineweb_val_*.bin'
+GLOBS="--train-glob \"$TG\" --val-glob \"$VG\""
 
 # Arm 1 -- single GPU: 480 = 30 x 16 accumulation steps
 DEX "python scripts/bench_ddp_modes.py --nproc 1 --modes ddp_torch --steps 25 --warmup 10 \
@@ -476,7 +490,10 @@ DEX "python scripts/bench_ddp_modes.py --nproc 8 --no-single --modes ddp_torch \
 60 seqs/device on a 40 GB card may OOM — the logits tensor is the high-water
 mark (§4). A failure here is a recorded result, not a problem; the harness
 records it and moves on. If it runs, it is directly comparable to the anchor's
-315 ms.
+315 ms. **It OOM'd on 2026-08-21** (`tried to allocate 5.76 GiB`), as did the
+uncompiled 8-rank arm; uncompiled autograd holds more live activations, and its
+2753 ms result is allocator thrash rather than a measurement. Both arms need
+80 GB cards. Sequence them last, as here, so they cost nothing that matters.
 
 ### C5. What the arms yield
 

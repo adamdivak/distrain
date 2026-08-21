@@ -14,6 +14,17 @@ time-to-target-loss, and to quantify where and why the two diverge.
 
 ## Status
 
+**The scaling headline exists end to end**
+([session log](docs/sessions/2026-08-21-prime-single-gpu-scaling.md)): on one
+A100 the 162M model reaches 3.28 in **7.19 h** (2589.1 ms/step at global batch
+480, 76.4% MFU); on 8 of them over NVLink, **0.94 h** — **7.66×, 95.8% scaling
+efficiency**, measured on one box at one micro-batch. Forcing the same 8 GPUs
+onto TCP sockets costs **3.8×** (3.38 h) — a tax, not a dealbreaker, since eight
+badly-connected GPUs still beat one well-connected one by 2.1×. §14's 0.88
+scaling figure turns out to be an artefact of the bench's 8-seq default batch:
+**scaling efficiency is a function of the batch and must be quoted with it**
+(`docs/decisions.md` §22).
+
 **The DDP-vs-DiLoCo comparison exists**
 ([session log](docs/sessions/2026-08-21-prime-diloco-k8.md)): on 8×A100-SXM4,
 at identical global batch and an identical 4.92B-token budget, DDP reaches
@@ -307,23 +318,36 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 1. **Finish the netem ladder below 10 gbit.** The 2026-08-21 sweep measured
    unthrottled-socket, 40 gbit and 10 gbit before the rental ceiling; 1 gbit
    and 500 mbit overran their timeouts because the schedule was budgeted off
-   *nominal* rate, which netem misses by ~10× ([`docs/decisions.md`](docs/decisions.md)
-   §21). Re-run the low end at measured pacing, and at the anchor's global
-   batch of 480 rather than the bench default of 64, so §15's
-   `time-to-3.28 = 9999 × step-time` applies directly instead of needing
-   reconstruction. Prime Intellect is the venue (§20); RunPod cannot (§17).
-2. **Decide whether DiLoCo's tokens-to-3.28 is worth buying.** It needs
+   *nominal* rate, which netem misses by ~8× ([`docs/decisions.md`](docs/decisions.md)
+   §21). Re-run the low end at measured pacing, **at the anchor's global batch
+   of 480** — the second 2026-08-21 session showed the batch-64 points need a
+   reconstruction that runs +23% (§22), and that at batch 480 comm is amortized
+   far better than the small-batch sweep suggests. Prime Intellect is the venue
+   (§20); RunPod cannot (§17).
+2. **Get one honest PCIe point**, the transport most people can actually rent.
+   Prime Intellect's `--socket PCIe` returned an SXM4/NVLink box (§22), so this
+   needs a venue whose topology can be verified before renting.
+3. **Decide whether DiLoCo's tokens-to-3.28 is worth buying.** It needs
    ~24,900 steps at the measured ratio — past the 55-chunk corpus wrap
    (~11,190 steps), so it cannot be measured without disclosing a second
    epoch, and it costs ~2.3 h of 8×A100 on top. The equal-token endpoint
    (§21) may simply be the honest deliverable.
-3. Track B (FSDP2 at ~7B on one 8-GPU node) after that.
+4. Track B (FSDP2 at ~7B on one 8-GPU node) after that.
 
 ## Known gaps
 
-- **H100/L40S/A100-PCIe peaks are unverified datasheet values.** A100-SXM4
-  is measured (269.9). Run the roofline script first thing on any new GPU
-  class; per-box measurement is mandatory (the two 3090s differ by 9%).
+- **H100/L40S/A100-PCIe peaks are unverified datasheet values.** A100-SXM4 is
+  measured at both memory sizes (269.9 / 270.1, 0.07% apart). Run the roofline
+  script first thing on any new GPU class; per-box measurement is mandatory (the
+  two 3090s differ by 9%). Check what the *generic* patterns in `_PEAK_BF16`
+  already swallow: `"A100"` was silently catching 40 GB cards with a datasheet
+  figure instead of refusing to start (`docs/decisions.md` §22).
+- **PCIe is still unmeasured.** Prime Intellect's `--socket PCIe` returned an
+  SXM4 box on a full NVLink mesh — the socket field is provider metadata, not a
+  fabric guarantee, so verify with `nvidia-smi topo -m` before believing any
+  transport claim. The slow-transport numbers above come from forcing NCCL onto
+  TCP sockets, and the netem-derived points in `scripts/transport_curve.py` are
+  **upper bounds, +23% at the one point measured both ways**.
 - **No spot-preemption recovery.** Per-step checkpoints with retention
   anchors, `--resume`/`--resume-from` and async off-box mirroring exist and
   survived a real pod termination; DCP/preemption hardening is deliberately

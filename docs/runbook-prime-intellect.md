@@ -1,9 +1,10 @@
-# Runbook — Prime Intellect (two sessions: netem curve, DiLoCo K=8)
+# Runbook — Prime Intellect (netem curve, DiLoCo K=8, PCIe scaling)
 
-Two sessions on one venue. **A** is the netem curve (§15), cheap, 2 GPUs, and
+Three sessions on one venue. **A** is the netem curve (§15), cheap, 2 GPUs, and
 blocked everywhere else. **B** is the DiLoCo K=8 converged anchor (§16, §19),
-8×A100, the headline number. They share §§0–5; run A first — it is a tenth of
-the price and it rehearses every mechanic B depends on.
+8×A100, the headline number. **C** is the PCIe scaling arm — the measured
+single-GPU baseline and a real slow-interconnect point. They share §§0–5; run A
+first — it is a tenth of the price and it rehearses every mechanic B depends on.
 
 Prime Intellect is an *exchange*: an offer is a (provider, data centre, socket)
 triple, each priced and stocked separately. Everything below assumes the
@@ -330,6 +331,165 @@ uv run --script scripts/prime_session.py status     # balance, and the pod is st
 
 Check the **balance** during the run, not just the clock — credit exhaustion
 terminates pods (§14 lost a run at ~step 7800 that way).
+
+---
+
+# Session C — the PCIe scaling arm
+
+**What it closes.** Two gaps the study carried into its write-up: there was no
+*measured* single-GPU time-to-3.28 on any datacenter GPU (only a 3090
+extrapolation), and PCIe — the interconnect most people can actually rent — was
+never measured, only simulated with netem at ~8× off nominal (§21). Both come
+from one box, which is the point: 1-GPU and 8-GPU numbers off the *same*
+hardware make the scaling ratio self-contained, needing no cross-box bridge.
+
+**Shape**: `--gpu-type A100_40GB --gpu-count 8 --socket PCIe`, lambdalabs,
+~$15.92/h. **Ceilings: 1 h, $16.** Estimated happy path ~40 min.
+
+### C0. Deviations from §§0–5, and why
+
+- **No image rebuild or push.** `git diff c8c72e1..HEAD` touches only
+  `README.md`, `docs/`. The already-pushed `c8c72e1`
+  (`sha256:f915028c1c50ce23…`) is therefore *code-identical* to HEAD and was
+  already proven on a rented box (226 tests, 2026-08-21). Pull that tag.
+- **Skip the §4 `pytest` parity run.** It costs ~30 min — most of this
+  session's budget — to re-prove what the digest already proves on an image
+  whose suite has passed on a rented box. The digest comparison stays; it is
+  the actual parity evidence. (Deviation recorded here so the session log does
+  not have to defend it twice.)
+- **Two data chunks, not 55.** These are step-time measurements, not converged
+  runs, so the corpus only needs to outlast ~25 steps × 480 seqs ≈ 12.3M
+  tokens. One chunk is 100M. `cached_fineweb10B.py 2` takes well under a
+  minute against §B1's ~7.
+- **MFU printed on the pod will be wrong — ignore it.** `"A100"` substring-matches
+  `NVIDIA A100-PCIE-40GB` in `_PEAK_BF16` *before* any PCIe entry exists, so
+  training silently uses the `UNVERIFIED` 312.0 datasheet figure instead of
+  refusing. Raw ms/step is unaffected, and that is the measurement. Recompute
+  MFU on aurora against the roofline measured in C2, and commit the measured
+  `PeakSpec` afterwards.
+
+### C1. Provision, guard, first contact
+
+```bash
+uv run --script scripts/prime_session.py \
+  --gpu-type A100_40GB --gpu-count 8 --socket PCIe --provider lambdalabs \
+  --name distrain-pcie up --max-hours 1 --disk-gb 200 --allow-stock-image
+uv run --script scripts/prime_session.py --name distrain-pcie guard &
+```
+
+```bash
+SSH 'systemd-detect-virt; nproc; nvidia-smi --query-gpu=name,memory.total --format=csv
+     nvidia-smi topo -m'
+```
+
+**The topology line is a gate, not a formality.** Some A100-PCIe boxes carry
+NVLink bridges across GPU *pairs*; if `topo -m` shows any `NV#`, this box is a
+hybrid and the "PCIe" label on every number below is false. Expect `PHB`/`NODE`/`SYS`
+throughout. Record the matrix verbatim — the §21 habit of verifying the transport
+before trusting a number applies here exactly.
+
+### C2. Container, data, roofline, bandwidth
+
+```bash
+SSH 'mkdir -p ~/session_out ~/data'
+SSH 'sudo docker login ghcr.io -u adamdivak --password-stdin' < /path/to/pat.txt
+SSH 'sudo docker pull ghcr.io/adamdivak/distrain:c8c72e1'
+SSH 'sudo docker image inspect ghcr.io/adamdivak/distrain:c8c72e1 --format "{{index .RepoDigests 0}}"'
+# must equal sha256:f915028c1c50ce239b44fd7e2ec1c674f2e36adb4d1bee971c8729f29305d789
+SSH 'sudo docker run -d --name distrain --gpus all --ipc=host \
+       -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+       -v /home/ubuntu/session_out:/workspace/session_out \
+       -v /home/ubuntu/data:/workspace/data \
+       ghcr.io/adamdivak/distrain:c8c72e1 sleep infinity'
+```
+
+```bash
+DEX 'mkdir -p /workspace/data/fineweb10B && \
+     ln -sfn /workspace/data/fineweb10B /workspace/reference/modded_nanogpt/fineweb10B && \
+     nohup python reference/modded_nanogpt/cached_fineweb10B.py 2 \
+       > session_out/data_download.log 2>&1 &'
+DEX 'python scripts/measure_roofline.py | tee session_out/roofline.txt'
+DEX '/opt/nccl-tests/build/all_reduce_perf -b 8M -e 512M -f 2 -g 8 \
+       | tee /workspace/session_out/nccl_tests.txt'
+```
+
+The all-reduce number is a headline in its own right: it is the third real point
+on the transport axis, against NVLink's 154 GB/s and the 2×3090's 2.29 GB/s.
+
+### C3. The two arms — matched micro-batch, global batch 480
+
+Both arms hold **global batch 480** (the anchor's) and **micro-batch 30
+sequences per device**. Matching the micro-batch is what makes the ratio mean
+something: each device does identical compute chunks in both arms, so the only
+difference is the rank count and the communication. 30 rather than the anchor's
+60 because these are 40 GB cards; the global batch, the token accounting and the
+comm volume per optimizer step are all unchanged by the chunking.
+
+`bench_ddp_modes.py` hardcodes `--grad-accum-steps 1` and derives the global
+batch from `--per-gpu-batch × nproc`; both are overridden by the pass-through
+args after `--`, which argparse resolves last-wins. Data globs go there too.
+
+```bash
+GLOBS='--train-glob data/fineweb10B/fineweb_train_*.bin --val-glob data/fineweb10B/fineweb_val_*.bin'
+
+# Arm 1 -- single GPU: 480 = 30 x 16 accumulation steps
+DEX "python scripts/bench_ddp_modes.py --nproc 1 --modes ddp_torch --steps 25 --warmup 10 \
+       --per-gpu-batch 30 --timeout 1800 --out-dir session_out/bench-1gpu \
+       -- --global-batch-seqs 480 --grad-accum-steps 16 $GLOBS"
+
+# Arm 2 -- 8 GPUs: 480 = 30 x 2 accumulation steps x 8 ranks
+DEX "NCCL_DEBUG=INFO python scripts/bench_ddp_modes.py --nproc 8 --no-single \
+       --modes ddp_torch ddp_interleaved --steps 25 --warmup 10 \
+       --per-gpu-batch 30 --timeout 1800 --out-dir session_out/bench-8gpu \
+       -- --global-batch-seqs 480 --grad-accum-steps 2 $GLOBS"
+
+# Arm 2b -- the overlap question, on a transport in the middle regime
+DEX "python scripts/bench_ddp_modes.py --nproc 8 --no-single --no-compile \
+       --modes ddp_interleaved ddp_torch --steps 25 --warmup 10 \
+       --per-gpu-batch 30 --timeout 1800 --out-dir session_out/bench-8gpu-nc \
+       -- --global-batch-seqs 480 --grad-accum-steps 2 $GLOBS"
+```
+
+Arm 1 runs `single` *and* `ddp_torch` at one rank (the harness cannot be asked
+for `single` alone); `single` is the number that matters and the 1-rank
+`ddp_torch` is a free cross-check on wrapper overhead.
+
+Arm 2b is the interesting one. §21 found the compile-vs-overlap lead *dissolves*
+as bandwidth falls — every mode within 0.12% at netem's slowest point — and
+that mode choice therefore matters only in the **middle regime**, where compute
+and comm are comparable. PCIe at batch 480 is a real instance of that regime, so
+this is a direct test of §21's claim on hardware rather than on netem.
+
+**Note `tokens_per_s_total` in `results.json` is wrong for these arms** — the
+harness computes it from `per_gpu_batch × nproc`, which the accumulation
+override invalidates. `mean_ms` is correct and is the only field used.
+
+### C4. Bonus, only if the clock allows — anchor-matched chunking
+
+```bash
+DEX "python scripts/bench_ddp_modes.py --nproc 8 --no-single --modes ddp_torch \
+       --steps 25 --warmup 10 --per-gpu-batch 60 --timeout 1800 \
+       --out-dir session_out/bench-8gpu-b60 \
+       -- --global-batch-seqs 480 --grad-accum-steps 1 $GLOBS"
+```
+
+60 seqs/device on a 40 GB card may OOM — the logits tensor is the high-water
+mark (§4). A failure here is a recorded result, not a problem; the harness
+records it and moves on. If it runs, it is directly comparable to the anchor's
+315 ms.
+
+### C5. What the arms yield
+
+- **Single-GPU time-to-3.28 = 9999 × arm-1 step time** (§15's rule, which holds
+  a fortiori at world size 1: the val-vs-step curve does not depend on the rank
+  count, and the three-way replication of §14 bounds the residual to ≤0.01).
+- **Scaling efficiency = arm-1 step / arm-2 step / 8**, on identical hardware
+  and identical per-device chunking.
+- **Time-to-3.28 on PCIe = 9999 × arm-2 step time**, which answers "is a slow
+  interconnect a dealbreaker or a nuisance" with a real fabric instead of netem.
+- Feed the measured bus bandwidth and step times to
+  `scripts/transport_curve.py` to place PCIe on the same axis as NVLink and the
+  netem points.
 
 ---
 

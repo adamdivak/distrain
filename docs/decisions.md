@@ -1007,5 +1007,42 @@ API rather than the docs:
 So the image is in their registry and nothing on the pod path can consume it.
 `scripts/prime_session.py` stays committed and tested against a fake API; if
 templates ever become creatable, `--template-id` is the only thing that needs a
-real value. Total spend on the venue: about $0.001, for the build. **RunPod remains
-the only venue that can run this study's image.**
+real value.
+
+**But the template path is not needed, because a Prime Intellect pod is a KVM
+virtual machine with root — measured.** Probed on the cheapest node available
+(1× nebius CPU, $0.0496/h, ~15 min, ~$0.01), booting their stock
+`ubuntu_22_cuda_12` through `up --allow-stock-image`:
+
+- `systemd-detect-virt` → `kvm`; pid 1 is `systemd`; cgroup is `/init.scope`.
+  This is a VM, not the locked-down container RunPod hands out.
+- Passwordless `sudo`, and root's `CapEff` is `000001ffffffffff` — the **full**
+  capability set, `cap_net_admin` included.
+- `tc qdisc add dev lo root netem delay 25ms` applied and *verified by effect*:
+  ping RTT went to 50.06 ms, exactly 2×25. `netem rate 100mbit delay 10ms` — the
+  shape §15 actually needs — is accepted too.
+- `ip netns add` works, and even unprivileged `unshare -Urn` works. Every one of
+  the three things §17 measured as blocked on RunPod is available here.
+- Docker installs and runs (29.1.3, `hello-world` OK), 55 GB free on `/`, and
+  ghcr.io is reachable (anonymous manifest → 401, i.e. the network path is fine
+  and only auth is missing).
+
+**This inverts the venue comparison.** Booting stock Ubuntu and running our own
+container inside it is not a compromise — it is *better* parity than their
+registry offers, because `docker pull ghcr.io/adamdivak/distrain:<sha>` fetches
+the byte-identical image aurora built and tested, where `prime images push`
+rebuilds it (digest `sha256:9555ca38...` vs aurora's `sha256:f56e1669...`). It
+also gives §15's netem curve its first home. The costs are real but bounded: the
+22 GB pull is paid on every rental, and Docker plus the NVIDIA container toolkit
+must be installed first (`scripts/setup-docker-nvidia.sh` already does this).
+
+**Do not ship a broad GitHub token to a rented box.** `gh auth token` carries
+`repo` scope — every private repo. The pull needs a PAT with `read:packages`
+only, the same rule runbook §0 already applies to RunPod's credential.
+
+**Unverified, and load-bearing before an 8-GPU rental**: this was a *nebius CPU*
+node. Whether a *lambdalabs* GPU node is also a full VM, and whether the NVIDIA
+container toolkit installs and passes GPUs through there, is not yet measured.
+Probe that on a 1-GPU box before committing the balance to 8×A100.
+
+Total spend on the venue so far: about $0.01.

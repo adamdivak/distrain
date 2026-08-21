@@ -524,8 +524,11 @@ def cmd_up(api: PrimeAPI, args: argparse.Namespace) -> int:
               "  private source 401s), so this rebuilds from our Dockerfile. `uv sync\n"
               "  --frozen` against uv.lock keeps the dependency set identical, but the digest\n"
               "  differs from the aurora build -- record both in the session log.\n"
-              "  --allow-stock-image provisions their image anyway (nothing measured on\n"
-              "  it is reportable; useful only for probing the box itself).")
+              "  --allow-stock-image boots their Ubuntu instead -- which is the better\n"
+              "  route here, not a fallback: a PI pod is a KVM VM with root (decisions\n"
+              "  §20), so install Docker and `docker pull` the *aurora* image. That is\n"
+              "  byte-identical, where their registry rebuilds. Measure nothing on the\n"
+              "  bare stock image itself.")
         return 2
 
     wallet = api.wallet()
@@ -601,11 +604,15 @@ def cmd_up(api: PrimeAPI, args: argparse.Namespace) -> int:
         "diskSize": args.disk_gb,
         "maxPrice": round(price * 1.05, 4),   # the offer's price, not an open cheque
         "autoRestart": False,                 # a restart after our deadline would bill on
-        "envVars": [{"key": "DISTRAIN_DEADLINE_UTC", "value": deadline}],
     }
     if args.template_id:
         pod_config["image"] = "custom_template"
         pod_config["customTemplateId"] = args.template_id
+        # Some pod types reject envVars outright ("Environment variables are not
+        # allowed for this request"). The deadline is informational -- `guard`
+        # enforces the ceiling -- so it must never be the reason a pod fails to
+        # create. Only send it where it is accepted.
+        pod_config["envVars"] = [{"key": "DISTRAIN_DEADLINE_UTC", "value": deadline}]
     else:
         pod_config["image"] = args.stock_image
     if offer.get("dataCenter"):
@@ -774,9 +781,11 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--image", default=None,
                     help="image reference recorded in the plan (default: GHCR at HEAD)")
     up.add_argument("--template-id", default=None,
-                    help="PI custom template id for the GHCR image (console-created)")
+                    help="PI custom template id -- note templates have no API and could "
+                         "not be created for this account (decisions §20)")
     up.add_argument("--allow-stock-image", action="store_true",
-                    help="boot PI's own image; nothing measured on it is reportable")
+                    help="boot PI's Ubuntu, then run our container inside it (the pod is "
+                         "a root KVM VM); measure nothing on the bare image")
     up.add_argument("--stock-image", default="ubuntu_22_cuda_12",
                     help="which stock image, when --allow-stock-image is given")
     up.add_argument("--ssh-key", type=Path, default=None)

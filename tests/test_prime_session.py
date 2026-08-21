@@ -238,6 +238,17 @@ class TestUp:
         assert created["pod"]["image"] == "ubuntu_22_cuda_12"
         assert "customTemplateId" not in created["pod"]
 
+    def test_stock_image_pods_carry_no_env_vars(self, tmp_path):
+        """Some pod types reject envVars outright ("Environment variables are not
+        allowed for this request"). The deadline is informational -- `guard` is what
+        enforces the ceiling -- so it must never be why a pod fails to create."""
+        api = FakeAPI()
+        args = up_args(tmp_path)
+        args.template_id = None
+        args.allow_stock_image = True
+        assert ps.cmd_up(api, args) == 0
+        assert "envVars" not in api.created_pods[0]["pod"]
+
     def test_reuses_a_running_pod_instead_of_renting_a_second(self, tmp_path):
         api = FakeAPI(pods=[pod_fixture()])
         assert ps.cmd_up(api, up_args(tmp_path)) == 0

@@ -963,3 +963,21 @@ RunPod GHCR credential in runbook §0. The alternative is `prime images push`,
 which builds our Dockerfile into Prime Intellect's own registry and needs no GHCR
 credential at all -- untried, and it re-builds rather than shipping the byte-identical
 image, so it trades a console step for a parity question.
+
+**Their image check cannot read an OCI index, and blames your credential for it.**
+`check-docker-image` returned 404 "does not exist or you don't have permission"
+for our image. The credential was fine: *without* it the same call returns 401,
+and the public, anonymously-pullable `ghcr.io/astral-sh/uv:latest` — an OCI index —
+gets the identical 404, while `ubuntu:22.04` and `alpine:latest` (Docker manifest
+*lists*) pass. GHCR returns 404, not 406, when the `Accept` header omits the
+manifest's media type, so a reader that only knows the Docker types cannot see an
+OCI index at all. Ours was one because BuildKit attaches a provenance attestation
+by default, which forces the index. `scripts/container.sh push` now builds with
+`--provenance=false --sbom=false` and exports `oci-mediatypes=false`; the same
+image then checks `accessible: true` with the credential unchanged. A plain
+`docker push` cannot fix this after the fact — with the containerd image store it
+copies the local store's media type rather than converting it.
+
+Worth remembering as a general shape: a registry 404 is as likely to mean "wrong
+`Accept` header" as "missing permission", and the error text will confidently say
+the latter.

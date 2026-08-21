@@ -25,11 +25,17 @@ arithmetic).
   gh auth token | docker login ghcr.io -u adamdivak --password-stdin
 
   SHA=$(git rev-parse --short HEAD)
-  IMAGE=ghcr.io/adamdivak/distrain:$SHA scripts/container.sh build
-  docker tag  ghcr.io/adamdivak/distrain:$SHA ghcr.io/adamdivak/distrain:latest
-  docker push ghcr.io/adamdivak/distrain:$SHA
-  docker push ghcr.io/adamdivak/distrain:latest
+  IMAGE=ghcr.io/adamdivak/distrain:$SHA    scripts/container.sh push
+  IMAGE=ghcr.io/adamdivak/distrain:latest  scripts/container.sh push
   ```
+
+  Use `container.sh push`, not `docker push`. BuildKit's default provenance
+  attestation makes the tag an OCI *index*, and clients that only know the
+  Docker media types then 404 on the manifest and report it as "image does not
+  exist or you don't have permission" — Prime Intellect's image check does
+  exactly that (decisions §20). `push` turns the attestation off and forces
+  Docker media types; a plain `docker push` of an already-built image copies
+  whatever the local store holds and cannot fix it after the fact.
 
   Record `$SHA` — it is the provenance of every number from the session.
 - [ ] Quick boot rehearsal passed (already scripted; rerun after any image change):

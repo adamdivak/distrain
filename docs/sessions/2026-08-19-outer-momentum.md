@@ -95,6 +95,9 @@ be measured on the rented box before any MFU number is reported.
 
 ## 5. Next session
 
+*(Arm A was resumed and finished on 2026-08-21 — endpoint 3.3978, gap +0.031.
+See `docs/decisions.md` §20.)*
+
 - **Resume arm A from step 2000 → 6000.** The warmdown (5000–6000) is where the
   baseline lost most of its ground and where the plateau-derived token estimate
   proved optimistic; the μ=0.5 endpoint is the number that matters.

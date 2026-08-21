@@ -1166,3 +1166,77 @@ $8.24), bought to close the two weakest bullets in the write-up.
   270.1 now sits ahead of it. When adding a peak, check what the *generic*
   patterns already swallow — "measured, not cited" fails quietly when a broad
   pattern shadows a narrow one.
+
+## 20. Arm A measured: mu=0.5 finishes the schedule at +0.031 (2026-08-21)
+
+Arm A of §19 ran to completion: `diloco-b480-mom05`, 6000 steps, K=2, H=500,
+B=480, outer lr 0.7, outer momentum 0.5. Endpoint **3.3978** against the
+single-GPU reference's **3.3664** — a gap of **+0.031**. The mu=0.9 baseline
+never finished; its last point was 3.5356 at step 5500, and its excursion peaked
+at 4.3558 (step 2500) against a reference of 3.6275.
+
+| step | reference | mu=0.9 | mu=0.5 | gap mu=0.5 | merge gain | inner-phase drift |
+|---|---|---|---|---|---|---|
+| 500 | 4.5076 | 5.6460 | 5.3353 | +0.828 | -0.61 | — |
+| 1000 | 3.9778 | 4.4666 | 4.1773 | +0.199 | 0.002 | — |
+| 1500 | 3.7864 | 4.1396 | 3.9055 | +0.119 | 0.054 | — |
+| 2000 | 3.6925 | 4.2243 | 3.7583 | +0.066 | 0.078 | -0.070 |
+| 2500 | 3.6275 | 4.3558 | 3.6733 | +0.046 | 0.090 | +0.028 |
+| 3000 | 3.5825 | 3.8804 | 3.6157 | +0.033 | 0.088 | +0.030 |
+| 3500 | 3.5490 | 3.6480 | 3.5793 | +0.030 | 0.087 | +0.050 |
+| 4000 | 3.5253 | 3.5837 | 3.5524 | +0.027 | 0.086 | +0.059 |
+| 4500 | 3.4982 | 3.5617 | 3.5266 | +0.028 | 0.082 | +0.057 |
+| 4750 | 3.5044 | — | — | — | — | — |
+| 5000 | *missing* | 3.5643 | 3.5125 | — | 0.081 | +0.067 |
+| 5500 | *missing* | 3.5356 | 3.4488 | — | 0.049 | **-0.015** |
+| 6000 | 3.3664 | *never ran* | **3.3978** | **+0.031** | 0.010 | **-0.041** |
+
+**Time-to-target-loss, the actual figure of merit, is worse than the loss gap
+suggests.** First unsmoothed crossings:
+
+| target | reference | mu=0.5 | ratio |
+|---|---|---|---|
+| 3.60 | 2750 | 3500 | 1.27x |
+| 3.55 | 3500 | 4500 | 1.29x |
+| 3.50 | 4500 | 5500 | 1.22x |
+
+So ~1.25x, not the ~1.15x that interpolating the loss gap implied mid-run.
+Caveat that biases *against* arm A: it validated every 500 steps against the
+reference's 250, so its crossings are late by up to 250 steps (~0.06 on the
+ratio). Report the crossing ratio, not the interpolated one, and match the val
+grid on any run meant for a crossing comparison.
+
+**The merge is where the progress came from, until the warmdown.** Decomposing
+each round into the inner phase and the merge: from round 5 on, 500 inner AdamW
+steps left each replica *worse* than the merged point it started from (+0.028 to
++0.067), and the merge more than recovered it. Over steps 2500-3000 the DiLoCo
+run gained 0.058 while the reference gained 0.045 — it out-improved the single-GPU
+run for that stretch. The sign inverts in the warmdown: at 5500 and 6000 the inner
+phase gains on its own (-0.015, -0.041) and merge gain collapses (0.049, 0.010) as
+the replicas stop disagreeing. Merge gain declined monotonically from 0.090.
+
+**The excursion is a momentum artifact, not replica drift.** Spread *fell*
+(0.0646 -> 0.0007) while merge gain *rose* over rounds 2-5; pure averaging
+predicts the opposite. The Nesterov build-up explains it: `lr/(1-mu)` is 7x at
+mu=0.9 and 1.4x at mu=0.5, and `lr_eff = 1.0` is exactly plain parameter
+averaging. Round 1 fires into an empty momentum buffer and hurt by -0.61 in both
+arms.
+
+**Arm B is therefore still open, and §19's `diloco-b960-h250` is probably the
+wrong test.** The noise arm targets spread; spread was never the problem. An
+outer-LR warmup at mu=0.9 tests the cold-start reading directly and would say
+whether mu=0.5 is a fix or a workaround. Not yet decided or run.
+
+**Do not read wall clock off aurora.** Arm A logged MFU 36.4% at 8.84 s/step
+against the reference's 84% at 7.67 s/step, because both gloo ranks share one
+3090. That is a shared-GPU artifact, not a DiLoCo cost. K=2 on aurora is a
+quality probe; throughput claims need the rented multi-GPU box.
+
+**The reference is two runs under one trackio name.** `rotary-calibration-3B`
+holds run `41cf...` (max_steps 6000, fresh, val points 0-4750) and `aa0b...`
+(max_steps 9000, resumed from step 6000). `out/calibration.log` stops mid-run at
+step 4990, so **no reference val exists at steps 5000 or 5500**. The endpoint
+3.3664 is sound: it is the first line of `out/crossing.log`, the val of run 1's
+final checkpoint evaluated at resume before any step at the raised LR. The 3.4638
+at 6250 is run 2's LR jumping back to plateau, not a regression. Neither run
+reached the 3.28 target by step 6000.

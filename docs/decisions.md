@@ -981,3 +981,31 @@ copies the local store's media type rather than converting it.
 Worth remembering as a general shape: a registry 404 is as likely to mean "wrong
 `Accept` header" as "missing permission", and the error text will confidently say
 the latter.
+
+**A custom image on a Prime Intellect *pod* turned out to be unreachable, and the
+$20 is stranded because of it.** The chain, each link verified against the live
+API rather than the docs:
+
+- `pod.image` is a closed enum. The server's own 422 lists it; `prime/...` and
+  `ghcr.io/...` references are both rejected. `custom_template` is the only member
+  that means "something of mine", and it requires `customTemplateId`.
+- There is no template API: the whole spec has `check-docker-image` (POST) and
+  `registry-credentials` (GET), nothing else. Their CLI takes
+  `--custom-template-id` as an opaque flag it can neither list nor create.
+- Their AI support said `customTemplateId` accepts the `prime/<owner>/<name>:<tag>`
+  reference from `prime images push`. It does not. With an otherwise-valid pod body
+  the API answers `400 Invalid Custom Template ID provided`, for that reference and
+  for the image's `id` alike. Treat vendor AI support as a hypothesis to test, not
+  a fact -- it cost a 40-minute build to falsify.
+- `prime images push` itself works. `--source-image` cannot copy from a private
+  ghcr.io (the field is documented public-only and the transfer 401s), so it
+  rebuilds from our Dockerfile in their builder. That succeeded --
+  `prime/team-<id>/distrain:a54f828`, digest `sha256:9555ca38...` against aurora's
+  `sha256:f56e1669...` -- but the CLI's own closing message points at `prime sandbox
+  create`, and sandboxes are not in this API at all.
+
+So the image is in their registry and nothing on the pod path can consume it.
+`scripts/prime_session.py` stays committed and tested against a fake API; if
+templates ever become creatable, `--template-id` is the only thing that needs a
+real value. Total spend on the venue: about $0.001, for the build. **RunPod remains
+the only venue that can run this study's image.**

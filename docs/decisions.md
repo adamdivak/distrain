@@ -1167,7 +1167,7 @@ $8.24), bought to close the two weakest bullets in the write-up.
   patterns already swallow — "measured, not cited" fails quietly when a broad
   pattern shadows a narrow one.
 
-## 20. Arm A measured: mu=0.5 finishes the schedule at +0.031 (2026-08-21)
+## 23. Arm A measured: mu=0.5 finishes the schedule at +0.031 (2026-08-21)
 
 Arm A of §19 ran to completion: `diloco-b480-mom05`, 6000 steps, K=2, H=500,
 B=480, outer lr 0.7, outer momentum 0.5. Endpoint **3.3978** against the
@@ -1222,6 +1222,15 @@ mu=0.9 and 1.4x at mu=0.5, and `lr_eff = 1.0` is exactly plain parameter
 averaging. Round 1 fires into an empty momentum buffer and hurt by -0.61 in both
 arms.
 
+**This K=2 run and §21's K=8 rental agree on all three structural findings**,
+which were measured independently on different hardware the same week: mu=0.5
+shows no excursion (§21 bullet 3); the first outer round is *worse* than any
+replica and later rounds are worth a steady gain (§21's +1.21 once, then -0.24 —
+here -0.61 once, then +0.08 to +0.09); and replica spread falls monotonically
+(§21: 0.092 -> 0.0013; here 0.0646 -> 0.0007). Two K values, two GPU classes, two
+world sizes, same shape. The aurora probe is cheap corroboration of the rented
+result, which is what it was for.
+
 **Arm B is therefore still open, and §19's `diloco-b960-h250` is probably the
 wrong test.** The noise arm targets spread; spread was never the problem. An
 outer-LR warmup at mu=0.9 tests the cold-start reading directly and would say
@@ -1238,5 +1247,6 @@ holds run `41cf...` (max_steps 6000, fresh, val points 0-4750) and `aa0b...`
 step 4990, so **no reference val exists at steps 5000 or 5500**. The endpoint
 3.3664 is sound: it is the first line of `out/crossing.log`, the val of run 1's
 final checkpoint evaluated at resume before any step at the raised LR. The 3.4638
-at 6250 is run 2's LR jumping back to plateau, not a regression. Neither run
-reached the 3.28 target by step 6000.
+at 6250 is run 2's LR jumping back to plateau, not a regression. Neither of the
+two 3090 reference runs reached 3.28 by step 6000 — unrelated to §22's measured
+7.19 h to 3.28, which is a converged A100 figure at a different step budget.

@@ -14,6 +14,18 @@ time-to-target-loss, and to quantify where and why the two diverge.
 
 ## Status
 
+**The DDP-vs-DiLoCo comparison exists**
+([session log](docs/sessions/2026-08-21-prime-diloco-k8.md)): on 8×A100-SXM4,
+at identical global batch and an identical 4.92B-token budget, DDP reaches
+**3.2730** in 3147.1 s while untuned DiLoCo (K=8, H=500, outer lr 0.7, μ=0.5)
+reaches **3.5183** in 3250.3 s — **+0.245 val loss and no wall-clock saving**
+on a full-NVLink fabric, which is the transport where DiLoCo has nothing to buy.
+DiLoCo's tokens-to-3.28 remains unmeasured and is now bounded as unreachable
+inside this corpus (~24,900 steps needed vs a ~11,190-step wrap). The netem
+sweep in the same session found that the compile-vs-overlap lead **dissolves**
+rather than flipping as bandwidth falls: 0.12% spread across modes at 10 gbit.
+See [`docs/decisions.md`](docs/decisions.md) §21.
+
 **The first Track A number exists** ([session log](docs/sessions/2026-08-16-runpod-8xa100.md)):
 on a rented 8×A100-SXM4 node, the 124M/162M model reached the 3.28 val-loss
 target at **4.92B tokens / 3147.1 s of training time** (clean 10000-step
@@ -52,7 +64,8 @@ value against the 3.28 target without N ranks paying for the same number.
 | DDP mode 4 — `ddp_torch`, the upstream baseline | done, wraps `DistributedDataParallel` behind the same seam |
 | Checkpointing — per-step files, retention anchors, async off-box mirror | done, in [`train.py`](src/distrain/train.py); survived a real pod termination. DCP deferred — [`docs/decisions.md`](docs/decisions.md) §12 |
 | Bench harness for mode timing | done, [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) |
-| FSDP2, DiLoCo, run matrix | not started |
+| DiLoCo (5th mode, per-rank checkpoints, diag evals) | done; K=8 anchor measured on 8×A100, [`docs/decisions.md`](docs/decisions.md) §21 |
+| FSDP2, run matrix | not started |
 
 The distributed layer is a single seam in the training loop — `finalize_gradients()`
 between the accumulation loop and gradient clipping — behind which all four modes
@@ -291,20 +304,19 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **DiLoCo's converged anchor** — the slow-transport side of the study,
-   against the fast-interconnect anchor measured on 2026-08-16 (3147.1 s /
-   4.92B tokens to 3.28 on 8×A100 NVLink). Only DiLoCo needs converged runs:
-   DDP's crossing step is transport-invariant, so its time-to-target at each
-   bandwidth is step-time × 9999 — see [`docs/decisions.md`](docs/decisions.md)
-   §15. This needs no throttling and is unblocked.
-2. **Decide where the netem curve runs.** It cannot run on RunPod:
-   containers there have no `NET_ADMIN`, `unshare` is blocked, and the API has
-   no way to ask for either — measured 2026-08-18,
-   [`docs/decisions.md`](docs/decisions.md) §17. Candidates: aurora in Docker
-   with `NET_ADMIN=1` (1–2 GPUs, transport shape rather than the 8-GPU anchor),
-   or a provider allowing privileged containers. The bench matrix rerun under
-   netem — testing whether uncompiled interleaved retakes the lead once comm
-   dominates — waits on that.
+1. **Finish the netem ladder below 10 gbit.** The 2026-08-21 sweep measured
+   unthrottled-socket, 40 gbit and 10 gbit before the rental ceiling; 1 gbit
+   and 500 mbit overran their timeouts because the schedule was budgeted off
+   *nominal* rate, which netem misses by ~10× ([`docs/decisions.md`](docs/decisions.md)
+   §21). Re-run the low end at measured pacing, and at the anchor's global
+   batch of 480 rather than the bench default of 64, so §15's
+   `time-to-3.28 = 9999 × step-time` applies directly instead of needing
+   reconstruction. Prime Intellect is the venue (§20); RunPod cannot (§17).
+2. **Decide whether DiLoCo's tokens-to-3.28 is worth buying.** It needs
+   ~24,900 steps at the measured ratio — past the 55-chunk corpus wrap
+   (~11,190 steps), so it cannot be measured without disclosing a second
+   epoch, and it costs ~2.3 h of 8×A100 on top. The equal-token endpoint
+   (§21) may simply be the honest deliverable.
 3. Track B (FSDP2 at ~7B on one 8-GPU node) after that.
 
 ## Known gaps
@@ -319,7 +331,12 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
   if spot is chosen.
 - **Trackio curves from cloud sessions live in per-session DB copies**
   (`out/runpod-8gpu/trackio/`), not aurora's dashboard DB — a merge story
-  is unbuilt.
+  is unbuilt. Worse on the container route: the DB lands in `~/.cache`
+  *inside* the container, which no mount covers, so the 2026-08-21 curves
+  died with the pod and `train.log` is the only record. Mount it next time.
+- **A100-SXM4 peaks differ ~1.4% box to box** (269.9 measured on RunPod,
+  266.0 on lambdalabs). MFU is reported against 269.9 throughout for
+  cross-session comparability, which understates lambdalabs numbers slightly.
 
 ## Mac fallback
 

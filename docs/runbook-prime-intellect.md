@@ -279,10 +279,22 @@ DEX 'PYTHONUNBUFFERED=1 nohup torchrun --standalone --nproc_per_node=8 -m distra
   --distributed-mode diloco \
   --outer-sync-every 500 --outer-lr 0.7 --outer-moment 0.5 \
   --global-batch-seqs 480 --grad-accum-steps 1 \
-  --max-steps 10000 --val-every 250 --checkpoint-every 250 \
-  --diag-val-every 250 \
+  --max-steps 10000 --val-every 500 --checkpoint-every 500 \
+  --diag-val-every 250 --compile \
   --run-name diloco-k8-a100 > session_out/train.log 2>&1 &'
 ```
+
+**`--val-every` must be a multiple of `--outer-sync-every`**, not a divisor of it:
+train.py refuses to start otherwise, because a val on a non-sync step would
+evaluate one replica's local variation rather than the shared model (§16). At
+H = 500 that makes 500 the smallest legal val cadence — which costs nothing,
+since the crossing resolution under DiLoCo is a multiple of H anyway. (This
+runbook said 250 until a rented box caught it, 2026-08-21.)
+
+`--compile` matches §14's `ddp_torch --compile` anchor; without it the wall-clock
+half of the DDP-vs-DiLoCo comparison would be confounded by compilation rather
+than by method. Measured here: 306 ms/step compiled at 8 ranks, vs the anchor's
+315 ms.
 
 Global batch 480 at 8 ranks = 60 seqs/rank, identical to the DDP anchor, so
 global token throughput matches exactly. `--diag-val-every 250` evaluates every

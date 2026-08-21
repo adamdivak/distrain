@@ -1066,3 +1066,55 @@ breaking runbook §3's "suite green = parity proven" criterion. It now returns
 `("unknown", False)` there, in both session scripts.
 
 Total spend on the venue: about $1.30.
+
+## 21. DiLoCo K=8 measured, and what netem does to the mode ranking (2026-08-21)
+
+Full narrative in the [session log](sessions/2026-08-21-prime-diloco-k8.md).
+One 8×A100-SXM4 rental (Prime Intellect / lambdalabs, $22.32/h, 3 h, $63.68)
+carried §16's converged anchor and a trimmed version of §15's curve.
+
+- **Untuned DiLoCo at K=8 costs +0.245 val loss at equal tokens, and saves no
+  wall clock on a fast interconnect.** Against §14's DDP anchor on the same box
+  shape, same global batch (480), same 4.92B tokens: DDP **3.2730 / 3147.1 s**,
+  DiLoCo **3.5183 / 3250.3 s**, `target_reached_step: None`. §16's open
+  measurement — tokens-to-3.28 under DiLoCo — is **still open**, and now bounded:
+  §18's ratio puts it near ~24,900 steps, which is both out of budget and past
+  the 55-chunk corpus wrap (~11,190 steps), so it cannot be measured without
+  disclosing a second epoch. The equal-token endpoint is the reportable number.
+  That DiLoCo loses over NVLink is its boundary condition, not a defect: the
+  method spends loss to buy communication, and there is nothing to buy here.
+- **The outer averaging step is worth a steady −0.24, after costing +1.21 once.**
+  `--diag-val-every` makes this observable rather than inferred: averaging eight
+  replicas diverged from a barely-trained init is *worse* than any replica at the
+  first round (the model-averaging barrier), neutral by step 1000, and worth
+  about −0.24 for the whole plateau. Replica spread falls monotonically
+  0.092 → 0.0013. Note the symmetry with the bullet above — the outer step
+  recovers roughly half of what a lone 60-sequence replica would lose.
+- **μ=0.5 at K=8 shows no excursion at all**, confirming §19's arm-A choice.
+  The μ=0.9 sawtooth does not appear, and no gap grows after step 1500.
+- **§14's "expect the lead to flip back under netem" is wrong in an
+  instructive way — the lead dissolves instead.** Uncompiled interleaved does
+  retake the lead once the transport is sockets (1180 vs `ddp_torch`'s 1285 ms
+  unthrottled, 8 ranks), reproducing the 2×3090 Socket+SHM result. But throttling
+  collapses the differences: 1.5% spread at 40 gbit, **0.12% at 10 gbit**.
+  Overlap cannot hide communication that *is* the step, and compilation only
+  helps compute that has stopped being the bottleneck. **Mode choice matters in
+  the middle regime, not at the slow end** — the opposite of the assumption
+  §14 recorded. Track A's transport-dependent config advice should say so.
+- **Never budget a netem ladder off nominal rate.** At 10 gbit a 567 MB ring
+  reduction should take ~0.45 s; it took ~6.1 s. netem's rate limiter over
+  loopback with NCCL's parallel socket channels is an order of magnitude off
+  nominal, so the 1 gbit and 500 mbit points overran their timeouts and produced
+  nothing. Schedule the low end from measured points only.
+- **Prime Intellect operational actuals.** The stock-image route works exactly as
+  §20 predicted: `docker pull` returned `sha256:f915028c…`, byte-identical to
+  aurora, in 1m43s; `pytest` green (226) on the baked code; netem applied inside
+  the training container. **massedcompute is also a root KVM VM** (A6000 probe,
+  $0.06), so §20's finding holds across three upstreams. **No 2-GPU A100 exists
+  on this venue** — live A100 stock is 8-GPU only, which is why the netem work
+  shared the anchor's box instead of getting the cheap box the runbook assumed.
+- **`guard` terminated at the ceiling mid-sweep**, which also pre-empted the
+  final artifact pull. Everything survived because a 5-minute watcher had already
+  mirrored `session_out/`. The trackio DB did not survive — it lives in
+  `~/.cache` inside the container, which is not a mounted path. Either mount it
+  or accept `train.log` as the record.

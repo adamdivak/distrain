@@ -902,3 +902,46 @@ Cost is ~4% of wall clock and it never feeds the 3.28 check (§16).
 step 3000 (where the baseline's excursion peaked and recovered), ~14.5 h for a
 full schedule. `--checkpoint-every 500` on both, so the endpoint survives an
 interruption -- the baseline's was lost to its omission.
+
+## 20. Prime Intellect as a second venue, and why SkyPilot is not it (2026-08-21)
+
+RunPod ran dry on 8xA100: 36 consecutive misses from 10:59 on 2026-08-19. The
+question was whether SkyPilot could broker across venues instead.
+
+**SkyPilot was rejected on backend depth, not price.** Its Prime Intellect
+backend declares `DOCKER_IMAGE`, `MULTI_NODE`, `AUTODOWN` and `STOP` unsupported
+(`sky/clouds/primeintellect.py`). The two things this study cannot give up are
+image parity and teardown-on-exception (§9), and that backend provides neither.
+The catalog remains useful for free cross-cloud *price discovery* on venues we
+hold no account with -- that is what it was actually used for here.
+
+**Catalog price is not stock.** The catalog's cheap Prime Intellect entries --
+latitude $8.28/h, datacrunch $8.92/h, hyperstack-NVLink $11.20/h -- all report
+no stock live. Only lambdalabs $22.32/h and vultr $22.40/h are purchasable, both
+SXM4. The apparent price advantage over RunPod's $11.12/h A100 was entirely
+phantom. Any venue comparison must query live availability, never the catalog.
+
+**Prime Intellect is a compute exchange**, so `provider.type` selects an upstream
+(lambdalabs, vultr, hyperstack, runpod, datacrunch, ...) and each offer is priced
+and stocked separately. Its own REST API *does* support custom images
+(`image="custom_template"` + `customTemplateId`) even though SkyPilot's backend
+does not -- hence `scripts/prime_session.py`, a stdlib-only mirror of
+`runpod_session.py` with the same `status`/`avail`/`up`/`guard`/`ssh`/`down`
+contract, the same wall-clock ceiling and the same teardown-on-exception.
+
+Three refusals are load-bearing in that script:
+
+- **Socket is pinned to SXM4.** A PCIe A100 is a different interconnect and would
+  silently break comparability with the §14 NVLink anchor. Renting the wrong
+  socket fakes the comparison rather than failing it, so `avail` and `up` filter
+  on socket and name the offers they refused to count.
+- **No `--template-id` means refuse to provision** (exit 2) rather than boot
+  Prime Intellect's stock `ubuntu_22_cuda_12`. Booting a different image is the
+  same class of error as mounting a volume over `/workspace`.
+- **`autoRestart=False` and `maxPrice` = the quoted offer +5%.** A restart after
+  our deadline would bill on unattended; an absent `maxPrice` is an open cheque.
+
+**Two one-time console steps have no API** and must be done by hand:
+funding the wallet, and adding a ghcr.io private-registry credential so a custom
+template can be built (`/api/v1/template/registry-credentials` is GET-only). This
+is the same shape as the RunPod GHCR credential in runbook §0.

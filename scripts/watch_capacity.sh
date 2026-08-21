@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Poll RunPod for 8-GPU capacity and record when it appears. Read-only: it calls
-# `avail` (free) and never rents. `avail` exits 0 when some host reports stock.
+# Poll RunPod and Prime Intellect for 8-GPU capacity and record when it appears.
+# Read-only: it calls `avail` (free) and never rents. `avail` exits 0 when some
+# host reports stock, on both venues.
 #
 #   scripts/watch_capacity.sh out/capacity.log 300
 #
@@ -33,5 +34,21 @@ while true; do
             echo "$ts none $gpu" >> "$LOG"
         fi
     done
+
+    # Prime Intellect: one shape only (8x A100_80GB SXM4, §20). Skipped rather
+    # than logged as a miss when no key is set, so the log stays honest.
+    if [ -n "${PRIME_API_KEY:-}" ]; then
+        out=$(uv run --script scripts/prime_session.py avail 2>&1)
+        rc=$?
+        ts=$(date -Is)
+        if [ $rc -eq 0 ]; then
+            echo "$ts HIT prime A100_80GB SXM4" >> "$LOG"
+            echo "$out" | sed 's/^/    /' >> "$LOG"
+            [ -e "$LOG.hit-prime" ] || { echo "$ts" > "$LOG.hit-prime"; }
+        else
+            echo "$ts none prime A100_80GB SXM4" >> "$LOG"
+        fi
+    fi
+
     sleep "$INTERVAL"
 done

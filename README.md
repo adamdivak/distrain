@@ -163,6 +163,23 @@ tested offline against a fake API in
 [`tests/test_runpod_session.py`](tests/test_runpod_session.py) — no credentials,
 nothing rented.
 
+### The second venue
+
+RunPod's 8×A100 stock is opportunistic, so
+[`scripts/prime_session.py`](scripts/prime_session.py) mirrors the same contract
+(`status`/`avail`/`up`/`guard`/`ssh`/`down`, wall-clock ceiling,
+teardown-on-exception) against Prime Intellect, a compute exchange that resells
+lambdalabs, vultr, hyperstack and others. It is stdlib-only — no SDK — and pins
+the socket to SXM4 so a PCIe A100 cannot silently break comparability with the
+§14 NVLink anchor. `up` refuses to provision without `--template-id` rather than
+boot Prime Intellect's stock image. Two one-time steps have no API and must be
+done in their console: funding the wallet, and adding a ghcr.io registry
+credential so a custom template on the pinned image can be created. See
+[`docs/decisions.md`](docs/decisions.md) §20 — including why SkyPilot was
+evaluated and rejected as the broker.
+
+`scripts/watch_capacity.sh` polls both venues.
+
 ## Data
 
 The full FineWeb10B set (104 shards, ~19 GiB; see

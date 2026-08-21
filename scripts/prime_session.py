@@ -515,9 +515,15 @@ def cmd_up(api: PrimeAPI, args: argparse.Namespace) -> int:
     if not args.template_id and not args.allow_stock_image:
         print(f"refusing to provision: no --template-id, so the pod would boot Prime "
               f"Intellect's stock '{args.stock_image}' image instead of {image_ref}.\n"
-              "  Prime Intellect has no API to create a template: in the console, add a\n"
-              "  private-registry credential for ghcr.io, create a custom template on\n"
-              f"  {image_ref}, then pass its id as --template-id.\n"
+              "  --template-id takes the *image reference* in Prime's own registry, not a\n"
+              "  console template id -- it is passed through as `customTemplateId`:\n"
+              "      scripts/container.sh push          # ghcr, Docker media types (decisions §20)\n"
+              "      prime images push distrain:<sha> --context . --dockerfile Dockerfile\n"
+              "      prime images list                 # -> prime/team-<id>/distrain:<sha>\n"
+              "  Their registry cannot copy from ghcr.io (`sourceImage` is public-only, so a\n"
+              "  private source 401s), so this rebuilds from our Dockerfile. `uv sync\n"
+              "  --frozen` against uv.lock keeps the dependency set identical, but the digest\n"
+              "  differs from the aurora build -- record both in the session log.\n"
               "  --allow-stock-image provisions their image anyway (nothing measured on\n"
               "  it is reportable; useful only for probing the box itself).")
         return 2

@@ -361,11 +361,20 @@ def read_pubkey(path: Path | None) -> str:
 
 def git_image_tag() -> tuple[str, bool]:
     """(short sha, tree_is_clean). The image tag is the provenance of every number
-    a session produces, so a dirty tree is worth a warning."""
-    sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT,
-                         capture_output=True, text=True, check=True).stdout.strip()
-    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=REPO_ROOT,
-                           capture_output=True, text=True, check=True).stdout.strip()
+    a session produces, so a dirty tree is worth a warning.
+
+    Returns ("unknown", False) where there is no git repo -- notably *inside* the
+    image, which bakes the code but not `.git`. Raising there made the parity
+    suite fail on the pod for a reason that has nothing to do with the code
+    being checked.
+    """
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT,
+                             capture_output=True, text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=REPO_ROOT,
+                               capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown", False
     return sha, not dirty
 
 

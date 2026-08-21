@@ -1040,9 +1040,29 @@ must be installed first (`scripts/setup-docker-nvidia.sh` already does this).
 `repo` scope — every private repo. The pull needs a PAT with `read:packages`
 only, the same rule runbook §0 already applies to RunPod's credential.
 
-**Unverified, and load-bearing before an 8-GPU rental**: this was a *nebius CPU*
-node. Whether a *lambdalabs* GPU node is also a full VM, and whether the NVIDIA
-container toolkit installs and passes GPUs through there, is not yet measured.
-Probe that on a 1-GPU box before committing the balance to 8×A100.
+**Confirmed on a GPU node too** (1× A10, lambdalabs us-east-1, $1.29/h, ~1 h,
+~$1.30 — the same upstream that sells the 8×A100). Same `kvm` / systemd / full
+`CapEff`, netem again verified by effect (50.099 ms RTT for a 25 ms delay), and:
 
-Total spend on the venue so far: about $0.01.
+- Docker **and** the NVIDIA container toolkit (1.17.8) are *preinstalled*;
+  `docker run --gpus all` sees the A10 with no setup at all. 1.4 TB on `/`.
+- `docker pull ghcr.io/adamdivak/distrain:a54f828` returned digest
+  `sha256:f56e1669...` — **byte-identical to the aurora build**. This is the
+  parity that their registry cannot give, and it is what makes the stock-image
+  route correct rather than a compromise.
+- `torch 2.13.0+cu126, cuda 12.6, available True, NVIDIA A10` inside our image.
+- **netem works *inside* the container** with `--cap-add=NET_ADMIN`:
+  `netem ... delay 10ms rate 100Mbit` on `lo`. §15's curve can run in the same
+  container the training runs in, which is the arrangement that matters.
+- `scripts/measure_roofline.py` ran to completion: 76.5 TFLOP/s sustained bf16.
+
+Two things the probe caught that would otherwise have surfaced on an expensive
+box. `train.py` **correctly refused to run**: `mfu.py` has no measured A10 peak
+and raised rather than reporting an MFU against a guessed denominator — the
+"peaks are measured, not cited" rule doing its job. And `git_image_tag()` raised
+`CalledProcessError` inside the image, which bakes the code but not `.git`,
+failing 29 session-script tests for a reason unrelated to what they test and
+breaking runbook §3's "suite green = parity proven" criterion. It now returns
+`("unknown", False)` there, in both session scripts.
+
+Total spend on the venue: about $1.30.

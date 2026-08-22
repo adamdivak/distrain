@@ -1,5 +1,10 @@
 # Session log — 8× A100-SXM4-80GB, Prime Intellect / lambdalabs (2026-08-21)
 
+> **MFU correction (2026-08-22).** Every MFU figure in this log was computed with
+> the pre-correction numerator (an untied `wte` charged 6N as if it were a matmul)
+> and is **1.271× too high** — divide by 1.271. Wall clock, tokens and losses are
+> unaffected. See [`../decisions.md`](../decisions.md) §3.
+
 Runbook: [`../runbook-prime-intellect.md`](../runbook-prime-intellect.md),
 Session B (DiLoCo K=8) plus a trimmed Session A (netem) in the same rental.
 **First session on Prime Intellect that ran real work**, and the first to use

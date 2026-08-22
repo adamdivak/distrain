@@ -59,7 +59,7 @@ GPU_TYPE = "NVIDIA A100-SXM4-80GB"     # the runbook's box; A100 PCIe / H100 are
 GPU_COUNT = 8
 CONTAINER_DISK_GB = 80
 POD_PORTS = "22/tcp"                   # SSH over exposed TCP; pod-entry.sh starts sshd
-START_CMD = "/workspace/scripts/pod-entry.sh"
+START_CMD = "/workspace/scripts/pod-entry.sh"   # --start-cmd '' boots a stock image's own CMD
 REGISTRY_AUTH_NAME = "GitHub packages"  # RunPod's own credential for private GHCR pulls
 VOLUME_MOUNT_PATH = "/data"
 IMAGE_REPO = "ghcr.io/adamdivak/distrain"
@@ -124,6 +124,20 @@ class RunpodAPI:
 
     def pod(self, pod_id: str) -> dict | None:
         return runpod.get_pod(pod_id)
+
+    def pod_runtime(self, pod_id: str) -> dict:
+        """`podHostId` and container uptime -- neither is in the SDK's own query.
+
+        `podHostId` is the username of RunPod's SSH proxy
+        (`<podHostId>@ssh.runpod.io`), which execs into any *running* container.
+        That is the only way onto a host that exposes no public port, which is
+        every community host this project has drawn (2026-08-22).
+        """
+        data = self.gql(
+            'query { pod(input: {podId: "%s"}) { id desiredStatus '
+            "runtime { uptimeInSeconds } machine { podHostId } } }" % pod_id
+        )
+        return data.get("pod") or {}
 
     def create_pod(self, **kwargs) -> dict:
         return runpod.create_pod(**kwargs)
@@ -572,12 +586,34 @@ def _ensure_template(api: RunpodAPI, args: argparse.Namespace, account: dict,
                      image: str) -> dict:
     """A template is how a pod gets a private-registry pull credential: the pod
     deploy call in the SDK takes a template id, not a registry auth id."""
+    # The suffix keeps a public (no-credential) template from colliding with an
+    # authenticated one of the same image tag -- reuse matches on name, and
+    # silently inheriting the wrong credential is exactly the failure above.
     name = f"distrain-{image.rsplit(':', 1)[-1]}"
+    if not args.registry_auth_name:
+        name += "-public"
     existing = next((t for t in account.get("podTemplates") or []
                      if t.get("name") == name and t.get("imageName") == image), None)
     if existing:
         print(f"template: reusing {existing['id']} ({name})")
         return existing
+
+    # A public image must be pulled with *no* credential. Attaching one anyway is
+    # not harmless: RunPod hands the named credential to whatever registry the
+    # image names, so a GHCR credential on a docker.io image is an
+    # IMAGE_AUTH_ERROR ("incorrect username or password") and the pod is stopped
+    # before its container ever starts (2026-08-22, three pods lost to this).
+    if not args.registry_auth_name:
+        if args.dry_run:
+            print(f"template: would create {name} -> {image} (public, no credential)")
+            return {"id": "<dry-run>", "name": name, "imageName": image}
+        template = api.create_template(
+            name=name, image_name=image, docker_start_cmd=args.start_cmd,
+            container_disk_in_gb=args.container_disk_gb, volume_in_gb=0,
+            ports=POD_PORTS, is_serverless=False,
+        )
+        print(f"template: created {template['id']} ({name}, public image)")
+        return template
 
     auth = find_by_name(account.get("containerRegistryCreds") or [], args.registry_auth_name)
     if not auth and args.ghcr_token:
@@ -595,7 +631,7 @@ def _ensure_template(api: RunpodAPI, args: argparse.Namespace, account: dict,
     template = api.create_template(
         name=name,
         image_name=image,
-        docker_start_cmd=START_CMD,
+        docker_start_cmd=args.start_cmd,
         container_disk_in_gb=args.container_disk_gb,
         volume_in_gb=0,                      # never a pod volume at /workspace
         ports=POD_PORTS,
@@ -614,6 +650,30 @@ def _wait_for_ssh(api: RunpodAPI, pod_id: str, timeout_s: int, poll_s: int = 10)
             return pod
         time.sleep(poll_s)
     raise TimeoutError(f"pod {pod_id} never exposed port 22 within {timeout_s}s")
+
+
+def proxy_ssh_command(pod_host_id: str) -> str:
+    """RunPod's SSH proxy. `-tt` because the proxy refuses a session without a PTY."""
+    return f"ssh -tt {pod_host_id}@ssh.runpod.io"
+
+
+def _wait_for_container(api: RunpodAPI, pod_id: str, timeout_s: int,
+                        poll_s: int = 10) -> str:
+    """Block until the container is actually running; return its proxy host id.
+
+    A pod is RUNNING from the moment it is rented, while its container may still
+    be pulling, stuck, or already exited -- `uptimeInSeconds` is what separates
+    the three, and watching the wrong one cost $1.26 on 2026-08-22.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        pod = api.pod_runtime(pod_id)
+        uptime = ((pod.get("runtime") or {}).get("uptimeInSeconds")) or 0
+        host_id = (pod.get("machine") or {}).get("podHostId")
+        if uptime > 0 and host_id:
+            return host_id
+        time.sleep(poll_s)
+    raise TimeoutError(f"pod {pod_id} container never started within {timeout_s}s")
 
 
 def cmd_up(api: RunpodAPI, args: argparse.Namespace) -> int:
@@ -676,7 +736,8 @@ def cmd_up(api: RunpodAPI, args: argparse.Namespace) -> int:
         "cloud_type": args.cloud_type,
         "data_center": data_center or "(unpinned: RunPod places it)",
         "price_per_hr": price, "container_disk_gb":
-        args.container_disk_gb, "pod_volume_gb": 0, "start_cmd": START_CMD,
+        args.container_disk_gb, "pod_volume_gb": 0,
+        "start_cmd": args.start_cmd or "(the image's own CMD)",
         "network_volume": (volume or {}).get("id"),
         "volume_mount_path": args.volume_mount_path if volume else None,
         "max_hours": args.max_hours, "deadline_utc": deadline,
@@ -698,7 +759,7 @@ def cmd_up(api: RunpodAPI, args: argparse.Namespace) -> int:
         cloud_type=args.cloud_type,
         data_center_id=data_center,
         template_id=template["id"],
-        docker_args=START_CMD,               # empty here would boot the image CMD and exit
+        docker_args=args.start_cmd,          # empty boots the image's own CMD
         container_disk_in_gb=args.container_disk_gb,
         volume_in_gb=0,                      # the API's 20 GB default would shadow /workspace
         volume_mount_path=args.volume_mount_path if volume else "/runpod-volume",
@@ -712,6 +773,18 @@ def cmd_up(api: RunpodAPI, args: argparse.Namespace) -> int:
     print(f"\npod: created {pod_id} -- billing from now, ${price:.2f}/h")
 
     try:                                     # teardown on exception: §9's kill-switch
+        if args.ssh_proxy:
+            host_id = _wait_for_container(api, pod_id, args.wait_seconds)
+            session = {**plan, "pod_id": pod_id,
+                       "started_utc": started.replace(microsecond=0).isoformat(),
+                       "ssh": proxy_ssh_command(host_id), "pod_host_id": host_id,
+                       "ip": None, "port": None}
+            write_session(session, args.session_file)
+            print(f"\n  {proxy_ssh_command(host_id)}\n")
+            print(f"ceiling {args.max_hours:g} h -> terminate by {deadline} UTC "
+                  f"(~${price * args.max_hours:.2f}). Start the kill-switch now:")
+            print(f"  uv run --script {Path(__file__).relative_to(REPO_ROOT)} guard &")
+            return 0
         ready = _wait_for_ssh(api, pod_id, args.wait_seconds)
     except BaseException as exc:             # includes KeyboardInterrupt
         if args.keep_on_error:
@@ -881,13 +954,24 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--volume-name", default="distrain")
     up.add_argument("--volume-mount-path", default=VOLUME_MOUNT_PATH)
     up.add_argument("--ssh-key", type=Path, default=None, help="public key for the pod")
-    up.add_argument("--registry-auth-name", default=REGISTRY_AUTH_NAME)
+    up.add_argument("--registry-auth-name", default=REGISTRY_AUTH_NAME,
+                    help="registry credential to pull with; '' for a public image. The "
+                         "credential is handed to whichever registry the image names, so "
+                         "the wrong one fails the pull rather than being ignored.")
     up.add_argument("--ghcr-user", default="adamdivak")
     up.add_argument("--ghcr-token", default=os.environ.get("GHCR_TOKEN"),
                     help="PAT with read:packages; only needed to create the credential once")
     up.add_argument("--wait-seconds", type=int, default=600)
     up.add_argument("--resume-stopped", action="store_true",
                     help="restart a stopped pod of the same name instead of failing")
+    up.add_argument("--ssh-proxy", action="store_true",
+                    help="reach the pod through ssh.runpod.io instead of a public port. "
+                         "Community hosts expose no public port, so this is the only way "
+                         "onto one; it needs the container running, not sshd.")
+    up.add_argument("--start-cmd", default=START_CMD,
+                    help="command the container runs; '' boots the image's own CMD, which "
+                         "is what a stock image (runpod/pytorch, ...) needs to start its "
+                         "own sshd. Default assumes our image's pod-entry.sh.")
     up.add_argument("--keep-on-error", action="store_true",
                     help="do NOT terminate the pod if provisioning fails (debugging only)")
     up.add_argument("--force", action="store_true", help="provision despite the budget check")

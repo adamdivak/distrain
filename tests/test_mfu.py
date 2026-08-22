@@ -14,7 +14,7 @@ from distrain.model import GPT, GPTConfig
 
 
 def gpt2_small_counter(seq_len=1024):
-    return FlopsCounter(num_params=124_000_000, n_layer=12, n_head=12, head_dim=64,
+    return FlopsCounter(matmul_params=124_000_000, n_layer=12, n_head=12, head_dim=64,
                         seq_len=seq_len)
 
 
@@ -75,7 +75,7 @@ class TestFlopsFormula:
     def test_includes_attention_term(self):
         """The whole point of PaLM-style over 6ND."""
         c = gpt2_small_counter()
-        bare_6nd = 6 * c.num_params
+        bare_6nd = 6 * c.matmul_params
         assert c.model_flops_per_token > bare_6nd
         attention = 12 * 12 * 12 * 64 * 1024
         assert c.model_flops_per_token == pytest.approx(bare_6nd + attention)
@@ -88,7 +88,7 @@ class TestFlopsFormula:
     def test_attention_share_is_material_at_gpt2_small(self):
         """13% of total FLOPs at 124M/seq-1024 -- far too large to drop."""
         c = gpt2_small_counter()
-        share = 1 - (6 * c.num_params) / c.model_flops_per_token
+        share = 1 - (6 * c.matmul_params) / c.model_flops_per_token
         assert share == pytest.approx(0.132, abs=0.005)
 
 
@@ -137,4 +137,30 @@ class TestCounterForModel:
         model = GPT(GPTConfig(n_layer=2, n_head=4, n_embd=128, block_size=64, vocab_size=256))
         c = counter_for(model, seq_len=64)
         assert (c.n_layer, c.n_head, c.head_dim, c.seq_len) == (2, 4, 32, 64)
-        assert c.num_params == model.num_params()
+        assert c.matmul_params == model.flops_params()
+
+    def test_untied_embedding_is_not_charged_flops(self):
+        """The regression this convention exists for.
+
+        Untying the head adds ~39M parameters but changes no matmul shape: `wte`
+        becomes a pure gather. Charging `6N` for it once inflated every MFU number in
+        the project by 27% -- an 8-GPU DDP step appeared to sustain 78.6% of a
+        measured A100 roofline. `docs/decisions.md` section 3.
+        """
+        shape = {"n_layer": 2, "n_head": 4, "n_embd": 128, "block_size": 64,
+                 "vocab_size": 256}
+        tied = GPT(GPTConfig(use_weight_tying=True, **shape))
+        untied = GPT(GPTConfig(use_weight_tying=False, **shape))
+
+        wte = untied.transformer.wte.weight.numel()
+        assert untied.num_params() == tied.num_params() + wte
+        assert untied.flops_params() == tied.flops_params()
+        assert counter_for(untied, 64).model_flops_per_token == pytest.approx(
+            counter_for(tied, 64).model_flops_per_token
+        )
+
+    def test_tied_embedding_counts_once_as_the_head(self):
+        """A tied `wte` *is* the output projection, so it belongs in 6N."""
+        model = GPT(GPTConfig(use_weight_tying=True, n_layer=2, n_head=4, n_embd=128,
+                              block_size=64, vocab_size=256))
+        assert model.flops_params() == model.num_params()

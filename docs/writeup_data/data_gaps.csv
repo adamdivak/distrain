@@ -1,0 +1,16 @@
+requested_comparison,availability,reason
+Full converged training and validation loss curve,complete,Both halves are projected: validation_curves.csv and training_curves.csv cover the clean 10000-step DDP schedule and the DiLoCo run.
+Desktop RTX 3090 time and price to 3.28,partial,"The 21.30 h figure is a step-time extrapolation on exactly the same footing as the 1xA100 7.19 h bar, so no direct crossing run is wanted. Only the cost inputs are open: average wall power and electricity price in cost_inputs.csv."
+8xA100 PCIe,partial,"Measured at 2 GPUs, not 8: a topology-verified 2xA100 80GB PCIe box gave 2.29 GB/s effective all-reduce bandwidth and a 1745.4 ms batch-480 step, projecting to 826 ms at 8 ranks. That node has no GPU-to-GPU P2P (topo -p2p r = CNS; NCCL routes via host memory), so none of it is PCIe P2P. The 8-GPU bar is out of stock rather than mispriced: RunPod sells the SKU at half the SXM4 anchor's price and had no capacity on 2026-08-22; Prime Intellect has none at all."
+Multi-node DDP,missing,No multi-node cluster was available or measured.
+DiLoCo time to 3.28,missing,"Missing crossing step, tokens, and training seconds. K=8 DiLoCo ended at 3.5183 after 4.92B tokens and did not cross 3.28."
+DiLoCo step time on slow transport,partial,"diloco_transport.csv reconstructs it: the outer sync moves the same tensor DDP all-reduces every step, so each transport's measured communication term divides by H=500. Sound, but not directly measured."
+Price per convergence run across conditions,partial,"Missing a matching 1xA100 rental rate, the desktop energy/capital convention, and convergence times for an 8-GPU PCIe box and for DiLoCo."
+Pinned versus current PyTorch performance,missing,Missing mean and standard deviation of step time for the same DDP mode matrix under a current PyTorch build.
+DDP validation-loss curve and 8xA100 crossing,complete,Raw logs contain the full clean 10000-step schedule and first crossing.
+DDP versus DiLoCo at equal tokens,complete,Both raw curves exist through step 9999 at global batch 480.
+1-to-8 GPU matched-micro-batch scaling,complete,Raw benchmark JSON exists for 1 and 8 A100s at global batch 480.
+DDP transport sensitivity,partial,NVLink and TCP are direct step measurements; 40/10 Gbit netem points are upper-bound reconstructions.
+8-GPU rental availability,complete,"capacity_availability.csv projects 350 polls of both venues from the capacity watcher's log, replacing the draft's screenshot of a console."
+DiLoCo merge penalty versus replica count,partial,"Two arms only, K=2 and K=8. The committed K=2 arm ran a 6000-step schedule against the K=8 arm's 10000, so the replica count is still confounded with the schedule; reported as each arm's gap from its own reference for that reason. Matched 10000-step K=2 arms (diloco-k2-10k, ref-1gpu-10k) were launched on aurora 2026-08-22 and supersede this when they land."
+Four DDP implementations over forced TCP/loopback,complete,"Raw benchmark JSON contains mean and standard deviation for naive, bucketed, interleaved, and PyTorch DDP at 8 ranks."

@@ -238,7 +238,7 @@ move). No converged run per bandwidth point is needed or affordable.
 ~$22.32/h. **Ceilings: 5 h, $120.** Estimated happy path ~3.5 h ≈ $80.
 
 This is the K=8 counterpart to §14's DDP anchor (4.92B tokens to 3.28,
-3147.1 s, ~79% MFU). Same architecture, same global batch — the method is the
+3147.1 s, ~62% MFU). Same architecture, same global batch — the method is the
 only difference, which is the whole point.
 
 ### B1. Start the data download first (~7 min, background)

@@ -170,12 +170,26 @@ class GPT(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def num_params(self) -> int:
-        """Parameter count -- the N that goes into the FLOPs formula, see `mfu.py`.
+        """Total parameter count, as reported. Not the N in the FLOPs formula.
 
-        With rotary embeddings there are no positional parameters to exclude; token
-        embeddings count because weight tying can make them the output projection.
+        With rotary embeddings there are no positional parameters to exclude, so this
+        is simply every parameter the model owns. For throughput accounting use
+        `flops_params()` -- see `mfu.py`.
         """
         return sum(p.numel() for p in self.parameters())
+
+    def flops_params(self) -> int:
+        """The N in `6N` -- only parameters that participate in a matmul.
+
+        `wte` is a gather, not a matmul. It earns its place in the FLOPs formula only
+        when weight tying makes it the output projection; counting an *untied* `wte`
+        charges the GPU for work it never does and overstates MFU by 27% at the 124M
+        shape. Untying changes no matmul shape, so it costs ~0 FLOPs/token.
+        """
+        n = self.num_params()
+        if not self.config.use_weight_tying:
+            n -= self.transformer.wte.weight.numel()
+        return n
 
     def forward(
         self, idx: torch.Tensor, targets: torch.Tensor | None = None

@@ -7,6 +7,9 @@ are fixed here once (`docs/decisions.md` section 3) rather than re-derived per r
   attention term. That term is 13% of total FLOPs at 124M/seq-1024 -- dropping it, as
   bare `6ND` does, would understate MFU by more than most of the effects this study
   is trying to measure.
+- **N is matmul parameters only** (`GPT.flops_params()`), not every parameter. An
+  untied `wte` is a gather; charging `6N` for it invents 27% of work that never runs.
+  See `docs/decisions.md` section 3.
 - **MFU vs HFU**: MFU counts only the FLOPs the model mathematically requires. HFU
   additionally counts activation recomputation, which FSDP2 at 7B will need. They
   differ by ~33% under full recompute and are widely conflated; both are reported.
@@ -54,7 +57,10 @@ _PEAK_BF16: tuple[tuple[str, PeakSpec], ...] = (
     ("H100", PeakSpec(989.0, "datasheet dense SXM, UNVERIFIED")),
     ("A100-SXM4-80GB", PeakSpec(269.9, "measured on runpod 8xA100 US-MD-1 2026-08-16, 16384^3 bf16 GEMM")),
     ("A100-SXM4-40GB", PeakSpec(270.1, "measured on prime/lambdalabs 8xA100 us-east-1 2026-08-21, 16384^3 bf16 GEMM")),
-    ("A100", PeakSpec(312.0, "datasheet dense, PCIe unmeasured, UNVERIFIED")),
+    ("A100 80GB PCIe", PeakSpec(256.5, "measured on runpod 2xA100-PCIe CA-MTL-3 2026-08-22, "
+                                "4096^3 bf16 GEMM; 223.9 at 16384^3 -- the 300 W part throttles "
+                                "on long large GEMMs where the SXM4 cards do not")),
+    ("A100", PeakSpec(312.0, "datasheet dense, UNVERIFIED")),
     ("L40S", PeakSpec(181.0, "datasheet dense, UNVERIFIED")),
     ("RTX 3090", PeakSpec(82.6, "measured on aurora 2026-07-28, 16384^3 bf16 GEMM")),
 )
@@ -81,11 +87,12 @@ def peak_bf16_flops(device_name: str) -> float:
 class FlopsCounter:
     """Per-token FLOPs for one model shape.
 
-    `num_params` matches `GPT.num_params()`: every parameter counts (rotary has no
-    positional parameters), tied token embeddings once.
+    `matmul_params` is `GPT.flops_params()`, *not* `GPT.num_params()`: only parameters
+    that participate in a matmul. Rotary has no positional parameters; a tied `wte`
+    counts once, as the output projection; an untied `wte` does not count at all.
     """
 
-    num_params: int
+    matmul_params: int
     n_layer: int
     n_head: int
     head_dim: int
@@ -95,7 +102,7 @@ class FlopsCounter:
     def model_flops_per_token(self) -> float:
         """Forward + backward FLOPs the model mathematically requires, per token."""
         attention = 12 * self.n_layer * self.n_head * self.head_dim * self.seq_len
-        return 6 * self.num_params + attention
+        return 6 * self.matmul_params + attention
 
     def hardware_flops_per_token(self, recompute_fraction: float = 0.0) -> float:
         """As above, plus recomputed forward passes under activation checkpointing.
@@ -109,7 +116,7 @@ class FlopsCounter:
             raise ValueError(f"recompute_fraction must be in [0, 1], got {recompute_fraction}")
         r = recompute_fraction
         attention_term = self.n_layer * self.n_head * self.head_dim * self.seq_len
-        return (6 + 2 * r) * self.num_params + (12 + 4 * r) * attention_term
+        return (6 + 2 * r) * self.matmul_params + (12 + 4 * r) * attention_term
 
     def mfu(self, tokens: int, seconds: float, peak_flops: float) -> float:
         """Model FLOPs utilization: fraction of peak spent on required work."""
@@ -131,7 +138,7 @@ def counter_for(model, seq_len: int) -> FlopsCounter:
     """Build a `FlopsCounter` from a `GPT`, so the shape is never transcribed by hand."""
     cfg = model.config
     return FlopsCounter(
-        num_params=model.num_params(),
+        matmul_params=model.flops_params(),
         n_layer=cfg.n_layer,
         n_head=cfg.n_head,
         head_dim=cfg.head_dim,

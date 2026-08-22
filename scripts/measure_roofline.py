@@ -50,18 +50,22 @@ def main() -> None:
     name = torch.cuda.get_device_name()
     print(f"device: {name}")
 
-    best = 0.0
+    best, best_n = 0.0, max(args.sizes)
     for n in args.sizes:
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
             tflops = bench(n, dtype, args.iters)
             label = str(dtype).removeprefix("torch.")
             print(f"  n={n:<6d} {label:<10s} {tflops:7.1f} TFLOP/s")
-            if dtype is torch.bfloat16:
-                best = max(best, tflops)
+            if dtype is torch.bfloat16 and tflops > best:
+                best, best_n = tflops, n
 
-    print(f"\nbest sustained bf16: {best:.1f} TFLOP/s")
+    # The provenance names the size the peak actually came from. It used to name
+    # the largest size unconditionally, which is right only when the sweep peaks
+    # there -- true on both SXM4 cards, false on the A100 PCIe, whose 300 W part
+    # falls from 256.5 to 223.9 TFLOP/s between n=4096 and n=16384 (2026-08-22).
+    print(f"\nbest sustained bf16: {best:.1f} TFLOP/s at n={best_n}")
     print("record in distrain/mfu.py as:")
-    print(f'    PeakSpec({best:.1f}, "measured on <host> <date>, {max(args.sizes)}^3 bf16 GEMM")')
+    print(f'    PeakSpec({best:.1f}, "measured on <host> <date>, {best_n}^3 bf16 GEMM")')
 
     try:
         from distrain.mfu import peak_bf16_spec

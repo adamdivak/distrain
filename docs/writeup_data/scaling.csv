@@ -1,0 +1,5 @@
+config,gpus,transport,mode,step_ms,step_std_ms,time_to_3_28_hours,scaling_speedup,scaling_efficiency,time_status,source_file,notes
+1xA100,1,single,single,2589.0583333333334,6.811281862179884,7.191109520833334,,,extrapolated_from_measured_step_time,out/prime-pcie/session_out/bench-1gpu/20260821T170132Z/results.json,Global batch 480; micro-batch 30 on every device.
+8xA100 NVLink,8,NVLink NV12,ddp_interleaved,337.775,0.738702794215515,0.9381700624999999,7.665038363802335,0.9581297954752919,extrapolated_from_measured_step_time,out/prime-pcie/session_out/bench-8gpu/20260821T170426Z/results.json,Global batch 480; micro-batch 30 on every device.
+8xA100 forced TCP/loopback,8,Forced TCP/loopback,ddp_interleaved,1218.425,14.61867578880457,3.3841754374999997,2.1249222014759495,0.2656152751844937,extrapolated_from_measured_step_time,out/prime-pcie/session_out/bench-8gpu-socket/20260821T170636Z/results.json,Global batch 480; micro-batch 30 on every device.
+8xA100 NVLink (full run),8,NVLink NV12,ddp_torch,,,0.8741944444444444,,,measured_full_convergence,out/runpod-8gpu/session_out/train_ext.log,First unsmoothed crossing at step 9999; micro-batch 60.

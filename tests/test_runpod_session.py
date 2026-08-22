@@ -499,3 +499,39 @@ class TestCli:
         monkeypatch.delenv("RUNPOD_API_KEY")
         with pytest.raises(SystemExit):
             rps.load_api_key(tmp_path / "missing.env")
+
+
+class TestProxyRoute:
+    """Community hosts expose no public port, so the SSH proxy is the only way in."""
+
+    def test_proxy_command_requests_a_pty(self):
+        # ssh.runpod.io refuses a session without one ("your SSH client doesn't
+        # support PTY"), which looks like an auth failure if -tt is missing.
+        assert rps.proxy_ssh_command("abc123-6441162e") == "ssh -tt abc123-6441162e@ssh.runpod.io"
+
+    def test_wait_for_container_ignores_a_pod_whose_container_has_not_started(self):
+        """RUNNING is the *pod*, not the container. A pod that is billing while its
+        container is stuck reports uptime 0 -- watching desiredStatus instead cost
+        $1.26 and 23 minutes on 2026-08-22.
+        """
+        class Api:
+            def __init__(self):
+                self.calls = 0
+
+            def pod_runtime(self, pod_id):
+                self.calls += 1
+                if self.calls < 3:
+                    return {"desiredStatus": "RUNNING", "runtime": {"uptimeInSeconds": 0},
+                            "machine": {"podHostId": "p-1"}}
+                return {"desiredStatus": "RUNNING", "runtime": {"uptimeInSeconds": 4},
+                        "machine": {"podHostId": "p-1"}}
+
+        assert rps._wait_for_container(Api(), "p", timeout_s=5, poll_s=0) == "p-1"
+
+    def test_wait_for_container_gives_up_rather_than_billing_forever(self):
+        class Api:
+            def pod_runtime(self, pod_id):
+                return {"runtime": {"uptimeInSeconds": 0}, "machine": {"podHostId": "p-1"}}
+
+        with pytest.raises(TimeoutError):
+            rps._wait_for_container(Api(), "p", timeout_s=0.05, poll_s=0.01)

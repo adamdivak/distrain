@@ -34,6 +34,9 @@ than a crash. Each is enforced by a test — do not weaken them to make a test p
   streams across world sizes 1/2/4/8. Changing GPU count must never change data order.
 - **One FLOPs convention, in `mfu.py` only.** PaLM-style `6N + 12*L*H*Q*T`, true MFU
   reported, HFU logged separately when checkpointing is on, bf16 **dense** peaks.
+  **N is matmul parameters** (`GPT.flops_params()`), never `num_params()`: an untied
+  `wte` is a gather, and charging `6N` for it inflated every MFU by 27% for two weeks
+  (`docs/decisions.md` §3). MFU under 100% is not evidence the numerator is right.
 - **Peaks are measured, not cited.** A datasheet figure for the 3090 (35.6 TFLOP/s —
   actually its FP32 non-tensor rate) once produced a 158% MFU. Run
   `scripts/measure_roofline.py` on any new GPU class; datacenter entries are marked

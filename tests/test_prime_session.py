@@ -182,6 +182,19 @@ class TestPureHelpers:
         assert [o["socket"] for o in sxm] == ["SXM4"]
         assert len(ps.matching_offers(availability, "A100_80GB", 8, socket="any")) == 2
 
+    def test_pinned_socket_rejects_a_cloud_id_known_to_misreport_its_fabric(self):
+        """The PCIe hole this project cannot close is not a stock problem: PI's
+        only 8xA100 "PCIe" offer is lambdalabs' SXM4 node. Pinning --socket PCIe
+        must therefore match nothing rather than rent an NVLink mesh (§22).
+        """
+        availability = {"A100_40GB": [
+            offer_fixture(socket="PCIe", cloudId="gpu_8x_a100",
+                          prices={"onDemand": 15.92}),
+        ]}
+        assert ps.matching_offers(availability, "A100_40GB", 8, socket="PCIe") == []
+        # --socket any makes no fabric claim, so it still lists the box.
+        assert len(ps.matching_offers(availability, "A100_40GB", 8, socket="any")) == 1
+
     def test_matching_offers_sorts_by_price_and_drops_the_unrentable(self):
         availability = {"A100_80GB": [
             offer_fixture(provider="vultr", prices={"onDemand": 22.40}),

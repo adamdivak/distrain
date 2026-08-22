@@ -9,6 +9,9 @@ time-to-target-loss, and to quantify where and why the two diverge.
   original statement of intent, deliberately left unedited.
 - [`docs/decisions.md`](docs/decisions.md) — everything settled since the brief,
   including the metric definitions that must not drift once runs cost money.
+- [`docs/writeup.md`](docs/writeup.md) — the article draft; its collected numbers,
+  rendered figures, and remaining plot gaps are indexed in
+  [`docs/writeup_data/README.md`](docs/writeup_data/README.md).
 - [`reference/PROVENANCE.md`](reference/PROVENANCE.md) — vendored upstream code, and
   the exact definition of the 3.28 target.
 
@@ -17,10 +20,11 @@ time-to-target-loss, and to quantify where and why the two diverge.
 **The scaling headline exists end to end**
 ([session log](docs/sessions/2026-08-21-prime-single-gpu-scaling.md)): on one
 A100 the 162M model reaches 3.28 in **7.19 h** (2589.1 ms/step at global batch
-480, 76.4% MFU); on 8 of them over NVLink, **0.94 h** — **7.66×, 95.8% scaling
-efficiency**, measured on one box at one micro-batch. Forcing the same 8 GPUs
-onto TCP sockets costs **3.8×** (3.38 h) — a tax, not a dealbreaker, since eight
-badly-connected GPUs still beat one well-connected one by 2.1×. §14's 0.88
+480, 60.1% MFU); on 8 of them over NVLink, **0.94 h** — **7.66×, 95.8% scaling
+efficiency**, measured on one box at one micro-batch. Forcing NCCL off P2P and
+shared memory and onto TCP/loopback costs **3.8×** (3.38 h) — a tax, not a
+dealbreaker, since eight badly-connected GPUs still beat one well-connected one
+by 2.1×. §14's 0.88
 scaling figure turns out to be an artefact of the bench's 8-seq default batch:
 **scaling efficiency is a function of the batch and must be quoted with it**
 (`docs/decisions.md` §22).
@@ -40,7 +44,7 @@ See [`docs/decisions.md`](docs/decisions.md) §21.
 **The first Track A number exists** ([session log](docs/sessions/2026-08-16-runpod-8xa100.md)):
 on a rented 8×A100-SXM4 node, the 124M/162M model reached the 3.28 val-loss
 target at **4.92B tokens / 3147.1 s of training time** (clean 10000-step
-trapezoid, first unsmoothed crossing, ~79% MFU against the measured 269.9
+trapezoid, first unsmoothed crossing, ~62% MFU against the measured 269.9
 TFLOP/s roofline, `ddp_torch --compile`). A clean 9000-step schedule ends
 measurably short at 3.2849 / 4.42B tokens.
 
@@ -84,8 +88,63 @@ switch at runtime. See [`docs/decisions.md`](docs/decisions.md) §6 for the conv
 it rests on and §10 for how the multi-rank tests are built.
 
 Measured on aurora (RTX 3090): the modernized model (162M params with the untied
-head) at seq-1024, batch 8, bf16 + compile → **130.4 ms/step, 82.6% MFU**.
+head) at seq-1024, batch 8, bf16 + compile → **130.4 ms/step, 65.0% MFU**.
 Correctness only — a consumer card's numbers do not transfer (`project_brief.md` §8).
+
+## Writeup figures
+
+The writeup numbers have been projected from the gitignored raw logs and benchmark
+JSON into reviewable CSVs under [`docs/writeup_data/`](docs/writeup_data/). The
+plotting script renders each figure as interactive HTML and static SVG/PNG under
+[`docs/plots/`](docs/plots/):
+
+```bash
+uv run python scripts/collect_writeup_data.py
+uv run --extra plots python scripts/plot_writeup.py
+```
+
+The rendered set covers both halves of the converged loss curve, measured 8-GPU
+rentability, equal-token DDP-vs-DiLoCo quality and runtime, matched-batch 1→8 GPU
+scaling, DDP transport sensitivity, transport MFU, four DDP implementations over
+sockets, compilation versus overlap on A100 PCIe, DiLoCo outer-sync diagnostics,
+the DiLoCo merge penalty at two replica counts, and DDP-vs-DiLoCo step time
+across transports. Headline plotted values
+include **7.19 h → 0.94 h** for 1→8 A100 scaling, **57.6% → 15.3% MFU** for
+NVLink → TCP, and **3.2730 versus 3.5183** validation loss for DDP versus DiLoCo
+at 4.915B tokens.
+
+Two derived numbers now sit on the same reconstruction as the netem points and
+answer the writeup's actual question. **8-GPU DDP stops beating a single A100
+below 0.50 GB/s (4.0 Gbit/s) effective all-reduce bandwidth** — the measured
+unthrottled socket sat only 1.8× above that cliff. And **DiLoCo starts beating
+DDP end to end below 2.36 GB/s (18.8 Gbit/s)** once charged §18's 2.49× token
+ratio, which is why its equal-token loss penalty is not the whole story. See
+[`transport_crossovers.csv`](docs/writeup_data/transport_crossovers.csv).
+
+**Still missing, in the order it would cost to buy:** a topology-verified A100
+PCIe point — the largest hole, and **not a price problem**: RunPod sells the PCIe
+card as its own GPU type at half the SXM4 anchor's rate and had no 8-GPU capacity
+on 2026-08-22, while Prime Intellect has none at all
+([`docs/decisions.md`](docs/decisions.md) §24). `scripts/pcie_hunt.sh` rents and
+measures the first opening unattended. Then: a *measured* rather than
+reconstructed DiLoCo slow-transport timing; complete price-per-convergence
+comparisons; and a current-PyTorch rerun.
+DiLoCo's time to 3.28 is blocked rather than unbought — it needs ~24,900 steps
+against a corpus that wraps near 11,190. The procedure for each, and the PCIe
+capacity-watch command, are in
+[`docs/writeup_data/README.md`](docs/writeup_data/README.md#plots-still-missing);
+the field-level manifest stays in
+[`data_gaps.csv`](docs/writeup_data/data_gaps.csv).
+
+Cost inputs belong in [`cost_inputs.csv`](docs/writeup_data/cost_inputs.csv),
+which has the measured/projected runtimes prefilled and leaves rental rates,
+average desktop wall power, electricity prices, capital allocation, and overrides
+blank. The existing
+3090 Trackio run supports a **21.30 h projected time to 3.28** (7.6684 s/step ×
+9999); it did not itself cross the target and is labelled as an extrapolation.
+That is the *same* evidence class as the 1×A100 **7.19 h** bar, which is also a
+measured step time times the measured step-9999 crossing — so no direct 3090
+convergence run is planned, and only the power and electricity fields are open.
 
 ## Machines
 
@@ -315,39 +374,61 @@ until measured — an unmeasured 3090 figure once produced a 158% MFU.
 
 ([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
 
-1. **Finish the netem ladder below 10 gbit.** The 2026-08-21 sweep measured
-   unthrottled-socket, 40 gbit and 10 gbit before the rental ceiling; 1 gbit
-   and 500 mbit overran their timeouts because the schedule was budgeted off
-   *nominal* rate, which netem misses by ~8× ([`docs/decisions.md`](docs/decisions.md)
-   §21). Re-run the low end at measured pacing, **at the anchor's global batch
-   of 480** — the second 2026-08-21 session showed the batch-64 points need a
-   reconstruction that runs +23% (§22), and that at batch 480 comm is amortized
-   far better than the small-batch sweep suggests. Prime Intellect is the venue
-   (§20); RunPod cannot (§17).
-2. **Get one honest PCIe point**, the transport most people can actually rent.
-   Prime Intellect's `--socket PCIe` returned an SXM4/NVLink box (§22), so this
-   needs a venue whose topology can be verified before renting.
-3. **Decide whether DiLoCo's tokens-to-3.28 is worth buying.** It needs
+1. **Get one honest PCIe point**, the transport most people can actually rent.
+   This is now waiting on stock rather than on a decision (§24): RunPod's
+   `NVIDIA A100 80GB PCIe` is the real SKU at half the anchor's price and had no
+   8-GPU capacity on 2026-08-22, and Prime Intellect has no PCIe 8×A100 at all.
+   Leave `scripts/pcie_hunt.sh out/pcie-hunt.log 300` running — it probes by
+   attempting the deploy (free when rejected), then guards, gates on
+   `nvidia-smi topo -m`, measures, tears down and verifies without a human.
+   Only bandwidth plus a batch-480 bench is needed, so it is minutes of rental
+   once a box exists.
+2. **Decide whether DiLoCo's tokens-to-3.28 is worth buying.** It needs
    ~24,900 steps at the measured ratio — past the 55-chunk corpus wrap
    (~11,190 steps), so it cannot be measured without disclosing a second
    epoch, and it costs ~2.3 h of 8×A100 on top. The equal-token endpoint
    (§21) may simply be the honest deliverable.
-4. Track B (FSDP2 at ~7B on one 8-GPU node) after that.
+3. Track B (FSDP2 at ~7B on one 8-GPU node) after that.
+
+**The netem ladder stops at 10 gbit, on purpose.** The 2026-08-21 sweep measured
+unthrottled-socket, 40 gbit and 10 gbit; 1 gbit and 500 mbit overran their
+timeouts because the schedule was budgeted off *nominal* rate, which netem misses
+by ~8× ([`docs/decisions.md`](docs/decisions.md) §21). They are not worth
+re-running. Nominal 10 gbit already delivers only 1.2 Gbit/s effective and puts
+an 8-GPU DDP run at **21.1 h against one A100's 7.19 h** — far past the 0.50 GB/s
+break-even where eight GPUs stop beating one. A lower point would extend a curve
+whose conclusion is already settled.
 
 ## Known gaps
 
-- **H100/L40S/A100-PCIe peaks are unverified datasheet values.** A100-SXM4 is
-  measured at both memory sizes (269.9 / 270.1, 0.07% apart). Run the roofline
+- **H100/L40S peaks are unverified datasheet values.** A100-SXM4 is measured at
+  both memory sizes (269.9 / 270.1, 0.07% apart) and A100 80GB PCIe at 256.5
+  (2026-08-22) — the PCIe part throttles to 223.9 at n=16384 where the SXM4
+  cards peak, and its 312.0 datasheet figure was 22% high. Run the roofline
   script first thing on any new GPU class; per-box measurement is mandatory (the
   two 3090s differ by 9%). Check what the *generic* patterns in `_PEAK_BF16`
   already swallow: `"A100"` was silently catching 40 GB cards with a datasheet
   figure instead of refusing to start (`docs/decisions.md` §22).
-- **PCIe is still unmeasured.** Prime Intellect's `--socket PCIe` returned an
-  SXM4 box on a full NVLink mesh — the socket field is provider metadata, not a
-  fabric guarantee, so verify with `nvidia-smi topo -m` before believing any
-  transport claim. The slow-transport numbers above come from forcing NCCL onto
-  TCP sockets, and the netem-derived points in `scripts/transport_curve.py` are
-  **upper bounds, +23% at the one point measured both ways**.
+- **PCIe is measured at 2 GPUs; the 8-GPU bar is out of stock, not mispriced.**
+  A topology-verified 2×A100 80GB PCIe box gave **2.29 GB/s** effective
+  all-reduce bandwidth — and revealed that the rentable node has **no GPU-to-GPU
+  P2P at all** (`topo -p2p r` = `CNS`; NCCL routes via host memory), so none of
+  it may be reported as PCIe P2P (§25). At 8 ranks that projects to 2.29 h to
+  3.28, an optimistic bound since a wider ring crosses more host bridges.
+  RunPod's `NVIDIA A100 80GB PCIe` is a distinct SKU at $11.12/h secure (half
+  the SXM4 anchor) and had no 8-GPU capacity on 2026-08-22; Prime Intellect's
+  every "PCIe" 8×A100 is `cloudId gpu_8x_a100`, lambdalabs' SXM4 box, which
+  `prime_session.py` now refuses before renting (§24). The netem-derived points
+  in `scripts/transport_curve.py` remain **upper bounds, +23% at the one point
+  measured both ways**.
+- **A registry credential is applied to whichever registry the image names.**
+  Attaching the GHCR credential to a `runpod/pytorch` image fails the pull with
+  `IMAGE_AUTH_ERROR` rather than being ignored — three dead pods on 2026-08-22.
+  Use `--registry-auth-name ''` for a public image (§24).
+- **DiLoCo's advantage on slow transport is reconstructed, not measured.**
+  `diloco_transport.csv` divides each transport's *measured* all-reduce by
+  H=500, which is sound — the outer sync moves the same tensor DDP all-reduces
+  every step — but no DiLoCo run has actually been timed over a slow transport.
 - **No spot-preemption recovery.** Per-step checkpoints with retention
   anchors, `--resume`/`--resume-from` and async off-box mirroring exist and
   survived a real pod termination; DCP/preemption hardening is deliberately

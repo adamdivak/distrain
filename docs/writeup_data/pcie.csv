@@ -1,0 +1,6 @@
+arm,gpus,mode,compiled,micro_batch,global_batch_seqs,step_ms,step_std_ms,time_to_3_28_hours,mfu_percent,source_file
+2 GPU compiled PyTorch DDP,2,ddp_torch,true,30,480,1745.4133333333334,19.624724444531935,4.847885533333334,46.92182552976945,out/runpod-pcie/session_out/bench-b480/20260822T193724Z/results.json
+2 GPU compiled interleaved,2,ddp_interleaved,true,30,480,1869.3266666666666,13.270077331385535,5.1920548166666665,43.81148643754079,out/runpod-pcie/session_out/bench-b480-il/20260822T193853Z/results.json
+2 GPU uncompiled interleaved,2,ddp_interleaved,false,30,480,2865.38,17.312967889499962,7.95859295,28.581891373569995,out/runpod-pcie/session_out/bench-b480-nc/20260822T194021Z/results.json
+2 GPU uncompiled PyTorch DDP,2,ddp_torch,false,30,480,2860.6,21.56399114926818,7.9453165,28.629651088582815,out/runpod-pcie/session_out/bench-b480-nc/20260822T194021Z/results.json
+1 GPU baseline,1,ddp_torch,true,30,480,2786.76,10.726726745222297,7.7402259,58.77648588611864,out/runpod-pcie/session_out/bench-1gpu-b480/20260822T194436Z/results.json

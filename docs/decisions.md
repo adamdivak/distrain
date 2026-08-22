@@ -120,6 +120,45 @@ Two mechanisms now exist so this fails loudly rather than silently:
 - `scripts/measure_roofline.py` compares its measurement against the recorded table
   and flags a gap over 2% (below that is run-to-run noise).
 
+**Correction (2026-08-22) — N is matmul parameters, not all parameters.** The
+counter took `N = GPT.num_params()`, every parameter the model owns. That was right
+while the head was tied — a tied `wte` *is* the output projection, and counting it
+once pays for that matmul. §13 untied the head (2026-08-09) and the counter kept
+summing both, so `6N` charged the GPU for the 38.6M-parameter `wte` **gather** as if
+it were a matmul. Untying changes no matmul shape and costs ~0 FLOPs/token; §13's
+"≈ +25% FLOPs/token" describes the counter, not the hardware.
+
+At the 124M shape this inflated model FLOPs/token from the true **854,770,176** to
+1,086,571,008 — **every MFU number measured after 2026-08-09 was 1.271× too high**:
+
+| Point | Reported | Corrected |
+|---|---|---|
+| 8×A100 NVLink, converged run (§14) | 79% | **62%** |
+| 8×A100 NVLink, batch-480 bench (§22) | 73.2% | **57.6%** |
+| 8×A100 TCP sockets (§22) | 19.5% | **15.3%** |
+| netem 40 / 10 Gbit lower bounds (§21) | 11.3% / 3.3% | **8.9% / 2.6%** |
+| 1×A100 baseline (§22) | 76.4% | **60.1%** |
+| aurora 3090, batch 8 (§13) | 82.6% | **65.0%** |
+
+The corrected figures are the plausible ones: an 8-GPU DDP step with all-reduces in
+it does not sustain 79% of a measured roofline, and a consumer 3090 does not sustain
+82.6%. Against the same measured 269.9 peak, llm.c's 8×A100 reproduction runs at
+~73%, so 62% is a believable PyTorch-vs-CUDA gap rather than near-parity. **No wall
+clock, token count, scaling efficiency or loss value changes** — only the throughput
+fraction, whose numerator was wrong.
+
+`GPT.num_params()` still reports all 162.2M parameters; the FLOPs N now comes from
+`GPT.flops_params()`, which drops `wte` unless it is tied. `TestCounterForModel`
+pins that tied and untied models of the same shape have identical FLOPs/token, which
+is the property that was violated. The 158% MFU above predates the untied head and
+is unaffected by this correction.
+
+**Why the existing guards missed it.** `warn_if_impossible()` only fires above 100%,
+and every inflated number stayed below it. A wrong *numerator* is not caught by a
+roofline check; the tell was that the numbers were implausibly good, which is a
+judgement call no assertion makes. The tied/untied equality test is the assertion
+that would have caught it.
+
 Known convention detail, deliberately left alone: `12*L*H*Q*T` assumes a full T x T
 attention matrix, while causal SDPA computes roughly half of it. PaLM and nanoGPT both
 count it this way, so keeping it preserves comparability with published MFU figures at
@@ -468,8 +507,9 @@ before anything is rented):
 - QK-norm (parameterless `rms_norm` over head_dim), ReLU² MLP.
 - Zero-init residual projections (`c_proj`) and the **untied**, zero-init
   `lm_head` (`use_weight_tying` in `GPTConfig`, default off). Untying adds ~39M
-  params ≈ +25% FLOPs/token; the MFU counter sees actual parameters, so the
-  accounting follows automatically.
+  params but **~0 FLOPs/token**: no matmul shape changes and `wte` becomes a pure
+  gather. The "≈ +25% FLOPs/token" claimed here originally was wrong, and the MFU
+  counter inherited it — corrected 2026-08-22, see §3.
 
 **Rotary embeddings — done (2026-08-10)**, completing the pack (the biggest
 single early lever, ÷1.43 together with the LR tuning). Early-record design:
@@ -549,7 +589,9 @@ tokens, expected to cross at or shortly before its end — versus ~10B for
 vanilla: the modernization delivered the estimated ~2.2×.
 
 **Budget arithmetic** (with N = 162.2M untied → 1.087e9 FLOPs/token by the §3
-convention): one converged run is 4.42e9 × 1.087e9 ≈ **4.8e18 FLOPs**. On
+convention *as it then stood*; the corrected N is 123.6M → 8.548e8, so the true
+figures are ~21% below this paragraph's): one converged run is 4.42e9 × 1.087e9
+≈ **4.8e18 FLOPs**. On
 8×A100 (312 TF dense each) at an assumed 35–45% MFU that is 1.3–1.7 h of node
 time — **$15–27** at RunPod's ~$10–15/h. Cross-check from aurora: the 3090 run
 took 19h at 84.7% MFU; an 8×A100 node has ~30× the peak, so ~1.4 h at 40% MFU.
@@ -570,7 +612,7 @@ what supersedes §13's bracket:
 
 - **Tokens-to-3.28 = 4.92B, measured**: first unsmoothed crossing at step
   9999 of a clean 10000-step trapezoid (val 3.2730), **3147.1 s** of
-  training time on 8×A100-SXM4 at ~79% MFU. The clean 9000-step schedule
+  training time on 8×A100-SXM4 at ~62% MFU (corrected, §3; logged as 79%). The clean 9000-step schedule
   ends at **3.2849 / 4.42B tokens** — short by 0.005: the §13 extrapolation
   (~3.26–3.29) was right and the 9000-step recipe sat on the wrong side.
   The converged-run recipe is now **10000 steps / 4.92B tokens**.
@@ -1126,7 +1168,8 @@ One 8×A100-SXM4-40GB rental (Prime Intellect / lambdalabs, $15.92/h, 31 min,
 $8.24), bought to close the two weakest bullets in the write-up.
 
 - **Time-to-3.28 on one A100 is 7.19 h, measured** — 2589.1 ms/step at global
-  batch 480 (30 seqs × 16 accumulation), 76.4% MFU against a measured 270.1
+  batch 480 (30 seqs × 16 accumulation), 60.1% MFU (corrected, §3; logged as
+  76.4%) against a measured 270.1
   TFLOP/s. Until now the study's single-GPU claim was a 3090 extrapolation
   (~21 h) and its A100 counterpart was pure arithmetic. Per §15 this is
   `9999 × step time`, not a converged run, and must be labelled that way.
@@ -1237,7 +1280,8 @@ outer-LR warmup at mu=0.9 tests the cold-start reading directly and would say
 whether mu=0.5 is a fix or a workaround. Not yet decided or run.
 
 **Do not read wall clock off aurora.** Arm A logged MFU 36.4% at 8.84 s/step
-against the reference's 84% at 7.67 s/step, because both gloo ranks share one
+against the reference's 84% at 7.67 s/step (28.6% and 66% under the §3
+correction; the ratio, which is the point here, is unchanged), because both gloo ranks share one
 3090. That is a shared-GPU artifact, not a DiLoCo cost. K=2 on aurora is a
 quality probe; throughput claims need the rented multi-GPU box.
 
@@ -1250,3 +1294,107 @@ final checkpoint evaluated at resume before any step at the raised LR. The 3.463
 at 6250 is run 2's LR jumping back to plateau, not a regression. Neither of the
 two 3090 reference runs reached 3.28 by step 6000 — unrelated to §22's measured
 7.19 h to 3.28, which is a converged A100 figure at a different step budget.
+
+## 24. The PCIe hole is a capacity problem, not a labelling one (2026-08-22)
+
+§22 left the PCIe point unmeasured and blamed a mislabelled offer. A day of
+hunting says the labelling half is now solved for free, and what remains is
+scarcity. Session log:
+[`sessions/2026-08-22-pcie-hunt.md`](sessions/2026-08-22-pcie-hunt.md). **$1.38.**
+
+**The fabric is checkable before renting, via `cloudId`.** §22 concluded there
+was no way to verify the interconnect before paying for it. There is: Prime
+Intellect's every 8×A100 "PCIe" offer carries `cloudId: gpu_8x_a100`, which is
+lambdalabs' 8×A100-**SXM4**-40GB instance type, listed as PCIe in all four
+regions it has. Lambda sells no 8-way A100 PCIe instance, so this is a catalogue
+mislabel rather than regional bad luck, and the box that failed the topology gate
+on 2026-08-21 was simply the shape working as advertised-incorrectly.
+`prime_session.py` now keys a `MISLABELLED_FABRIC` map on `cloudId`: pinning a
+socket *is* a fabric claim, so `--socket PCIe` matches nothing rather than
+renting a mesh. `--socket any` makes no claim and still lists it.
+
+**The topology gate stays anyway.** The `cloudId` check is a pre-filter over
+*known* lies; `nvidia-smi topo -m` is the check that catches the unknown ones,
+and it runs before any number is produced (`scripts/pcie_measure.sh`).
+
+**RunPod has the right hardware and no capacity.** `NVIDIA A100 80GB PCIe` is
+its own GPU type there, distinct from `NVIDIA A100-SXM4-80GB`, so the card is the
+PCIe part and the catalogue cannot lie about it. At $11.12/h secure it is *half*
+the SXM4 anchor's price. Confirmed empty at the **deploy call** — not the
+advisory precheck — at 8 and 4 GPUs on both tiers.
+
+**A registry credential is handed to whichever registry the image names.** Four
+community pods died before any of them ran, and three died of our own bug:
+`_ensure_template` attached the account's GHCR credential to a `runpod/pytorch`
+image, and RunPod's pull failed `IMAGE_AUTH_ERROR: unauthorized` rather than
+ignoring the unused credential. `--registry-auth-name ''` now builds a
+credential-free template for public images, with a `-public` name suffix so
+template reuse cannot silently restore the authenticated one. Two further
+corollaries are enforced in code: `desiredStatus: RUNNING` describes the *pod*,
+not the container, so `runtime.uptimeInSeconds` is the field to watch; and
+community hosts expose no public port, so `up --ssh-proxy` reaches them through
+`ssh -tt <podHostId>@ssh.runpod.io` instead. Whether community capacity can run
+this workload is **still unknown** — the one pod that used the right credential
+was abandoned mid-pull.
+
+**The measurement is now automated rather than scheduled.** An 8-GPU PCIe
+opening is brief and random, so `scripts/pcie_hunt.sh` probes by attempting the
+deploy (a rejected deploy creates nothing and costs nothing), and on success
+guards, measures, tears down and verifies without a human. The one path that is
+not free — a deploy that succeeds and then fails to boot — backs off 30 minutes
+instead of retrying a broken host in a loop.
+
+**What the write-up should say.** The PCIe bar is missing because the SKU was
+out of stock, at a venue that prices it *below* the NVLink box we did rent. The
+draft's thesis is that capacity, not price, is the binding constraint; the
+transport point it most wants is itself an instance of that.
+
+## 25. PCIe measured: what you rent has no P2P at all (2026-08-22)
+
+§24's hunt found no 8-GPU PCIe capacity, but a **2×A100 80GB PCIe secure box**
+appeared late and was measured — the first genuine PCIe fabric here. Session log:
+[`sessions/2026-08-22-pcie-hunt.md`](sessions/2026-08-22-pcie-hunt.md) §5. $0.59.
+
+**The topology gate passed, and then the interesting part failed.** `topo -m`
+shows `PHB` between the two GPUs and no `NV#`, so the fabric is real PCIe. But
+`nvidia-smi topo -p2p r` reports **`CNS`, chipset not supported**, and NCCL
+routes every channel `via SHM/direct/direct` — through **host memory**. This is
+not a fallback we selected with `NCCL_P2P_DISABLE`; it is what the node offers.
+**The write-up must not call this PCIe P2P.** Its existing caveat — that the
+forced-socket control "is not a substitute for direct GPU-to-GPU PCIe P2P" —
+understates the case: on a rentable A100 PCIe node, direct P2P is not available.
+
+**Effective all-reduce bandwidth: 2.29 GB/s**, against NVLink's 151 and the
+forced-TCP/loopback control's 0.92. That the SHM path lands within a few percent
+of the 2×3090's socket+SHM figure (2.29 GB/s, §6) is worth noting and is not yet
+explained; both are host-memory staging, so a shared ceiling is plausible.
+
+**Projected to 8 ranks: 826 ms/step, 2.29 h to 3.28** — 2.44× slower than
+NVLink, 1.54× faster than forced TCP, 3.1× faster than one A100. So a badly
+connected multi-GPU box is a tax, not a dealbreaker; but at RunPod's prices
+($11.12/h PCIe vs $22.32/h SXM4) the NVLink box is *both* faster and slightly
+cheaper per convergence ($21.0 vs $25.5), which is the answer to the draft's
+"should you rent this anyway" question. The projection is an **optimistic
+bound**: an 8-GPU PCIe server's ring crosses more host bridges than this 2-GPU
+box's does.
+
+**Compilation is worth 1.64×; overlap is worth nothing.** §21 predicted the
+compile-vs-overlap lead would dissolve as bandwidth fell. On this fabric the
+*overlap* difference dissolves — uncompiled `ddp_interleaved` 2865.4 ms vs
+uncompiled `ddp_torch` 2860.6 ms, within 0.2% — while compilation stays
+decisive, and among compiled modes `ddp_torch` leads interleaved by 7.1%. §21's
+netem result predicted the ranking would flatten; on hardware only half of it
+flattened, and the half that matters for a config choice (compile) did not.
+
+**The A100 PCIe part throttles on long large GEMMs.** Measured 256.5 TFLOP/s at
+n=4096 falling to 223.9 at n=16384, where both SXM4 cards peak *at* n=16384
+(269.9 / 270.1). The 312.0 datasheet figure `mfu.py` carried as `UNVERIFIED` is
+22% above the best sustained rate; `("A100 80GB PCIe", 256.5)` is now recorded
+ahead of the generic `"A100"` pattern. `measure_roofline.py` was also printing
+`16384^3` into its suggested provenance string unconditionally — right on every
+card measured so far, wrong on this one — and now names the size the peak came
+from.
+
+**Scaling at 2 ranks over this fabric is 79.8%** (2786.8 ms → 1745.4 ms), at the
+same global batch 480 and micro-batch 30 as the NVLink and TCP rows. Not
+like-for-like against 8-rank numbers, but same box, same chunking.

@@ -1,0 +1,63 @@
+series,step,tokens_billions,val_loss,train_time_s,status,source_file,notes
+"DDP (8xA100, NVLink)",0,0.0,10.8125,23.9,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",250,0.12288,5.3846,101.5,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",500,0.24576,4.5151,179.5,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",750,0.36864,4.1408,257.4,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",1000,0.49152,3.9756,335.2,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",1250,0.6144,3.8609,413.0,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",1500,0.73728,3.7932,490.7,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",1750,0.86016,3.7302,568.5,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",2000,0.98304,3.6928,646.3,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",2250,1.10592,3.6562,724.1,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",2500,1.2288,3.6328,802.0,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",2750,1.35168,3.6016,879.8,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",3000,1.47456,3.5827,957.6,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",3250,1.59744,3.5641,1035.4,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",3500,1.72032,3.5556,1113.2,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",3750,1.8432,3.5396,1191.0,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",4000,1.96608,3.5321,1268.8,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",4250,2.08896,3.518,1346.8,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",4500,2.21184,3.5039,1424.6,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",4750,2.33472,3.5065,1502.4,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",5000,2.4576,3.4915,1580.2,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",5250,2.58048,3.4792,1658.0,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",5500,2.70336,3.4799,1735.8,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",5750,2.82624,3.4697,1813.7,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",6000,2.94912,3.4583,1891.5,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",6250,3.072,3.4581,1969.4,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",6500,3.19488,3.4504,2047.3,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",6750,3.31776,3.4463,2125.1,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",7000,3.44064,3.4403,2202.9,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",7250,3.56352,3.4332,2280.7,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",7500,3.6864,3.4287,2358.6,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",7750,3.80928,3.4256,2436.4,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",8000,3.93216,3.4236,2524.9,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",8250,4.05504,3.4238,2602.7,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",8500,4.17792,3.4176,2680.5,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",8750,4.3008,3.411,2758.3,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",9000,4.42368,3.4101,2836.1,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",9250,4.54656,3.377,2913.9,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",9500,4.66944,3.3376,2991.7,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",9750,4.79232,3.3006,3069.6,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DDP (8xA100, NVLink)",9999,4.91470848,3.273,3147.1,measured,out/runpod-8gpu/session_out/train.log + out/runpod-8gpu/session_out/train_ext.log,Clean 10000-step trapezoid; the step-8000 checkpoint joins the two logs.
+"DiLoCo (8xA100, NVLink)",0,0.0,10.8251,10.3,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",500,0.24576,6.5805,172.7,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",1000,0.49152,5.0144,336.9,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",1500,0.73728,4.4256,498.9,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",2000,0.98304,4.1865,661.2,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",2500,1.2288,4.0396,823.0,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",3000,1.47456,3.9361,984.4,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",3500,1.72032,3.8695,1146.3,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",4000,1.96608,3.8204,1308.5,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",4500,2.21184,3.7797,1469.9,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",5000,2.4576,3.7481,1631.3,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",5500,2.70336,3.7219,1792.9,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",6000,2.94912,3.6989,1954.2,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",6500,3.19488,3.6806,2116.1,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",7000,3.44064,3.6634,2278.5,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",7500,3.6864,3.6478,2440.9,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",8000,3.93216,3.6372,2602.5,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",8500,4.17792,3.6272,2764.7,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",9000,4.42368,3.6152,2926.6,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",9500,4.66944,3.5603,3088.7,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."
+"DiLoCo (8xA100, NVLink)",9999,4.91470848,3.5183,3250.3,measured,out/prime-diloco/session_out/train.log,"K=8, H=500, outer_lr=0.7, outer_momentum=0.5."

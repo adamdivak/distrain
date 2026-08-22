@@ -1,5 +1,10 @@
 # 2026-08-19 — halving outer momentum removes the DiLoCo excursion
 
+> **MFU correction (2026-08-22).** Every MFU figure in this log was computed with
+> the pre-correction numerator (an untied `wte` charged 6N as if it were a matmul)
+> and is **1.271× too high** — divide by 1.271. Wall clock, tokens and losses are
+> unaffected. See [`../decisions.md`](../decisions.md) §3.
+
 Arm A of the §19 probe (`diloco-b480-mom05`): the 2026-08-18 baseline with one
 variable changed, outer momentum 0.9 → 0.5. Same seed, same 6000-step trapezoid,
 same B=480 / H=500 / outer lr 0.7. Nothing was rented; $0 spent.

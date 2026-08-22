@@ -251,6 +251,21 @@ def in_stock(offer: dict) -> bool:
     return status not in ("unavailable", "none", "out_of_stock", "")
 
 
+# cloudId -> what the machine actually is, when the `socket` field is wrong.
+# PI's socket is provider metadata, not a fabric guarantee: `gpu_8x_a100` is
+# lambdalabs' 8xA100-SXM4-40GB node and is listed as PCIe in every region it has.
+# Renting it cost a session once (decisions.md §22, 2026-08-21), and §22 concluded
+# there was no way to check the fabric before renting. The cloudId is that check.
+MISLABELLED_FABRIC: dict[str, str] = {
+    "gpu_8x_a100": "lambdalabs 8xA100-SXM4-40GB on a full NV12 mesh",
+}
+
+
+def fabric_lie(offer: dict) -> str | None:
+    """What the offer really is, when its advertised socket is known to be wrong."""
+    return MISLABELLED_FABRIC.get(str(offer.get("cloudId") or ""))
+
+
 def matching_offers(availability: dict, gpu_type: str, gpu_count: int,
                     socket: str | None = None,
                     provider: str | None = None) -> list[dict]:
@@ -266,8 +281,13 @@ def matching_offers(availability: dict, gpu_type: str, gpu_count: int,
         for offer in entries or []:
             if int(offer.get("gpuCount") or 0) != gpu_count:
                 continue
-            if socket and socket != "any" and str(offer.get("socket") or "") != socket:
-                continue
+            if socket and socket != "any":
+                if str(offer.get("socket") or "") != socket:
+                    continue
+                # Pinning a socket *is* the fabric claim, so an offer known to
+                # misreport its own is not a match for it. `any` makes no claim.
+                if fabric_lie(offer):
+                    continue
             if provider and str(offer.get("provider") or "") != provider:
                 continue
             if not in_stock(offer):
@@ -467,8 +487,13 @@ def cmd_avail(api: PrimeAPI, args: argparse.Namespace) -> int:
     if not offers:
         others = matching_offers(availability, args.gpu_type, args.gpu_count, socket="any")
         print("  no in-stock offers for that shape.")
-        if others:
-            sockets = sorted({str(o.get('socket')) for o in others})
+        for cloud_id, lie in sorted({str(o.get("cloudId")): fabric_lie(o)
+                                     for o in others if fabric_lie(o)
+                                     and str(o.get("socket") or "") == args.socket}.items()):
+            print(f"  ({cloud_id} is listed as {args.socket} but is {lie} -- excluded)")
+        sockets = sorted({str(o.get("socket")) for o in others
+                          if not fabric_lie(o) and str(o.get("socket") or "") != args.socket})
+        if sockets:
             print(f"  (in stock at other sockets: {', '.join(sockets)} -- "
                   "not interchangeable for the anchor comparison)")
         return 1

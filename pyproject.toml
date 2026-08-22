@@ -21,6 +21,11 @@ dev = [
 data = [
     "huggingface-hub",
 ]
+plots = [
+    "plotly>=6.3,<7",
+    "kaleido>=1.0,<2",
+    "pandas>=2.3,<4",
+]
 
 [build-system]
 requires = ["hatchling"]

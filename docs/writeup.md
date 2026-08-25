@@ -10,11 +10,11 @@ Karpathy started the now-famous nanogpt challenge, which is about training a sma
 
 ![](plots/loss_curves.svg)
 
-This way, my baseline ended up being ~7h/$14 on an A100 and ~21h/$4 minutes on a 3090 card in my desktop. This latter cost is misleading, as it only includes raw electricity but not capital costs (i.e. what I paid for the card). Spending an extra $11 allows a baseline run in one third of a time, without the noise and heat in my room.
+This way, my baseline ended up being ~7h/$14 on an A100 and ~21h/$4 on a 3090 RTX card in my desktop. This latter cost is misleading, as it only includes raw electricity but not capital costs (i.e. what I paid for the card). Spending an extra $11 allows a baseline run in one third of a time, without the noise and heat in my room.
 
 ![](plots/time_and_cost_baseline.svg)
 
-In order to make measurements across different world sizes consistent, it is important that the data loader is deterministic and yields batches in a fixed order regardless of the number of ranks. Most measurements were done on A100 machines, as opposed to the latest H100, as it had slightly better availability and yielded a little lower total cost.
+In order to make measurements across different world sizes consistent, it is important that the data loader is deterministic and yields batches in a fixed order regardless of the number of ranks. Most measurements were done on A100 machines, as opposed to the latest H100, as it had slightly better availability and yielded a little lower total cost. Experiment details are collected in [Experiment setup](#a1-experiment-setup).
 
 # Ideal setup: DDP over high-speed interconnect
 
@@ -28,14 +28,13 @@ Using the ideal setup of 8xA100 GPUs with NVLink interconnect, the model can be 
 
 ![](plots/time_and_cost_scaling.svg)
 
-A naive implementation of DDP would introduce a long bottleneck after the local computation has finished on each rank, and before the gradients are received from all other ranks, which is the biggest no-no in distributed computing, leading to low GPU utilization and inflated costs. DDP actually has a couple of tricks to reduce this gap, which are explained in detail (with measurements) in Appendix 1. 
+A naive implementation of DDP would introduce a long bottleneck after the local computation has finished on each rank, and before the gradients are received from all other ranks, which is the biggest no-no in distributed computing, leading to low GPU utilization and inflated costs. DDP actually has a couple of tricks to reduce this gap, which are explained in detail (with measurements) in [What makes DDP go brr](#a3-what-makes-ddp-go-brr). 
 
 # DDP over slower interconnect
 
-8xA100 over NVLink is the ideal setup.. if you can get it. Turns out, despite showcasing per-GPU prices on their homepage, most providers barely have any capacity of proper 8-GPU clusters available. In a brief period of 2 days, RunPod only had 8-GPU capacity <3% of the time, while PrimeIntellect, which is itself a marketplace collecting offers from multiple providers, only had it at almost twice the usual price.
+8xA100 over NVLink is the ideal setup.. if you can get it. Turns out, despite showcasing per-GPU prices on their homepage, most providers barely have any capacity of proper 8-GPU pods available. In those few days I was trying to run these experiments, RunPod only had 8-GPU capacity <3% of the time, while PrimeIntellect, which is itself a marketplace collecting offers from multiple providers, only had it at almost twice the usual price. As you can see on the screenshot below, most of those GPUs didn't actually have an 8-GPU pod available, and even the ones that had were in low stock.
 
-Image: picture of 'unavailable' texts from RunPod, PrimeIntellect, etc.
-![](plots/capacity_availability.svg)
+![](images/runpod_gpu_availability.png)
 
 If capacity becomes available, it is sometimes using the slower PCIe interconnect between cards, or maybe even the required number of GPUs spread in multiple pods. Should you rent this anyway, or does the slow communication destroy all benefits of having multiple cards and you would be just wasting money? This of course heavily depends on the specific use case you're working with (especially the size of the model and how long processing a single batch takes on the given GPU), so this only gives an indication for this particular problem (very small model). In order to better understand this, I ran the same workload with DDP on 8xA100 cards, with increasingly slow interconnects between the cards. The fastest is still a full NVLink, while the second most common option would be communication through the host's PCIe lanes. Next I included a setup where communication was forced to go through the local TCP interface, so it included the hosts' network stack as well, but did not actually leave the NIC. I also added two simulated cases, where the network connection speed was artificially limited to 40Gbit/s and 10GBit/s respectively, to simulate the effect of renting A100s in different boxes, connected using traditional network connections.
 
@@ -47,7 +46,7 @@ What happens in these cases is that the GPUs spend most of their time waiting fo
 
 ![](plots/transport_mfu.svg)
 
-Plotting the total time to a converged run shows us that it is almost completely linear in the available communication bandwidth. This is hardly surprising, given that a compute batch with a batch size of 64 is around 43ms, and the communication overheard goes from ~7ms on NVLink to over 1000ms over TCP.
+Plotting the total time to a converged run shows us that it is almost completely linear in the inverse of the available communication bandwidth. This is hardly surprising, given that a compute batch with a batch size of 64 is around 43ms, and the communication overheard goes from ~7ms on NVLink to over 1000ms over TCP.
 
 ![](plots/transport_sensitivity.svg)
 
@@ -65,7 +64,8 @@ DiLoCo architecture. Image from the [DiLoCo paper](https://arxiv.org/abs/2311.08
 
 ![](plots/diloco_k_penalty.svg)
 
-As we can see, under the same 10k steps training regime, DiLoCo has worsened the validation result by 0.245 points in the end (3.525 instead of 3.28 validation loss). While I didn't run experiments to find the exact step count at which DiLoCo achieves the desired 3.28 validation loss, looking at the trend it looks like that it tracks the original validation loss curve by taking roughly three times as many steps. Luckily it barely adds any overhead compared to a non-distributed training in terms of training time or total cost (for the same step count with worse results), so what we can conclude from this is that it allows training a model that is consistently above by 0.25 val loss at the same steps, or that it trains a model to the same quality at 3x the price. (All numbers in the text are quoted for the K=8 case. The difference is much smaller when only using 2 workers.)
+As we can see, under the same 10k steps training regime, DiLoCo has worsened the validation result by 0.245 points in the end (3.525 instead of 3.28 validation loss). While I didn't run experiments to find the exact step count at which DiLoCo achieves the desired 3.28 validation loss, looking at the trend it looks like that it tracks the original validation loss curve by taking roughly three times as many steps. Luckily it barely adds any overhead compared to a non-distributed training in terms of training time or total cost (for the same step count with worse results).
+In this untuned run, DiLoCo had not reached the target loss after the original 10k-step budget. Extrapolating the observed curve suggests roughly 3× the steps, but that estimate needs a measured target-loss run. (All numbers in the text are quoted for the K=8 case. The difference is much smaller when only using 2 workers.)
 
 We must not forget however that DiLoCo introduced three new parameters to tune: the outer step size H, outer learning rate and moment. Originally I planned to use the hyperparameters reported in the publication, but those quickly turned out to be unsuitable for this model. We could say that in order to tune this properly, now we need to spend additional money on figuring out reasonable values for these parameters, on top of all the other parameters you use for your problem, which means additional cost and uncertainty. The hyperparameters used in my study are simple guesses, so I am certain one could reduce the difference with a bit of hyperparameter tuning.
 
@@ -78,8 +78,14 @@ If you are forced to accept suboptimal pods, or GPUs over multiple pods with a r
 ![](plots/diloco_transport.svg)
 
 # Conclusion
-...
 
+I set out both to answer a practical question about scarce GPU capacity and to gain a better understanding of what distributed training actually does underneath the abstractions. Reimplementing the core data-parallel operations exposed several details I had previously known only in theory: the ordering of collectives, gradient bucketing and overlap, the interaction with the compiler, and how quickly communication costs turn into idle GPU time. If you are interested in exploring the implementation, [ddp_synchronizer](../src/distrain/ddp_synchronizer.py) is a good place to start. Training the same model on the same data across 1/2/8 GPUs, pods from different providers, and two data-parallel algorithms then connected those implementation details to their practical and economic consequences.
+
+For this workload, eight NVLink-connected A100s gave nearly eightfold speedup at approximately the same total cost. Slower within-host interconnects still reduced wall-clock time, but at a substantial cost premium, while DDP over 40 Gbit/s became slower and more expensive than a single GPU. DiLoCo largely removed the network bottleneck, but introduced an optimization penalty: the untuned eight-worker run did not reach the target loss within the original budget, and its apparent requirement for roughly three times as many steps remains an extrapolation rather than a measured result. 
+
+The practical lesson is that GPU count and hourly price are insufficient when evaluating scarce capacity: topology can determine whether additional GPUs are an acceleration or merely additional cost. DiLoCo may make poorly connected hardware viable, especially after the ordinary training recipe has already been tuned, but these experiments do not yet establish its true crossover point. More broadly, implementing and measuring these methods showed me that even the supposedly simplest form of distributed training contains a surprising amount of machinery, and that its rules of thumb only become useful when tied to the actual ratio of computation to communication.
+
+When renting distributed hardware, you are not just renting GPUs—you are renting the links between them.
 
 # What's missing 
 
@@ -88,10 +94,20 @@ If you are forced to accept suboptimal pods, or GPUs over multiple pods with a r
 - Hyperparameter search for DiLoCo was not performed, so the related conclusions are weaker then they could be
 
 # Appendix
-## A0. How fast are those GPUs, really?
+## A1. Experiment setup
+
+ - Model size
+  - Tokens and target validation loss
+  - Global batch, microbatch, and accumulation
+  - What remains constant as world size changes
+  - A100 type and hourly price
+  - Meaning of “step” in the DDP and DiLoCo comparisons
+  - Whether the limited connections are real or simulated
+
+## A2. How fast are those GPUs, really?
 In order to calculate Model Flops Utilization (MFU), the most widely used metric when measuring distributed algorithms, we first need to know the actual maximum flops for the given GPU. The obvious move is to look it up in the datasheet, but that gave me a bit of a headache. A vendor spec sheet quotes several different numbers for what looks like the same thing: tensor core versus plain shader rates, dense versus 2:4-sparse figures (a factor of two), and for FP16/BF16 there are separate rates depending on whether the accumulation happens in FP16 or FP32 (another factor of two on consumer cards). My first attempt entered the RTX 3090 at 35.6 TFLOP/s, which is that card's FP32 *non-tensor* rate, and the training loop then cheerfully reported an MFU of 158%. The only reason I caught it is that anything above 100% is impossible.
 
-So I stopped citing and started measuring: `scripts/measure_roofline.py` runs a large square bf16 GEMM at a few sizes and reports the best sustained throughput. That is a lower bound on the true peak rather than the peak itself, but it is what the hardware demonstrably does, which is the honest denominator for MFU. Every MFU number in this post is computed against a measured peak for that exact card, and the difference from the datasheet is not small:
+So I stopped citing and started measuring: `scripts/measure_roofline.py` runs a large square bf16 GEMM at a few sizes and reports the best sustained throughput. That is a lower bound on the true peak rather than the peak itself, but it is what the hardware demonstrably does, which is the honest denominator for MFU. Every MFU number in this post is computed against a measured roofline for that exact card, and the difference from the datasheet is not small:
 
 | Card | Measured bf16 | Datasheet dense | Measured / datasheet |
 |---|---|---|---|
@@ -104,7 +120,7 @@ The two A100 SXM4 cards land at ~86.5% of their quoted 312 TFLOP/s, which is rou
 
 All this is really just to say that even the seemingly trivial question of 'what is the fastest this card can go that I'm comparing again' holds more than what one would expect, making it easy to derive incorrect conclusions from measurements across different providers, pods and GPUs.
 
-## A1. What makes DDP go brr
+## A3. What makes DDP go brr
 
 Data parallelism works by dividing the batch into K distinc parts, each rank (GPU) processing a single part of this, then averaging using the `all_reduce` communication primitive to share the partial gradients between all ranks, and using this global gradient to perform identical updates on the model parameters on each rank. In order to better understand the trade-offs and gain a bit more familiarity, I've implemented them by hand, using just the basic communication primitives like `all_reduce` and `broadcast`. While describing each algorithm fully in detail is well out of scope for this post, you can find fantastic descriptions like the [Ultrascale Playbook](https://huggingface.co/spaces/nanotron/ultrascale-playbook).
 
@@ -125,6 +141,6 @@ There are a few low-level details we need top pay attention to though. First of 
 Above is a plot of how much slower is each version of DDP compared to the fastest. On the left, we can see that while using NVLink, the difference is negligible, virtually all methods perform identically. On a slower interconnect, shown on the right, the difference become more pronounced. However, we can also see that the actual method only makes a difference if there is enough computation happening under which communication can be hidden. As the microbatch increases (x axis to the right), so does the time it takes to process the batch. At the microbatch size of 8, the total computation takes only 49.5ms against a 649 MB all-reduce that takes over a second. The collective is 96% of the step and every mode issues the same one, so the entire implementation question lives in the remaining 4%. Naive is the exception because it changes the communication itself - 75 small collectives instead of 14 fused ones, which costs ~400 ms - while the other three sit within one compute-time of each other and their ranking is decided by host jitter. This leads to the conclusion that it is best to maximize the microbatch size, but that is something you'd be doing anyway. The general more lesson is the same we have also seen previously, meaning that what matters is the ratio of compute to communication, and every "X is faster than Y" claim about distributed training is really a claim about where you sit
 on that axis.
 
-## What would make DiLoCo go brr
+## A4. What would make DiLoCo go brr
 
 DiLoCo in the current tests is completely untuned. However, the end of the training looks particularly suspicious and worth a bit of extra discussion. The training currently uses a trapezoidal LR schedule, so there is a warmdown period in the end, as per one of the entries in modded-nanogpt. This is only applied to the original optimizer, not the outer optimizer utilized by DiLoCo. The outer optimizer uses Nesterov momentum, so it keeps making fairly large steps influenced by the previous gradient directions even when the incoming gradients keep getting smaller. Most likely attenuating the momentum to zero would significantly reduce the overshoot here, and help the DiLoCo version keep close to the validation loss of the baseline, without the weird divergence in the last 1k steps.

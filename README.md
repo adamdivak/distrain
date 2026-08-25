@@ -1,463 +1,172 @@
 # distrain
 
-A distributed-training scaling study: a nanoGPT-style pretraining loop with a
-distributed layer written from scratch, used to measure how training scales from
-1 GPU to multiple GPUs and multiple nodes — on **both** raw throughput and
-time-to-target-loss, and to quantify where and why the two diverge.
+A distributed-training scaling study. Read [PROJECT.md](PROJECT.md) for technical details and how to run. Below is the summary writeup.
 
-- [`project_brief.md`](project_brief.md) — goals, tracks, budget, providers. The
-  original statement of intent, deliberately left unedited.
-- [`docs/decisions.md`](docs/decisions.md) — everything settled since the brief,
-  including the metric definitions that must not drift once runs cost money.
-- [`docs/writeup.md`](docs/writeup.md) — the article draft; its collected numbers,
-  rendered figures, and remaining plot gaps are indexed in
-  [`docs/writeup_data/README.md`](docs/writeup_data/README.md).
-- [`reference/PROVENANCE.md`](reference/PROVENANCE.md) — vendored upstream code, and
-  the exact definition of the 3.28 target.
+# GPU clusters are cheap, but unavailable... what now?
 
-## Status
+You've got a great idea for a new model to train or fine-tune. You've been trying to use a single GPU for as long as possible to avoid dealing with all the difficulties of distributed training, but given the data and model sizes, it is not possible to continue doing that. So you look around and realize that renting a decent multi-GPU rig is not even that expensive, with a plethora of providers and marketplaces pooling their offers and advertising eight previous-generation GPUs (A100s) for as little as $16 an hour. That's certainly affordable even for learning or play purposes, so you decide to go ahead and rent one... except that as soon as you actually try to reserve it, you realize there is practically no stock left. Renting a single GPU of almost any caliber is easy; renting an 8-GPU pod with a fast interconnect takes a lot of patience and luck (or watcher scripts), and getting a cluster with more than one pod is nearly impossible. No wonder, given reports that on-demand GPU capacity is effectively sold out and that critical upstream capacity remains constrained through at least 2027 [1](https://www.apollo.com/institutional/insights-news/insights/2026/06/growing-compute-shortage).
 
-**The scaling headline exists end to end**
-([session log](docs/sessions/2026-08-21-prime-single-gpu-scaling.md)): on one
-A100 the 162M model reaches 3.28 in **7.19 h** (2589.1 ms/step at global batch
-480, 60.1% MFU); on 8 of them over NVLink, **0.94 h** — **7.66×, 95.8% scaling
-efficiency**, measured on one box at one micro-batch. Forcing NCCL off P2P and
-shared memory and onto TCP/loopback costs **3.8×** (3.38 h) — a tax, not a
-dealbreaker, since eight badly-connected GPUs still beat one well-connected one
-by 2.1×. §14's 0.88
-scaling figure turns out to be an artefact of the bench's 8-seq default batch:
-**scaling efficiency is a function of the batch and must be quoted with it**
-(`docs/decisions.md` §22).
+Any distributed training guide will start by telling you how communication-bound the whole process is, so the question is: what can you do with the leftover capacity you can scrape together? Is a pod with a slower interconnect a waste of money? How much performance can we expect from the most common distributed algorithms using what we can find on the market right now? As a guiding task, I picked the nanoGPT speedrunning benchmark, which is large enough to benefit from multiple GPUs, small enough to finish in a reasonable time, and widely tested and studied. Part I focuses on data parallelism on a single pod, while Part II will focus on other parallelization techniques and multi-pod clusters.
 
-**The DDP-vs-DiLoCo comparison exists**
-([session log](docs/sessions/2026-08-21-prime-diloco-k8.md)): on 8×A100-SXM4,
-at identical global batch and an identical 4.92B-token budget, DDP reaches
-**3.2730** in 3147.1 s while untuned DiLoCo (K=8, H=500, outer lr 0.7, μ=0.5)
-reaches **3.5183** in 3250.3 s — **+0.245 val loss and no wall-clock saving**
-on a full-NVLink fabric, which is the transport where DiLoCo has nothing to buy.
-DiLoCo's tokens-to-3.28 remains unmeasured and is now bounded as unreachable
-inside this corpus (~24,900 steps needed vs a ~11,190-step wrap). The netem
-sweep in the same session found that the compile-vs-overlap lead **dissolves**
-rather than flipping as bandwidth falls: 0.12% spread across modes at 10 gbit.
-See [`docs/decisions.md`](docs/decisions.md) §21.
+# Setup and baseline
 
-**The first Track A number exists** ([session log](docs/sessions/2026-08-16-runpod-8xa100.md)):
-on a rented 8×A100-SXM4 node, the 124M/162M model reached the 3.28 val-loss
-target at **4.92B tokens / 3147.1 s of training time** (clean 10000-step
-trapezoid, first unsmoothed crossing, ~62% MFU against the measured 269.9
-TFLOP/s roofline, `ddp_torch --compile`). A clean 9000-step schedule ends
-measurably short at 3.2849 / 4.42B tokens.
+Karpathy started the now-famous [nanoGPT](https://github.com/karpathy/nanogpt) challenge, which is about training a small GPT-2-like model to a given validation loss as fast as possible on fixed hardware. This led to [modded-nanogpt](https://github.com/kellerjordan/modded-nanogpt), a community speedrunning competition in which a series of patches took the original training time from 45 minutes on 8× H100s (90 minutes on 8× A100s) down to 1.23 minutes. This is a perfect starting point for our distributed training measurements: the model and dataset are small enough that I could run tests on my desktop and keep cloud measurements affordable, large enough to benefit from multiple GPUs and produce meaningfully measurable runtimes, and well known enough that anyone can easily understand what is being measured. To keep the model and code simple and easy to understand, I did not use the fastest entry from the speedrunning leaderboard, as some of its optimizations seemed rather low-level or specific to this model, or I simply had no idea what they were doing. Instead, I chose to start from the original GPT-2 baseline and apply some of the most widely understood and tested optimizations from the first leaderboard entries, such as using rotary embeddings, using ReLU², zero-initializing projections, applying QK-norm, and untying the embedding and output head. However, I decided to skip the Muon optimizer for now, so my runs are considerably slower than the leaderboard suggests. While Muon was integral to the nanoGPT speedrunning competition, it is less widely used, and I wanted to keep the better-known AdamW optimizer.
 
-Single-device training works end to end on CPU, MPS and CUDA; the three hand-rolled
-DDP modes are correct (cursor-ordered launches, measured-order bucket rebuild) and
-PyTorch's own DDP is wired in as a fourth, baseline mode. All four are NCCL-proven
-and timed on a rented 2×3090 ([session log](docs/sessions/2026-08-09-runpod-2x3090.md))
-and at 8 ranks on the A100 node. The compile × overlap question resolved
-per-transport: over NVLink every compiled config beats every uncompiled one
-(`ddp_torch --compile` fastest); over the 3090s' Socket+SHM, uncompiled
-interleaved wins — overlap buys more than compilation only once communication
-dominates.
+![](docs/plots/loss_curves.svg)
 
-The model is no longer vanilla GPT-2: rotary embeddings (replacing `wpe`),
-QK-norm, ReLU², zero-init residual projections, untied zero-init head, trapezoid
-LR at 0.0018 — the early modded-nanogpt improvements, adopted because the vanilla
-architecture measured val 3.50 after 3B tokens (~10B needed to 3.28, 3× the
-assumed cost). See [`docs/decisions.md`](docs/decisions.md) §13. 125 tests
-pass; the multi-rank ones run on gloo/CPU so they are exercisable without a GPU.
+This way, my baseline ended up at ~7 h/$14 on an A100 and ~21 h/$4 on the RTX 3090 in my desktop. The latter cost is misleading, as it includes only electricity and not the capital cost (i.e., what I paid for the card), but I already had it at hand. Spending an extra $11 allows a baseline run in one-third the time, without the noise and heat in my room.
 
-Validation runs on rank 0 only and the loss is broadcast, so every rank tests the same
-value against the 3.28 target without N ranks paying for the same number.
+![](docs/plots/time_and_cost_baseline.svg)
 
-| Piece | State |
+To make measurements across different world sizes consistent, the data loader must be deterministic and yield batches in a fixed order regardless of the number of ranks. Most measurements used A100 machines rather than newer H100s, as the A100s had slightly better availability and yielded a somewhat lower total cost. Experiment details are collected in [Experiment setup](#a1-experiment-setup).
+
+# Ideal setup: DDP over high-speed interconnect
+
+The ideal setup for training on multiple GPUs is an 8-GPU pod with a high-speed NVLink fabric between the cards. The simplest approach to using multiple cards in parallel is data parallelism: each GPU has an identical copy of the model, calculates gradients independently for a different subset of the data, then shares the gradients with all other GPUs and performs the same parameter update using the global batch gradient. As we can see from this very short description, this requires transferring roughly one model's worth of gradients between each pair of GPUs before each optimizer step, which shows why a fast interconnect is important.
+
+![](docs/images/ddp_naive_flow.png)
+
+Schematic of data parallelism (in a naive implementation). Image taken from the [Ultrascale Playbook](https://huggingface.co/spaces/nanotron/ultrascale-playbook?section=data_parallelism).
+
+Using the ideal setup of 8× A100 GPUs with an NVLink fabric, the model can be trained in less than an hour, resulting in a nearly linear speedup. What's even better is that it costs almost exactly the same, which makes using DDP a no-brainer in this case.
+
+![](docs/plots/time_and_cost_scaling.svg)
+
+A naive implementation of DDP would introduce a long bottleneck after the local computation finishes on each rank but before the gradients are received from all other ranks. This is the biggest no-no in distributed computing, leading to low GPU utilization and inflated costs. DDP actually has a couple of tricks to reduce this gap, which are explained in detail (with measurements) in [What makes DDP go brr](#a3-what-makes-ddp-go-brr).
+
+# DDP over slower interconnect
+
+8× A100s over NVLink is the ideal setup... if you can get it. It turns out that despite showcasing per-GPU prices on their homepages, most providers barely have any proper 8-GPU pods available. During the few days when I was trying to run these experiments, RunPod had an 8-GPU configuration available less than 3% of the time, while PrimeIntellect, itself a marketplace collecting offers from multiple providers, had one available only at almost twice the usual price. As you can see in the screenshot below, most of the listed GPUs did not actually have an 8-GPU pod available, and even those that did had low availability.
+
+![](docs/images/runpod_gpu_availability.png)
+
+When capacity does become available, it sometimes uses the slower PCIe interconnect between cards, or the required number of GPUs may even be spread across multiple pods. Should you rent this anyway, or does slow communication destroy all the benefits of having multiple cards, leaving you to waste money? This, of course, depends heavily on the specific use case you're working with - especially the size of the model and how long processing a single batch takes on the given GPU - so these results are only indicative of this particular setup. To better understand this, I compared the same DDP workload across increasingly slow interconnects, using direct measurements where the hardware was available and reconstructions where it was not. The fastest case uses the full NVLink fabric. The PCIe point comes from a real 2-GPU A100 host where P2P was unavailable and NCCL staged through host memory; its 8-GPU result is an optimistic reconstruction. Next, I included a setup where communication was forced through the local TCP interface on an 8-GPU host, so it included the host's network stack but data did not actually leave the machine. I also added two simulated cases where the network connection speed was artificially limited to 40 Gbit/s and 10 Gbit/s, respectively, to simulate the effect of renting A100s in different boxes connected by conventional network links. Full measurement details are collected in [Experiment setup](#a1-experiment-setup).
+
+![](docs/plots/transport_cost.svg)
+
+Whether renting machines with slower interconnects makes sense depends on your priorities. As we saw previously, a pod with a high-speed interconnect is a no-brainer, as it reduces runtime by a factor of almost eight for virtually no additional cost. A pod with a slower form of within-host communication still trains two to three times faster than a single GPU, but also costs two to three times as much. Essentially, you're paying a high premium for a somewhat faster run. However, if your bandwidth is limited to even 40 Gbit/s - which is nothing to sniff at in terms of network bandwidth - then distributed data-parallel training across multiple GPUs hardly makes sense: the run is only slightly faster than on a single A100 and costs several times more. At 10 Gbit/s, it becomes both slower and much more expensive than the single-GPU run.
+
+What happens in these cases is that the GPUs spend most of their time waiting for communication to happen, so you're paying mostly for wasted hours.
+
+![](docs/plots/transport_mfu.svg)
+
+Plotting the total time to convergence shows that it is almost completely linear in the inverse of the available communication bandwidth. This is hardly surprising, given that the compute time for a batch size of 64 is around 43 ms, while the communication overhead goes from ~7 ms on NVLink to over 1,000 ms over TCP.
+
+![](docs/plots/transport_sensitivity.svg)
+
+# Reducing communication with DiLoCo
+
+The reduction in available communication bandwidth led to clear underutilization of the GPUs. We can't create well-connected GPU pods out of nowhere, so can we change the distributed algorithm to reduce its dependence on frequent high-bandwidth communication? When using DDP, the most important knob we have is increasing the batch size, but that quickly becomes undesirable. As we keep increasing the batch size, more and more samples are processed before the model is updated. This means we already have a lot of information telling us what to change in the model (the gradient accumulated so far), yet we keep processing more minibatches with the original model just to be extra certain. It is easy to see how this becomes a waste of computation above a certain batch size. (Of course, DDP also has other parameters we could tune, such as bucket size, the degree of overlap, or gradient compression, to name a few.)
+
+An alternative approach is to let the ranks update their models individually without communicating with the other ranks, and synchronize only occasionally. There are many ways of achieving this; the question is how well we can combine these individual changes - do they compound or diverge? Distributed Low-Communication (DiLoCo) is one method that has been shown to work reasonably well. Under DiLoCo, each rank uses an inner optimizer for multiple local steps, which matches the optimizer we've been using before. The resulting model differences (or pseudo-gradients) are then averaged, and an outer optimizer uses them to calculate a global model update that is shared with every rank. A very nice additional advantage of DiLoCo is that it makes it much easier to use a heterogeneous set of GPUs, which may require different microbatch sizes and finish computation at different times. The original paper suggests that this can reduce communication by a factor of 500, which is certainly a very appealing prospect. Can we use this to overcome our GPU poorness?
+
+![](docs/images/diloco_setup.svg)
+
+DiLoCo architecture. Image from the [DiLoCo paper](https://arxiv.org/abs/2311.08105).
+
+![](docs/plots/validation_loss_vs_tokens.svg)
+
+![](docs/plots/diloco_k_penalty.svg)
+
+As we can see, under the same 10k-step training regime, DiLoCo worsened the final validation loss by 0.245 (3.525 instead of 3.28). In this untuned run, DiLoCo had not reached the target loss after the original 10k-step budget. Extrapolating the observed curve suggests that it would take roughly three times as many steps to track the original validation-loss curve, but that estimate needs to be verified by a measured target-loss run. Luckily, DiLoCo barely adds any overhead compared with DDP in terms of training time or total cost for the same step count, albeit with worse results. (All numbers in the text refer to the K=8 case. The difference is much smaller when using only two workers.)
+
+We must not forget, however, that DiLoCo introduced three new parameters to tune: the synchronization interval H, the outer learning rate, and outer momentum. I originally planned to use the hyperparameters reported in the paper, but those quickly turned out to be unsuitable for this model. To tune this properly, we would now need to spend additional money finding reasonable values for these parameters on top of all the other parameters in the training setup, adding both cost and uncertainty. The hyperparameters used in my study are simple guesses, so I expect that one could reduce the difference with a bit of hyperparameter tuning.
+
+While I did not run enough experiments to find the actual crossover point for DiLoCo, assuming that the extrapolated 3× step count holds, we can still estimate how much it would cost to train our model to the desired level with suboptimal network connections. (The weird-looking drop in the last plot that tracks the ratio between the tokens needed by the baseline and the DiLoCo runs is caused by the interactions of the learning rate scheduler warmdown period and DiLoCo's momentum, which is explained in more detail in [What would make DiLoCo go brr](#a4-what-would-make-diloco-go-brr).) These estimates suggest that DiLoCo has the great advantage of being virtually unaffected by the reduction in communication speed and remaining usable over slow network links with high measured utilization.
+
+![](docs/plots/diloco_transport_mfu.svg)
+
+If you are forced to accept suboptimal pods, or GPUs spread across multiple pods with conventional network connections between them, DiLoCo appears to move the economic crossover far enough that poorly connected GPUs may become viable. Establishing the true cost, however, requires tuning and a measured run to the target loss.
+
+![](docs/plots/diloco_transport.svg)
+
+# Conclusion
+
+I set out both to answer a practical question about scarce GPU capacity and to gain a better understanding of what distributed training actually does underneath the abstractions. Reimplementing the core data-parallel operations exposed several details I had previously known only in theory: the ordering of collectives, gradient bucketing and overlap, the interaction with the compiler, and how quickly communication costs turn into idle GPU time. If you are interested in exploring the implementation, [ddp_synchronizer](../src/distrain/ddp_synchronizer.py) is a good place to start. I then trained the same model on the same data across one, two, and eight GPUs, using pods from different providers and two distributed optimization algorithms. This connected those implementation details to their practical and economic consequences.
+
+For this workload, eight NVLink-connected A100s gave nearly eightfold speedup at approximately the same total cost. Slower within-host interconnects still reduced wall-clock time, but at a substantial cost premium. At a nominal 40 Gbit/s, DDP was only slightly faster and several times more expensive than a single A100; at 10 Gbit/s, it became slower as well. DiLoCo largely removed the network bottleneck, but introduced an optimization penalty: the untuned eight-worker run did not reach the target loss within the original budget, and its apparent requirement for roughly three times as many steps remains an extrapolation rather than a measured result.
+
+The practical lesson is that GPU count and hourly price are insufficient when evaluating scarce capacity: topology can determine whether additional GPUs are an acceleration or merely additional cost. DiLoCo may make poorly connected hardware viable, especially after the ordinary training recipe has already been tuned, but these experiments do not yet establish its true crossover point. More broadly, implementing and measuring these methods showed me that even the supposedly simplest form of distributed training contains a surprising amount of machinery, and that its rules of thumb only become useful when tied to the actual ratio of computation to communication.
+
+When renting distributed hardware, you are not just renting GPUs—you are renting the links between them.
+
+# What's missing
+
+- Each run was performed only once, so no spread or uncertainty is shown in any of the plots or numbers.
+- While I deliberately excluded the Muon optimizer from the model, there are still some AdamW optimizations tested in the modded-nanoGPT repo that I haven't adopted, leaving another 50% of performance on the table. While this wouldn't have changed the relative distributed results, it would have made the experiments faster and cheaper, or allowed me to try more hyperparameters.
+- I did not perform a hyperparameter search for DiLoCo, so the related conclusions are weaker than they could be.
+
+# Appendix
+
+## A1. Experiment setup
+
+All headline runs use the same model, data and training recipe. The short DDP implementation benchmarks vary the microbatch or transport, but they do not feed back into the convergence result.
+
+| Item | Setting |
 |---|---|
-| Shard IO + world-size-independent sharding | done, [`data.py`](src/distrain/data.py) |
-| 124M GPT: SDPA, rotary, QK-norm, ReLU², zero-init, untied head | done, [`model.py`](src/distrain/model.py) |
-| FLOPs / MFU / HFU accounting | done, [`mfu.py`](src/distrain/mfu.py) |
-| Single-device loop, trapezoid LR, trackio logging | done, [`train.py`](src/distrain/train.py) |
-| Pinned Docker image (aurora + cloud parity) | builds + tests pass on aurora, [`Dockerfile`](Dockerfile) |
-| DDP modes 1–3 (naive, bucketed, interleaved) | done, [`distributed_synchronizer.py`](src/distrain/distributed_synchronizer.py); NCCL-proven, timed on 2×3090 |
-| DDP mode 4 — `ddp_torch`, the upstream baseline | done, wraps `DistributedDataParallel` behind the same seam |
-| Checkpointing — per-step files, retention anchors, async off-box mirror | done, in [`train.py`](src/distrain/train.py); survived a real pod termination. DCP deferred — [`docs/decisions.md`](docs/decisions.md) §12 |
-| Bench harness for mode timing | done, [`scripts/bench_ddp_modes.py`](scripts/bench_ddp_modes.py) |
-| DiLoCo (5th mode, per-rank checkpoints, diag evals) | done; K=8 anchor measured on 8×A100, [`docs/decisions.md`](docs/decisions.md) §21 |
-| FSDP2, run matrix | not started |
+| Model | 12 transformer blocks, 12 attention heads, width 768, sequence length 1024, vocabulary 50,304, no bias or dropout. The untied embedding and output head bring the total to 162,220,800 parameters. |
+| Data | GPT-2 BPE tokens from the first 55 training shards of FineWeb10B (5.5B tokens), plus its validation shard. A 10,000-step run stays within those shards and does not wrap around the corpus. |
+| Inner optimizer | Fused AdamW in CUDA runs, learning rate 1.8e-3, betas (0.9, 0.95), weight decay 0.1 and gradient clipping at 1.0. The trapezoidal schedule has 250 warmup steps, a constant plateau and 1,000 warmdown steps. |
+| Precision and compiler | BF16 autocast, TF32 enabled, and `torch.compile` unless a plot explicitly compares compiled and eager execution. The environment is pinned to Python 3.12, PyTorch 2.13 and the CUDA 12.6 PyTorch build. |
+| Validation | Mean cross-entropy over the first 10,485,760 tokens of the FineWeb validation split, always in the same order and in batches of 32 sequences. Validation runs on rank 0 and the scalar is broadcast. The headline is the first unsmoothed validation loss at or below 3.28. |
+| DiLoCo | K=8 replicas, H=500 local steps between synchronizations, outer learning rate 0.7 and Nesterov momentum 0.5. The inner optimizer and learning-rate schedule are the same AdamW recipe as above. These outer parameters were not found by a systematic search. |
 
-The distributed layer is a single seam in the training loop — `finalize_gradients()`
-between the accumulation loop and gradient clipping — behind which all four modes
-switch at runtime. See [`docs/decisions.md`](docs/decisions.md) §6 for the conventions
-it rests on and §10 for how the multi-rank tests are built.
+Unless a plot says otherwise, the global batch is fixed at 480 sequences, or 491,520 tokens per optimizer step. Changing the world size changes only how that batch is partitioned: step *t* always reads the same 480 sequences in the same order. In the matched-microbatch scaling measurements, each GPU processes 30 sequences per forward/backward pass and gradient accumulation is adjusted to 16, 8 and 2 iterations at world sizes 1, 2 and 8, respectively. The full 8-GPU DDP and DiLoCo runs use 60 sequences per GPU and no gradient accumulation. The ratio sweep in Appendix A3 is the deliberate exception: it uses microbatches of 8, 16, 30 and 60 with no accumulation, since the point of that experiment is to vary the amount of computation available to hide communication.
 
-Measured on aurora (RTX 3090): the modernized model (162M params with the untied
-head) at seq-1024, batch 8, bf16 + compile → **130.4 ms/step, 65.0% MFU**.
-Correctness only — a consumer card's numbers do not transfer (`project_brief.md` §8).
+“Step” means one inner optimizer update. For DDP, that is one AdamW update after gradient accumulation and averaging across every rank. For DiLoCo, every replica makes one local AdamW update, and an outer step combines the model differences at each H=500 boundary. Because the log is zero-indexed and no merge happens at step 0, the first DiLoCo round contains 501 updates, full intervening rounds contain 500, and the final partial round merges at the last step. Both methods still process the same global 491,520 tokens per step, and the 10,000-step comparison covers 4.9152B tokens. Log step 9999 is the final update of this zero-indexed schedule. The DDP and RTX 3090 convergence runs actually reached the target; several other time-to-target bars combine a measured steady-state step time with that independently measured crossing step rather than rerunning the full optimization on every transport.
 
-## Writeup figures
+The A100 measurements use more than one SKU. The full DDP and DiLoCo runs used 8× A100-SXM4-80GB; the matched scaling measurements used A100-SXM4-40GB cards, whose measured BF16 roofline was effectively identical. Cost plots use a 2026-08-24 on-demand list-price snapshot: $1.99/h for one 40GB SXM4 A100, $15.92/h for the corresponding 8-GPU NVLink pod, and $17.56/h—the mean of $12.72 and $22.40 quotes—for an 8×80GB SXM4 pod. The unavailable 8×80GB PCIe listing was $11.12/h. The transport-cost plot charges that cheaper $11.12/h rate to every non-NVLink option, giving the slow configurations the benefit of the cheapest advertised hardware. The desktop RTX 3090 cost assumes 800 W at the wall and $0.23/kWh, with no capital cost.
 
-The writeup numbers have been projected from the gitignored raw logs and benchmark
-JSON into reviewable CSVs under [`docs/writeup_data/`](docs/writeup_data/). The
-plotting script renders each figure as interactive HTML and static SVG/PNG under
-[`docs/plots/`](docs/plots/):
+The transport axis mixes direct measurements and reconstructions, so the distinction is important:
 
-```bash
-uv run python scripts/collect_writeup_data.py
-uv run --extra plots python scripts/plot_writeup.py
-```
-
-The rendered set covers both halves of the converged loss curve, measured 8-GPU
-rentability, equal-token DDP-vs-DiLoCo quality and runtime, matched-batch 1→8 GPU
-scaling, DDP transport sensitivity, transport MFU, four DDP implementations over
-sockets, compilation versus overlap on A100 PCIe, DiLoCo outer-sync diagnostics,
-the DiLoCo merge penalty at two replica counts, and DDP-vs-DiLoCo step time
-across transports. Headline plotted values
-include **7.19 h → 0.94 h** for 1→8 A100 scaling, **57.6% → 15.3% MFU** for
-NVLink → TCP, and **3.2730 versus 3.5183** validation loss for DDP versus DiLoCo
-at 4.915B tokens.
-
-Two derived numbers now sit on the same reconstruction as the netem points and
-answer the writeup's actual question. **8-GPU DDP stops beating a single A100
-below 0.50 GB/s (4.0 Gbit/s) effective all-reduce bandwidth** — the measured
-unthrottled socket sat only 1.8× above that cliff. And **DiLoCo starts beating
-DDP end to end below 2.36 GB/s (18.8 Gbit/s)** once charged §18's 2.49× token
-ratio, which is why its equal-token loss penalty is not the whole story. See
-[`transport_crossovers.csv`](docs/writeup_data/transport_crossovers.csv).
-
-**Still missing, in the order it would cost to buy:** a topology-verified A100
-PCIe point — the largest hole, and **not a price problem**: RunPod sells the PCIe
-card as its own GPU type at half the SXM4 anchor's rate and had no 8-GPU capacity
-on 2026-08-22, while Prime Intellect has none at all
-([`docs/decisions.md`](docs/decisions.md) §24). `scripts/pcie_hunt.sh` rents and
-measures the first opening unattended. Then: a *measured* rather than
-reconstructed DiLoCo slow-transport timing; complete price-per-convergence
-comparisons; and a current-PyTorch rerun.
-DiLoCo's time to 3.28 is blocked rather than unbought — it needs ~24,900 steps
-against a corpus that wraps near 11,190. The procedure for each, and the PCIe
-capacity-watch command, are in
-[`docs/writeup_data/README.md`](docs/writeup_data/README.md#plots-still-missing);
-the field-level manifest stays in
-[`data_gaps.csv`](docs/writeup_data/data_gaps.csv).
-
-Cost inputs belong in [`cost_inputs.csv`](docs/writeup_data/cost_inputs.csv),
-which has the measured/projected runtimes prefilled and leaves rental rates,
-average desktop wall power, electricity prices, capital allocation, and overrides
-blank. The 3090 bar is now **measured**: `ref-1gpu-10k` (aurora, 2026-08-24) ran a clean
-10000-step trapezoid and crossed 3.28 at step 9999 at val 3.2678, after
-**76403.7 training seconds = 21.22 h** at 7.6333 s/step and 66.6% MFU. It was
-run as the K=2 DiLoCo arm's single-GPU reference, so the bar cost nothing extra,
-and it confirms the previous 21.299 h Trackio extrapolation to **0.36%** — which
-is also a check on the 1×A100 **7.19 h** bar, still an extrapolation of the same
-kind. With wall power and electricity filled in, a converged run costs **$3.91**
-of electricity on the desktop against **$14.31** of rental on one A100: 3.0×
-slower, 3.7× cheaper.
-
-## Machines
-
-| Machine | Role |
+| Transport label | Evidence |
 |---|---|
-| `aurora` (RTX 3090, via Tailscale) | default development — editing, tests, all CUDA work, `~/work/distrain` |
-| rented cloud nodes | all reported results |
-| MacBook Pro (arm64) | fallback editor, CPU/MPS correctness only |
+| NVLink | Measured on real 8-GPU SXM4 hosts with a full NV12 topology. |
+| A100 PCIe | Measured on a real 2× A100-PCIe-80GB host. GPU-to-GPU P2P was unavailable, so NCCL staged through host memory. The plotted 8-GPU step time is an optimistic reconstruction from that measured bandwidth; I never managed to rent the actual 8-GPU configuration. |
+| Forced TCP/loopback | Measured on an 8-GPU NVLink host after disabling NCCL's P2P and shared-memory transports. Traffic traversed the host network stack but never left the machine. |
+| Nominal 40 and 10 Gbit/s | Applied locally with `netem` to the TCP case. Communication was measured under the limits, while the batch-480 step times were reconstructed as compute plus communication and should be treated as upper bounds. These are simulations of limited bandwidth, not measurements of a real multi-node cluster. |
 
-Day-to-day work happens directly on aurora (`ssh adam@aurora`); git is for
-milestones. The Mac fallback workflow is at the [end of this README](#mac-fallback).
+## A2. How fast are those GPUs, really?
 
-## Setup
+To calculate Model FLOPs Utilization (MFU), one of the most widely used metrics when measuring distributed training, we first need to know the actual maximum FLOP/s of the given GPU. The obvious move is to look it up in the datasheet, but that gave me a bit of a headache. A vendor spec sheet quotes several different numbers for what looks like the same thing: tensor-core versus CUDA-core rates, dense versus 2:4-sparse figures (a factor of two), and, for FP16/BF16, separate rates depending on whether accumulation happens in FP16 or FP32 (another factor of two on consumer cards). My first attempt used 35.6 TFLOP/s for the RTX 3090, which is that card's FP32 *non-tensor* rate, and the training loop then cheerfully reported an MFU of 158%. The only reason I caught it is that anything above 100% is impossible.
 
-Requires [uv](https://docs.astral.sh/uv/). The interpreter is uv-managed by design —
-see [`docs/decisions.md`](docs/decisions.md) §2.
+So I stopped citing and started measuring: `scripts/measure_roofline.py` runs large square BF16 GEMMs at a few sizes and reports the best sustained throughput. This is a lower bound on the true peak rather than the peak itself, but it represents what the hardware demonstrably does, making it a useful practical denominator for utilization. Strictly speaking, this is measured-roofline utilization rather than conventional MFU, which uses the theoretical peak. Every MFU number in this post uses this nonstandard measured denominator for the exact card, and the difference from the datasheet is not small:
 
-```bash
-uv sync --extra dev
-```
+| Card | Measured BF16 (TFLOP/s) | Datasheet dense (TFLOP/s) | Measured / datasheet |
+|---|---|---|---|
+| A100-SXM4-80GB | 269.9 | 312.0 | 86.5% |
+| A100-SXM4-40GB | 270.1 | 312.0 | 86.6% |
+| A100 80GB PCIe | 256.5 | 312.0 | 82.2% (71.8% at 16384³) |
+| RTX 3090 | 82.6 | 71.2 | 116% |
 
-```bash
-uv run pytest
-```
+The two A100 SXM4 cards land at ~86.5% of their quoted 312 TFLOP/s, which is roughly what you would expect from a real GEMM measured against a marketing number. The PCIe A100 is the interesting one: NVIDIA quotes the same 312 TFLOP/s for it as for the SXM4 part, even though it is a 300 W card rather than a 400 W one, and its sustained performance does not hold up. It peaks at 256.5 TFLOP/s on a 4096³ GEMM and then *falls* to 223.9 TFLOP/s on a 16384³ one, i.e., it throttles on exactly the long, large matrix multiplications representative of training, while the SXM4 cards hold their rate. The 3090 goes the other way, and at first glance, the result looks impossible. The [GA102 whitepaper](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.1.pdf) gives 71.2 TFLOP/s for dense BF16 tensor operations with FP32 accumulation—the only BF16 mode the hardware has, since BF16 always accumulates in FP32—while the 142.3 printed beside it is the corresponding rate with 2:4 sparsity. My card, however, sustains 82.6 TFLOP/s, 16% *above* the published rate. The resolution is the clock. Peak rates in that table are quoted at the 3090 Founders Edition's 1695 MHz boost clock, and my card is not a Founders Edition: it has a 420 W power limit, and when sampled during a 16384³ BF16 GEMM, it held a mean SM clock of 1990 MHz at 394 W, power-capped rather than thermally throttled. Per clock, that is 41.7 kFLOP/clock against the 42.0 kFLOP/clock implied by the whitepaper figure—99.3% of the architectural rate. The card is doing exactly what NVIDIA says a GA102 does, just at a 17% higher clock than the table assumes; a rented 3090 that measured 75.3 TFLOP/s achieved the same per-clock rate at about 1.79 GHz. A peak quoted at a reference boost clock is no more a property of the card in your machine than a peak quoted for a 400 W part describes the 300 W one you rented.
 
-On macOS this installs a CPU/MPS torch; on Linux, the CUDA build from the pinned
-`cu126` index.
+All this is really just to say that even the seemingly trivial question of "how fast can the card I'm comparing against actually go?" has more nuance than one might expect, making it easy to draw incorrect conclusions from measurements across different providers, pods, and GPUs.
 
-## Container
+## A3. What makes DDP go brr
 
-The pinned Docker image ([`Dockerfile`](Dockerfile)) is the reproducibility unit:
-the *same* image on aurora and on rented cloud nodes, so cross-provider numbers are
-comparable (`project_brief.md` §3). It bakes the exact `uv` environment on a pinned
-CUDA 12.6 base; torch still comes from the `cu126` wheels, so the base supplies only
-the toolchain and the driver ABI (injected by the NVIDIA Container Toolkit).
+Data parallelism works by dividing the batch into K distinct parts. Each rank (GPU) processes one part, then uses the `all_reduce` communication primitive to average the partial gradients across all ranks. Each rank uses this global gradient to perform an identical update to its copy of the model parameters. To better understand the trade-offs and gain a bit more familiarity, I implemented these variants by hand using only basic communication primitives such as `all_reduce` and `broadcast`. Describing each algorithm in full is well outside the scope of this post, but you can find fantastic explanations in resources such as the [Ultrascale Playbook](https://huggingface.co/spaces/nanotron/ultrascale-playbook).
 
-One-time host setup (installs the NVIDIA Container Toolkit, wires it into Docker,
-adds you to the `docker` group — needs sudo, so run it yourself):
+![](docs/images/ddp_naive_flow.png)
 
-```bash
-scripts/setup-docker-nvidia.sh   # then log out/in so 'docker' group applies
-```
+Schematic of data parallelism (in a naive implementation). Image taken from the [Ultrascale Playbook](https://huggingface.co/spaces/nanotron/ultrascale-playbook?section=data_parallelism).
 
-Then everything goes through one helper:
+A naive implementation first waits for all gradient calculations to finish, then initiates an `all_reduce` separately for each tensor. There are a few problems with this. First, initiating communication has some overhead of its own, so doing it one tensor at a time is inefficient for small tensors. A slightly improved version is `ddp_bucketed`, which combines tensors into buckets of predefined sizes, reducing the number of `all_reduce` operations and saving some of that overhead. This in itself isn't a huge win, though, and we can do better. Gradients become available one by one during the backward pass and don't depend on each other once they have been calculated, so we can share them immediately. This way, we can overlap a gradient's communication with the computation of gradients for preceding layers and avoid the dreaded gaps in GPU utilization caused by blocking communication.
 
-```bash
-scripts/container.sh build        # (re)build the image
-scripts/container.sh test         # pytest in the container, on GPU
-scripts/container.sh smoke        # torch + GPU visibility check
-scripts/container.sh run torchrun --nproc_per_node=1 -m distrain.train --max-steps 20
-```
+![](docs/images/ddp_optimized_flow.png)
 
-`run`/`test`/`shell` bind-mount the working tree at `/workspace` so rsync'd edits are
-live without a rebuild (the venv lives at `/opt/venv`, outside the mount). `--no-mount`
-runs the code baked into the image — the reproducible mode for reported results.
+Schematic of interleaved and bucketed data parallelism. Image taken from the [Ultrascale Playbook](https://huggingface.co/spaces/nanotron/ultrascale-playbook?section=data_parallelism).
 
-For cloud sessions the image is pushed to **`ghcr.io/adamdivak/distrain:<git-sha>`**
-(private, like the repo) and the pod boots it directly with
-[`scripts/pod-entry.sh`](scripts/pod-entry.sh) as the start command — it starts
-sshd from the provider-injected key and exports the baked env to SSH sessions.
-The image also carries a prebuilt `nccl-tests` (`/opt/nccl-tests/build/`) and the
-`data` extra, so a pod needs zero setup beyond booting. Build/push steps:
-[`docs/runbook-8gpu-runpod.md`](docs/runbook-8gpu-runpod.md).
+There are a few low-level details we need to pay attention to, though. First, as with all these communication primitives, we need to ensure that all ranks invoke collectives in the same order with matching tensor shapes. The low-level primitives simply push tensor values through the channel, without any additional metadata or checks to verify that they correspond to the intended parameters. While this trivially holds for our small and simple model, we could theoretically end up in a situation where a rank produces no gradient for a given tensor in a batch, e.g., when using a Mixture-of-Experts model. We also need to ensure that the buckets we create follow the order in which the gradients become available, so we can't just blindly follow the order in which the model components are defined. Things like tying the embedding and LM head—the first and last tensors in the graph—can easily trick us. However, the largest effect actually comes from the compiler. One of the most important optimizations the compiler performs is fusing consecutive operations so that they run as a single large kernel on the GPU, without interruption or host synchronization. This makes computation faster, but AOTAutograd can turn the whole backward pass into a single autograd node, causing our post-accumulate hooks to fire only after all the gradients have been computed.
 
-### Renting the box
+PyTorch's default [`DDPOptimizer`](https://docs.pytorch.org/docs/stable/notes/ddp.html#torchdynamo-ddpoptimizer) solves exactly this problem when the model is wrapped in `DistributedDataParallel` *before* it is passed to `torch.compile`, as it is in this project. Dynamo walks the captured forward graph in reverse, counts parameter bytes in approximately the order their gradients will become ready, and splits the graph at DDP's bucket-size boundaries. AOTAutograd and Inductor then compile each piece separately. During the backward pass, control returns to the autograd engine between pieces, allowing DDP's reduction hooks to launch an all-reduce while the next piece of backward computation is still running. With our 25 MiB bucket cap, this produces 14 compiled subgraphs. The trade-off is exactly the one described above: PyTorch preserves communication overlap, but gives up fusion opportunities across 13 graph boundaries.
 
-[`scripts/runpod_session.py`](scripts/runpod_session.py) provisions the pod over
-the RunPod API instead of the console — ensure the network volume, ensure the
-pod, boot the pinned image, wait for SSH:
+My hand-rolled modes are just ordinary models as far as the compiler is concerned, so they do not get this DDP-aware partitioning. Under `torch.compile`, their backward pass is fused into one piece and all their hooks become ready at the end; compiled `ddp_interleaved` therefore does not actually interleave communication with computation and behaves much like the bucketed version with asynchronous launches. This is why the compiled PyTorch DDP baseline and the compiled hand-rolled implementation are making opposite trades rather than simply being better or worse implementations.
 
-```bash
-uv run --script scripts/runpod_session.py status           # balance, pods, volumes
-uv run --script scripts/runpod_session.py avail            # which DCs have 8xA100 now
-uv run --script scripts/runpod_session.py up --dry-run     # the plan + the price, free
-uv run --script scripts/runpod_session.py up --max-hours 8
-uv run --script scripts/runpod_session.py guard &          # ceiling + balance watch
-uv run --script scripts/runpod_session.py ssh --exec
-uv run --script scripts/runpod_session.py down
-uv run --script scripts/runpod_session.py verify           # is anything still billing?
-```
+![](docs/plots/ratio_sweep.svg)
 
-`verify` is the end-of-session proof, and `down` ends by running it. It separates
-what is metered **by the hour** — running pods, stopped pods (no GPU charge, but
-their disks bill), serverless endpoints, and the account's own
-`currentSpendPerHr` — from what is metered **by the month**: network volumes,
-~$0.07/GB. The hourly tier must be empty and any of it exits non-zero; volumes
-are reported with a price but pass, since a volume is the thing meant to outlive
-a pod. `verify --strict` requires those gone too — the end of the project rather
-than the end of a session.
+Above is a plot of how much slower each version of DDP is than the fastest one. On the left, we can see that with NVLink, the difference is negligible: virtually all methods perform identically. On the slower interconnect shown on the right, the differences become more pronounced. However, we can also see that the method only makes a difference if there is enough computation with which communication can overlap. As the microbatch size increases (moving right on the x-axis), so does the time it takes to process the batch. At a microbatch size of 8, the computation takes only 49.5 ms, while a 649 MB all-reduce takes over a second. The collective occupies 96% of the step, and every mode issues the same one, so the entire implementation question lives in the remaining 4%. Naive is the exception because it changes the communication itself—75 small collectives instead of 14 fused ones, costing ~400 ms—while the other three sit within roughly one batch's compute time of each other, and their ranking is decided by host jitter. This leads to the conclusion that, for throughput, it is best to maximize the microbatch size up to the memory limit, but that is something you'd be doing anyway. The more general lesson is the same one we saw previously: what matters is the ratio of compute to communication, and every "X is faster than Y" claim about distributed training is really a claim about where you sit on that axis.
 
-It is idempotent (a second `up` reuses the live pod rather than renting another)
-and it is where the cost kill-switch of [`docs/decisions.md`](docs/decisions.md)
-§9 lives: `up` refuses a ceiling the balance cannot fund and terminates the pod
-if provisioning fails partway; `guard` terminates at the wall-clock ceiling. The
-`runpod` SDK comes from the script's own inline dependency block (`uv run
---script`), never from the training environment; the API key comes from
-`RUNPOD_API_KEY` in the environment or the gitignored `.env`. The mechanics are
-tested offline against a fake API in
-[`tests/test_runpod_session.py`](tests/test_runpod_session.py) — no credentials,
-nothing rented.
+## A4. What would make DiLoCo go brr
 
-### The second venue
-
-RunPod's 8×A100 stock is opportunistic, so
-[`scripts/prime_session.py`](scripts/prime_session.py) mirrors the same contract
-(`status`/`avail`/`up`/`guard`/`ssh`/`down`, wall-clock ceiling,
-teardown-on-exception) against Prime Intellect, a compute exchange that resells
-lambdalabs, vultr, hyperstack and others. It is stdlib-only — no SDK — and pins
-the socket to SXM4 so a PCIe A100 cannot silently break comparability with the
-§14 NVLink anchor. `up` refuses to provision without `--template-id` rather than
-boot Prime Intellect's stock image.
-
-Money added in their console lands on a **team** wallet, which a bare API key
-cannot see — so the team id is picked up from `PRIME_TEAM_ID`, `.env`, or the
-`prime` CLI's config and sent with every call (`--team-id ''` forces the personal
-wallet). `status` prints which wallet it read. One step still has no API and must
-be done in their console: adding a ghcr.io registry credential so a custom
-template on the pinned image can be created. See
-[`docs/decisions.md`](docs/decisions.md) §20 — including why SkyPilot was
-evaluated and rejected as the broker.
-
-`scripts/watch_capacity.sh` polls both venues.
-
-A Prime Intellect pod is a **KVM VM with root**, so the session boots their stock
-Ubuntu and runs our own container inside it — which pulls the byte-identical
-aurora image, better parity than their registry (which rebuilds), and gives
-`NET_ADMIN`, so netem runs in the same container as the training. That is the one
-thing RunPod cannot do (§17). Two sessions are written up in
-[`docs/runbook-prime-intellect.md`](docs/runbook-prime-intellect.md): the netem
-curve (§15) and the DiLoCo K=8 converged anchor (§16, §19).
-
-## Data
-
-The full FineWeb10B set (104 shards, ~19 GiB; see
-[`reference/PROVENANCE.md`](reference/PROVENANCE.md)) lives on aurora at
-`data/fineweb10B`, fetched with:
-
-```bash
-ln -sfn ../../data/fineweb10B reference/modded_nanogpt/fineweb10B
-uv run --extra data python reference/modded_nanogpt/cached_fineweb10B.py
-```
-
-The symlink makes the vendored script land shards in machine-local `data/`, which
-git, rsync and the image build all ignore.
-
-Synthetic shards exist for quick smokes and for machines without the real data:
-
-```bash
-uv run python scripts/make_synthetic_shards.py --out data/synthetic --shards 2
-```
-
-## Training
-
-A real-data run on aurora — the Track A 124M model, GPT-2 global batch (480 seqs
-via 60×8 accumulation), checkpointed and resumable:
-
-```bash
-PYTHONUNBUFFERED=1 nohup uv run python -m distrain.train \
-  --train-glob 'data/fineweb10B/fineweb_train_*.bin' \
-  --val-glob 'data/fineweb10B/fineweb_val_*.bin' \
-  --grad-accum-steps 60 --max-steps 6000 \
-  --val-every 250 --checkpoint-every 250 \
-  --compile --run-name <name> > out/train.log 2>&1 &
-```
-
-`--checkpoint-every N` writes `checkpoints/ckpt.pt` (rank 0, atomic) every N steps;
-`--resume` continues from it with the same command line — same command line matters,
-because the LR schedule derives from `--max-steps`. `PYTHONUNBUFFERED=1` keeps the
-log readable in real time instead of flushing every few hours.
-
-A quick synthetic smoke (defaults are the 124M model at seq-1024):
-
-```bash
-uv run python -m distrain.train --global-batch-seqs 8 --max-steps 20 --compile
-```
-
-Local testing of a distributed run:
-
-```bash
-uv run torchrun --nproc_per_node=2 -m distrain.train --device cuda:0 \
-  --distributed-backend gloo --distributed-mode ddp_naive
-```
-
-### Watching a run
-
-Metrics live in a local SQLite store (`~/.cache/huggingface/trackio/distrain.db`).
-The dashboard:
-
-```bash
-uv run trackio show --project distrain
-```
-
-It serves on `localhost:7860` on aurora; from another machine, forward the port
-first (`ssh -L 7860:localhost:7860 adam@aurora`) and open http://localhost:7860.
-System metrics (GPU/CPU/RAM, 10 s cadence) are logged automatically via the
-`trackio[gpu]` extra.
-
-### Timing the DDP modes
-
-For any machine with ≥2 GPUs — a single-process baseline plus all three modes,
-warmup excluded, raw per-step times and a comparison table written to
-`out/bench/<timestamp>/`:
-
-```bash
-uv run python scripts/bench_ddp_modes.py --nproc 2 --steps 50 --warmup 10
-```
-
-Everything after `--` is forwarded to `distrain.train` (data globs, model size,
-`--ddp-bucket-size`, ...). A hung mode is recorded as a result, not a crash — the
-remaining modes still run. Harness mechanics are covered by
-[`tests/test_bench.py`](tests/test_bench.py) on gloo/CPU, so the first paid
-session only exercises NCCL, not the script.
-
-## Measuring a new GPU
-
-Before trusting MFU on any GPU class this project has not used before:
-
-```bash
-uv run python scripts/measure_roofline.py
-```
-
-Record the result in `_PEAK_BF16` in [`mfu.py`](src/distrain/mfu.py). Datacenter
-entries there are datasheet values marked `UNVERIFIED` and should not be trusted
-until measured — an unmeasured 3090 figure once produced a 158% MFU.
-
-## Next steps
-
-([`docs/decisions.md`](docs/decisions.md) §13 has the full reasoning.) In order:
-
-1. **Get one honest PCIe point**, the transport most people can actually rent.
-   This is now waiting on stock rather than on a decision (§24): RunPod's
-   `NVIDIA A100 80GB PCIe` is the real SKU at half the anchor's price and had no
-   8-GPU capacity on 2026-08-22, and Prime Intellect has no PCIe 8×A100 at all.
-   Leave `scripts/pcie_hunt.sh out/pcie-hunt.log 300` running — it probes by
-   attempting the deploy (free when rejected), then guards, gates on
-   `nvidia-smi topo -m`, measures, tears down and verifies without a human.
-   Only bandwidth plus a batch-480 bench is needed, so it is minutes of rental
-   once a box exists.
-2. **Decide whether DiLoCo's tokens-to-3.28 is worth buying.** It needs
-   ~24,900 steps at the measured ratio — past the 55-chunk corpus wrap
-   (~11,190 steps), so it cannot be measured without disclosing a second
-   epoch, and it costs ~2.3 h of 8×A100 on top. The equal-token endpoint
-   (§21) may simply be the honest deliverable.
-3. Track B (FSDP2 at ~7B on one 8-GPU node) after that.
-
-**The netem ladder stops at 10 gbit, on purpose.** The 2026-08-21 sweep measured
-unthrottled-socket, 40 gbit and 10 gbit; 1 gbit and 500 mbit overran their
-timeouts because the schedule was budgeted off *nominal* rate, which netem misses
-by ~8× ([`docs/decisions.md`](docs/decisions.md) §21). They are not worth
-re-running. Nominal 10 gbit already delivers only 1.2 Gbit/s effective and puts
-an 8-GPU DDP run at **21.1 h against one A100's 7.19 h** — far past the 0.50 GB/s
-break-even where eight GPUs stop beating one. A lower point would extend a curve
-whose conclusion is already settled.
-
-## Known gaps
-
-- **H100/L40S peaks are unverified datasheet values.** A100-SXM4 is measured at
-  both memory sizes (269.9 / 270.1, 0.07% apart) and A100 80GB PCIe at 256.5
-  (2026-08-22) — the PCIe part throttles to 223.9 at n=16384 where the SXM4
-  cards peak, and its 312.0 datasheet figure was 22% high. Run the roofline
-  script first thing on any new GPU class; per-box measurement is mandatory (the
-  two 3090s differ by 9%). Check what the *generic* patterns in `_PEAK_BF16`
-  already swallow: `"A100"` was silently catching 40 GB cards with a datasheet
-  figure instead of refusing to start (`docs/decisions.md` §22).
-- **PCIe is measured at 2 GPUs; the 8-GPU bar is out of stock, not mispriced.**
-  A topology-verified 2×A100 80GB PCIe box gave **2.29 GB/s** effective
-  all-reduce bandwidth — and revealed that the rentable node has **no GPU-to-GPU
-  P2P at all** (`topo -p2p r` = `CNS`; NCCL routes via host memory), so none of
-  it may be reported as PCIe P2P (§25). At 8 ranks that projects to 2.29 h to
-  3.28, an optimistic bound since a wider ring crosses more host bridges.
-  RunPod's `NVIDIA A100 80GB PCIe` is a distinct SKU at $11.12/h secure (half
-  the SXM4 anchor) and had no 8-GPU capacity on 2026-08-22; Prime Intellect's
-  every "PCIe" 8×A100 is `cloudId gpu_8x_a100`, lambdalabs' SXM4 box, which
-  `prime_session.py` now refuses before renting (§24). The netem-derived points
-  in `scripts/transport_curve.py` remain **upper bounds, +23% at the one point
-  measured both ways**.
-- **A registry credential is applied to whichever registry the image names.**
-  Attaching the GHCR credential to a `runpod/pytorch` image fails the pull with
-  `IMAGE_AUTH_ERROR` rather than being ignored — three dead pods on 2026-08-22.
-  Use `--registry-auth-name ''` for a public image (§24).
-- **DiLoCo's advantage on slow transport is reconstructed, not measured.**
-  `diloco_transport.csv` divides each transport's *measured* all-reduce by
-  H=500, which is sound — the outer sync moves the same tensor DDP all-reduces
-  every step — but no DiLoCo run has actually been timed over a slow transport.
-- **No spot-preemption recovery.** Per-step checkpoints with retention
-  anchors, `--resume`/`--resume-from` and async off-box mirroring exist and
-  survived a real pod termination; DCP/preemption hardening is deliberately
-  deferred ([`docs/decisions.md`](docs/decisions.md) §12) — it only matters
-  if spot is chosen.
-- **Trackio curves from cloud sessions live in per-session DB copies**
-  (`out/runpod-8gpu/trackio/`), not aurora's dashboard DB — a merge story
-  is unbuilt. Worse on the container route: the DB lands in `~/.cache`
-  *inside* the container, which no mount covers, so the 2026-08-21 curves
-  died with the pod and `train.log` is the only record. Mount it next time.
-- **A100-SXM4 peaks differ ~1.4% box to box** (269.9 measured on RunPod,
-  266.0 on lambdalabs). MFU is reported against 269.9 throughout for
-  cross-session comparability, which understates lambdalabs numbers slightly.
-
-## Mac fallback
-
-The MacBook (arm64, no NVIDIA) can run everything except CUDA: tiny CPU/MPS configs
-exercise the loop, data path, checkpointing and the gloo multi-rank tests. Keep the
-batch small — fp32 logits for 480 sequences would need well over 100 GB. No
-performance number from the Mac transfers anywhere (`project_brief.md` §8), and
-Docker is not used there. Edit on the Mac, run on aurora:
-
-```bash
-scripts/sync-aurora.sh
-ssh adam@aurora 'cd ~/work/distrain && uv run pytest -q'
-```
-
-`sync-aurora.sh` is for iteration (git stays for milestones); it excludes `data/`
-and `.venv/`, which aurora owns.
+DiLoCo is completely untuned in the current tests. However, the end of training looks particularly suspicious and is worth a bit of extra discussion. The training uses a trapezoidal learning-rate schedule, following one of the entries in modded-nanoGPT, so there is a warmdown period at the end. This schedule is applied only to the inner optimizer, not the outer optimizer used by DiLoCo. The outer optimizer uses Nesterov momentum, so it keeps making fairly large steps influenced by previous update directions even as the incoming pseudo-gradients get smaller. Most likely, decaying the momentum to zero would significantly reduce the overshoot and help the DiLoCo version stay close to the baseline's validation loss without the weird divergence in the last 1k steps.

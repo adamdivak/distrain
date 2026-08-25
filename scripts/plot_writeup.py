@@ -469,15 +469,23 @@ def plot_ddp_modes(data_dir: Path, plots_dir: Path) -> None:
     The top panel draws every timed step, not a mean with an error bar: at 15
     steps over a jittery socket transport the distributions have heavy right
     tails, and the *mean* ranking of the three bucketing modes is an artifact of
-    those tails -- their minima agree to about 2%.  The bottom panel is the same
-    question at the anchor's batch, where the two modes that were measured on
-    NVLink land within 1%.
+    those tails -- their minima agree to about 2%.  The bottom panel puts the
+    anchor batch on all three measured fabrics, because that is where the only
+    reproducible finding lives: the sign of the interleaved-vs-PyTorch gap
+    flips with bandwidth (decisions.md section 26).
+
+    PyTorch DDP is drawn in brick rather than the transport purple used
+    elsewhere: purple means "forced TCP" in this figure's own x axis, and
+    teal/purple is the one pair here that a protanope cannot separate
+    (ΔE 3.6).  Teal/brick is ΔE 13.4.  Naive keeps the neutral gray -- it is a
+    strawman, and every series in both panels is direct-labelled, so no
+    identity in this figure rests on colour alone.
     """
     steps = read_csv(data_dir / "ddp_mode_steps.csv")
     summary = read_csv(data_dir / "ddp_modes.csv")
     order = ["Naive", "Bucketed", "Interleaved", "PyTorch DDP"]
     colors = {"Naive": GRAY, "Bucketed": "#6A8E3A", "Interleaved": DDP_COLOR,
-              "PyTorch DDP": TCP_COLOR}
+              "PyTorch DDP": "#A63A3A"}
 
     fig = make_subplots(
         rows=2,
@@ -486,11 +494,17 @@ def plot_ddp_modes(data_dir: Path, plots_dir: Path) -> None:
         row_heights=[0.58, 0.42],
         subplot_titles=(
             "Every timed step, global batch 64 over forced TCP/loopback",
-            "Anchor batch 480 — only these two modes were run on NVLink",
+            "Anchor batch 480, by measured all-reduce bandwidth — % is PyTorch DDP against interleaved",
         ),
     )
     for label in order:
-        values = [float(row["step_ms"]) for row in steps if row["label"] == label]
+        # ddp_mode_steps.csv carries every measured (mode, transport, batch);
+        # this panel is the batch-64 matrix only.
+        values = [
+            float(row["step_ms"])
+            for row in steps
+            if row["label"] == label and row["global_batch_seqs"] == "64"
+        ]
         fig.add_box(
             y=values,
             name=label,
@@ -506,21 +520,46 @@ def plot_ddp_modes(data_dir: Path, plots_dir: Path) -> None:
             col=1,
         )
 
+    # Ordered by the measured effective all-reduce bandwidth in transport.csv,
+    # which is the axis the finding runs along.  Rank counts differ (the PCIe
+    # box was rentable at 2 GPUs only), so the tick labels carry them: compare
+    # the two bars inside a fabric, never bar heights across fabrics.
     anchor = [row for row in summary if row["global_batch_seqs"] == "480"]
-    transports = ["NVLink NV12", "Forced TCP/loopback"]
+    transports = [
+        ("NVLink NV12", "NVLink NV12<br>8 ranks · 151 GB/s"),
+        ("A100 PCIe (P2P off, SHM)", "A100 PCIe, host-staged<br>2 ranks · 2.29 GB/s"),
+        ("Forced TCP/loopback", "Forced TCP/loopback<br>8 ranks · 0.92 GB/s"),
+    ]
+    ticks = [tick for _, tick in transports]
+    means = {
+        label: [
+            float(next(row["mean_ms"] for row in anchor
+                       if row["label"] == label and row["transport"] == transport))
+            for transport, _ in transports
+        ]
+        for label in ("Interleaved", "PyTorch DDP")
+    }
+    gaps = [
+        (torch - interleaved) / interleaved * 100
+        for interleaved, torch in zip(means["Interleaved"], means["PyTorch DDP"])
+    ]
     for label in ("Interleaved", "PyTorch DDP"):
         picked = [
-            next(row for row in anchor if row["label"] == label and row["transport"] == transport)
-            for transport in transports
+            next(row for row in anchor
+                 if row["label"] == label and row["transport"] == transport)
+            for transport, _ in transports
         ]
+        text = [f"{label}<br>{value:.0f} ms" for value in means[label]]
+        if label == "PyTorch DDP":
+            text = [f"{cell} ({gap:+.1f}%)" for cell, gap in zip(text, gaps)]
         fig.add_bar(
-            x=transports,
-            y=[float(row["mean_ms"]) for row in picked],
+            x=ticks,
+            y=means[label],
             name=label,
             marker_color=colors[label],
             showlegend=False,
             error_y={"type": "data", "array": [float(row["std_ms"]) for row in picked]},
-            text=[f"{label}<br>{float(row['mean_ms']):.0f} ms" for row in picked],
+            text=text,
             textposition="outside",
             cliponaxis=False,
             hovertemplate="%{x}<br>%{fullData.name}: %{y:.1f} ms<extra></extra>",
@@ -542,21 +581,47 @@ def plot_ddp_modes(data_dir: Path, plots_dir: Path) -> None:
     for annotation in fig.layout.annotations:
         annotation.update(font={"size": 13, "color": "#222222"})
     fig.update_layout(
-        title_text="Four DDP implementations, and how much of the gap is real",
+        title_text="The gap between DDP implementations changes sign with the fabric",
         barmode="group",
         showlegend=False,
+    )
+    # The truncated y axis is what makes this panel misreadable on its own: at 8
+    # sequences per rank the collective is 96% of every step, so mark the floor
+    # all four modes stand on and say what is left for them to differ by.
+    floor_ms = min(
+        float(row["step_ms"]) for row in steps if row["global_batch_seqs"] == "64"
+    )
+    fig.add_hline(
+        y=floor_ms,
+        line_dash="dot",
+        line_color="#333333",
+        line_width=1.2,
+        row=1,
+        col=1,
+    )
+    fig.add_annotation(
+        xref="x domain",
+        yref="y",
+        x=0.01,
+        y=floor_ms,
+        text=f"{floor_ms:.0f} ms — fastest step in any mode",
+        showarrow=False,
+        xanchor="left",
+        yanchor="bottom",
+        font={"size": 11, "color": "#333333"},
     )
     # The empty band above the three fast modes, inside the top panel.
     fig.add_annotation(
         xref="x domain",
         yref="y",
-        x=0.62,
+        x=0.60,
         y=1620,
         text=(
-            "Only naive separates cleanly — its best step is slower than"
-            "<br>every other mode's worst. The other three overlap: their"
-            "<br>fastest steps agree to 2%, and the means differ only"
-            "<br>through the late-run tails."
+            "Only naive separates cleanly, and for a communication reason: it"
+            "<br>sends 75 small collectives where the others send 14 fused ones."
+            "<br>The other three share one 649 MB all-reduce that is 96% of the"
+            "<br>step at this batch, leaving them at most the 49.5 ms of compute"
+            "<br>to differ by. Their minima agree to 0.2%; the rest is tails."
         ),
         showarrow=False,
         xanchor="center",
@@ -564,7 +629,135 @@ def plot_ddp_modes(data_dir: Path, plots_dir: Path) -> None:
         align="center",
         font={"size": 11, "color": "#555555"},
     )
+    # The only free space in the lower panel is above the NVLink pair, which is
+    # 5x shorter than the other two columns. Keep this to what the figure must
+    # say on its own; the mechanism is the appendix's job.
+    fig.add_annotation(
+        xref="x2 domain",
+        yref="y2",
+        x=0.02,
+        y=math.log10(2000),
+        text=(
+            "Both modes compiled, same"
+            "<br>25 MB buckets. Under compile"
+            "<br>only PyTorch DDP still"
+            "<br>overlaps — appendix A1."
+        ),
+        showarrow=False,
+        xanchor="left",
+        yanchor="top",
+        align="left",
+        font={"size": 11, "color": "#555555"},
+    )
     finish(fig, plots_dir / "ddp_mode_comparison", height=780)
+
+
+def plot_ratio_sweep(data_dir: Path, plots_dir: Path) -> None:
+    """Which DDP implementation wins, as a function of compute per communication.
+
+    The four-way comparison used to exist at a single operating point, and that
+    point was the worst possible one: at 8 sequences per rank the collective is
+    96% of the step, so no implementation could differ from another by more than
+    the compute (decisions.md section 26).  This sweeps the micro-batch, which is
+    the knob that actually moves compute against a fixed 649 MB all-reduce -- the
+    model size cancels out of that ratio, and gradient accumulation does not
+    widen the overlap window.
+
+    Every arm runs a different global batch by construction, so absolute step
+    times are not comparable along x.  What is comparable, and what the question
+    asks for, is each mode's step time *relative to the fastest mode at that same
+    micro-batch* -- so the winner sits on 0% and the plot reads as "how much does
+    picking the wrong implementation cost me here".
+
+    Medians, not means: three of four modes showed late-run tails at 15 steps
+    (section 26).  Each point carries a downward whisker to that arm's fastest
+    step, so a position that rests on a tail is visible rather than implied, and
+    ratio_sweep.csv carries mean, median, std and min for every arm.
+    """
+    path = data_dir / "ratio_sweep.csv"
+    if not path.exists():
+        return
+    rows = read_csv(path)
+    order = ["Naive", "Bucketed", "Interleaved", "PyTorch DDP"]
+    colors = {"Naive": GRAY, "Bucketed": "#6A8E3A", "Interleaved": DDP_COLOR,
+              "PyTorch DDP": "#A63A3A"}
+    fabrics = [f for f in ("Native fabric", "Forced TCP/loopback")
+               if any(row["fabric"] == f for row in rows)]
+
+    # No subplot_titles: finish() pins the legend to the row they would occupy,
+    # so the facets name themselves inside their own plotting area instead.
+    fig = make_subplots(rows=1, cols=len(fabrics), shared_yaxes=True,
+                        horizontal_spacing=0.06)
+    for column, fabric in enumerate(fabrics, start=1):
+        here = [row for row in rows if row["fabric"] == fabric]
+        micros = sorted({int(row["micro_batch"]) for row in here})
+        best = {
+            micro: min(float(row["median_ms"]) for row in here
+                       if int(row["micro_batch"]) == micro)
+            for micro in micros
+        }
+        for label in order:
+            points = {int(row["micro_batch"]): float(row["median_ms"])
+                      for row in here if row["label"] == label}
+            if not points:
+                continue
+            fastest = {int(row["micro_batch"]): float(row["min_ms"])
+                       for row in here if row["label"] == label}
+            xs = [micro for micro in micros if micro in points]
+            fig.add_scatter(
+                x=xs,
+                y=[(points[micro] / best[micro] - 1) * 100 for micro in xs],
+                name=label,
+                mode="lines+markers",
+                line={"color": colors[label], "width": 2.5},
+                marker={"size": 8, "color": colors[label]},
+                # Downward only, to each arm's fastest step: these are 10-step
+                # arms with right tails (section 26), so the whisker shows how
+                # much of a mode's position is its tail rather than its speed.
+                error_y={
+                    "type": "data",
+                    "symmetric": False,
+                    "array": [0] * len(xs),
+                    "arrayminus": [(points[micro] - fastest[micro]) / best[micro] * 100
+                                   for micro in xs],
+                    "color": colors[label],
+                    "thickness": 1.2,
+                    "width": 3,
+                },
+                showlegend=(column == 1),
+                hovertemplate=(f"{label}<br>micro-batch %{{x}}<br>"
+                               "%{y:.1f}% slower than the best mode here<extra></extra>"),
+                row=1,
+                col=column,
+            )
+        fig.update_xaxes(title_text="Sequences per rank per backward", type="log",
+                         tickmode="array", tickvals=micros,
+                         ticktext=[str(micro) for micro in micros], row=1, col=column)
+        fig.add_annotation(
+            xref=f"x{'' if column == 1 else column} domain", yref="y domain",
+            x=0.02, y=0.99, text=f"<b>{fabric}</b>", showarrow=False,
+            xanchor="left", yanchor="top", font={"size": 13, "color": "#222222"},
+        )
+    fig.update_yaxes(title_text="Step time above the best mode (%)", row=1, col=1)
+    fig.add_hline(y=0, line_color="#333333", line_width=1)
+    fig.update_layout(
+        title_text="What the implementation is worth, against compute per collective",
+        showlegend=True,
+    )
+    # Two ratios on the throttled fabric: the segment carries a direction, not a
+    # shape.  TCP_MICROS was not forwarded to the pod on the 2026-08-24 run.
+    tcp_micros = sorted({int(row["micro_batch"]) for row in rows
+                         if row["fabric"] == "Forced TCP/loopback"})
+    if len(fabrics) > 1 and len(tcp_micros) < 3:
+        fig.add_annotation(
+            xref="x2 domain", yref="y domain",
+            x=0.45, y=0.20,
+            text=(f"Measured at {len(tcp_micros)} ratios; the segment"
+                  "<br>shows the direction, not the shape."),
+            showarrow=False, xanchor="center", align="center",
+            font={"size": 11, "color": "#555555"},
+        )
+    finish(fig, plots_dir / "ratio_sweep", height=560)
 
 
 def plot_pcie_modes(data_dir: Path, plots_dir: Path) -> None:
@@ -773,32 +966,53 @@ def plot_capacity(data_dir: Path, plots_dir: Path) -> None:
 
 
 def plot_diloco_k_penalty(data_dir: Path, plots_dir: Path) -> None:
-    """How long the merge penalty lasts, at two replica counts.
+    """What the DiLoCo merge penalty costs, measured two ways.
 
-    Plots the gap only. The two arms ran different schedule lengths on different
-    hardware, so their absolute validation losses are not comparable and are
-    deliberately not drawn -- only each arm's distance from its own reference.
+    Two panels, because the loss gap on its own is misleading. The gap is
+    contaminated by the reference's own slope: the reference falls about 10x
+    faster in the warmdown than on the plateau, so a *shrinking* token lag still
+    reads as a *growing* loss gap. The bottom panel inverts the reference curve
+    instead and reports the ratio the project committed to -- how many more
+    tokens DiLoCo needs to reach the same loss.
+
+    Both arms run the same 10000-step trapezoid, the same 500-step validation
+    grid, and the same 491,520 tokens/step, so equal token counts sit at the same
+    point in the LR schedule.  Each is measured against a no-DiLoCo run of that
+    config on its own box; those two references are the same experiment and agree
+    to within 0.016 everywhere.
     """
     rows = [
         row
         for row in read_csv(data_dir / "diloco_k_penalty.csv")
         if int(row["step"]) > 0  # step 0 is the shared init, before any merge
     ]
+    # Replica count is the only variable left: the schedule, the token budget and
+    # the reference config now match, and the hardware does not enter a loss plot.
     series = {}
     for row in rows:
-        label = f"K={row['replicas_k']} ({row['schedule_steps']} steps)"
-        series.setdefault(label, []).append(row)
+        series.setdefault(f"K={int(row['replicas_k'])} replicas", []).append(row)
 
-    fig = Figure()
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.13,
+        subplot_titles=(
+            "Validation loss above the reference",
+            "Tokens needed to reach the same loss",
+        ),
+    )
     colors = {2: TCP_COLOR, 8: DILOCO_COLOR}
     for label, points in series.items():
         replicas = int(points[0]["replicas_k"])
+        color = colors[replicas]
         fig.add_scatter(
             x=[float(row["tokens_billions"]) for row in points],
             y=[float(row["penalty"]) for row in points],
             mode="lines+markers",
             name=label,
-            line={"color": colors[replicas], "width": 2.5},
+            legendgroup=label,
+            line={"color": color, "width": 2.5},
             marker={"size": 7},
             customdata=[
                 [int(row["step"]), float(row["reference_val_loss"]), float(row["diloco_val_loss"])]
@@ -809,26 +1023,8 @@ def plot_diloco_k_penalty(data_dir: Path, plots_dir: Path) -> None:
                 "Reference: %{customdata[1]:.4f}<br>DiLoCo: %{customdata[2]:.4f}<br>"
                 "Penalty: +%{y:.4f}<extra></extra>"
             ),
-        )
-        # Mark where this arm's warmdown begins: the tails diverge there, and the
-        # two arms reach it at different token counts.
-        warmdown_start = int(points[0]["warmdown_start_step"]) * TOKENS_PER_STEP / 1e9
-        fig.add_vline(
-            x=warmdown_start,
-            line_dash="dot",
-            line_color=colors[replicas],
-            line_width=1.2,
-            opacity=0.7,
-        )
-        fig.add_annotation(
-            x=warmdown_start,
-            y=math.log10(2.4),
-            text="warmdown",
-            showarrow=False,
-            xanchor="right",
-            xshift=-4,
-            textangle=-90,
-            font={"size": 10, "color": colors[replicas]},
+            row=1,
+            col=1,
         )
         final = points[-1]
         fig.add_annotation(
@@ -838,50 +1034,173 @@ def plot_diloco_k_penalty(data_dir: Path, plots_dir: Path) -> None:
             showarrow=False,
             xanchor="left",
             xshift=8,
-            font={"color": colors[replicas], "size": 13},
+            font={"color": color, "size": 13},
+            row=1,
+            col=1,
         )
-    fig.update_layout(
-        title="How long the DiLoCo merge penalty lasts",
-        xaxis_title="Training tokens (billions)",
-        yaxis_title="Validation loss above each arm's own reference",
+
+        # Early rounds are worse than any loss the reference logged, so they carry
+        # no ratio -- the curve starts where the comparison first becomes defined.
+        ratio_points = [row for row in points if row["token_ratio"]]
+        clean = [row for row in ratio_points if row["ratio_comparison"] == "clean"]
+        # Mismatched points keep the last clean one so the dashed line joins up.
+        mismatched = ratio_points[len(clean) - 1 :] if len(clean) < len(ratio_points) else []
+        hover = (
+            "%{fullData.name}<br>Step: %{customdata[0]}<br>"
+            "Reference reached this loss at %{customdata[1]:.2f}B tokens<br>"
+            "DiLoCo needs %{y:.2f}x the tokens<extra></extra>"
+        )
+        for segment, dashed in ((clean, False), (mismatched, True)):
+            if not segment:
+                continue
+            fig.add_scatter(
+                x=[float(row["tokens_billions"]) for row in segment],
+                y=[float(row["token_ratio"]) for row in segment],
+                mode="lines+markers",
+                name=label,
+                legendgroup=label,
+                showlegend=False,
+                line={"color": color, "width": 2.5, "dash": "dot" if dashed else "solid"},
+                marker=(
+                    {"size": 8, "symbol": "circle-open", "line": {"color": color, "width": 2}}
+                    if dashed
+                    else {"size": 7}
+                ),
+                customdata=[
+                    [int(row["step"]), float(row["reference_tokens_at_equal_loss"])]
+                    for row in segment
+                ],
+                hovertemplate=hover,
+                row=2,
+                col=1,
+            )
+        # Label the last *clean* point: past it the ratio flatters DiLoCo.
+        final_ratio = clean[-1]
+        fig.add_annotation(
+            x=float(final_ratio["tokens_billions"]),
+            y=float(final_ratio["token_ratio"]),
+            text=f"{float(final_ratio['token_ratio']):.2f}×",
+            showarrow=False,
+            xanchor="left",
+            xshift=8,
+            # Up and right: clear of the parity line at K=2, and of the dashed
+            # continuation, which dives away downward at K=8.
+            yshift=12,
+            font={"color": color, "size": 13},
+            row=2,
+            col=1,
+        )
+
+    # Both arms share a warmdown start now, so this is one line, not one per arm.
+    # It is the point the two panels disagree about: the gap widens there while
+    # the token ratio falls.
+    for warmdown_step in sorted({int(row["warmdown_start_step"]) for row in rows}):
+        warmdown_start = warmdown_step * TOKENS_PER_STEP / 1e9
+        fig.add_vline(
+            x=warmdown_start,
+            line_dash="dot",
+            line_color="#555555",
+            line_width=1.2,
+            opacity=0.7,
+        )
+        fig.add_annotation(
+            x=warmdown_start,
+            y=math.log10(0.45),
+            text="warmdown",
+            showarrow=False,
+            xanchor="right",
+            xshift=-4,
+            textangle=-90,
+            font={"size": 10, "color": "#555555"},
+            row=1,
+            col=1,
+        )
+    # Parity: the reference needed exactly as many tokens for the same loss.
+    fig.add_hline(
+        y=1.0,
+        line_dash="dash",
+        line_color=GRAY,
+        line_width=1.2,
+        row=2,
+        col=1,
     )
-    fig.update_xaxes(range=[0, 5.6])
+    fig.add_annotation(
+        x=0.08,
+        y=1.0,
+        text="no penalty",
+        showarrow=False,
+        xanchor="left",
+        yshift=9,
+        font={"size": 10, "color": GRAY},
+        row=2,
+        col=1,
+    )
+
     fig.update_yaxes(
+        title_text="Loss above reference",
         type="log",
-        range=[math.log10(0.02), math.log10(3.0)],
+        range=[math.log10(0.018), math.log10(3.0)],
         tickmode="array",
         tickvals=[0.03, 0.1, 0.3, 1, 3],
         ticktext=["+0.03", "+0.1", "+0.3", "+1.0", "+3.0"],
+        row=1,
+        col=1,
     )
+    fig.update_yaxes(
+        title_text="× the reference's tokens",
+        range=[0.85, 3.7],
+        tickmode="array",
+        tickvals=[1, 2, 3],
+        ticktext=["1×", "2×", "3×"],
+        row=2,
+        col=1,
+    )
+    fig.update_xaxes(range=[0, 5.6])
+    fig.update_xaxes(title_text="Training tokens (billions)", row=2, col=1)
+    for annotation in fig.layout.annotations:
+        if annotation.text in (
+            "Validation loss above the reference",
+            "Tokens needed to reach the same loss",
+        ):
+            annotation.update(font={"size": 13, "color": "#222222"})
+    fig.update_layout(title_text="What the DiLoCo merge penalty costs")
     fig.add_annotation(
-        x=0.985,
-        y=0.34,
-        xref="paper",
-        yref="paper",
+        x=4.3,
+        y=math.log10(2.6),
         text=(
-            "Each arm against its own reference, on the same token axis."
-            "<br>The two ran different schedule lengths, so they are not at"
-            "<br>the same point in the LR trapezoid at equal tokens — the"
-            "<br>dotted lines mark where each one warms down."
+            "Both arms: same 10,000-step trapezoid, same 500-step validation"
+            "<br>grid, 491,520 tokens/step. Each against a no-DiLoCo run of that"
+            "<br>config on its own box; the two references agree to within 0.016."
         ),
         showarrow=False,
         xanchor="right",
         yanchor="top",
         align="right",
         font={"size": 11, "color": "#555555"},
+        row=1,
+        col=1,
     )
-    # The K=2 reference logged no 5000/5500 point, so its last segment spans a
-    # quarter of the schedule with nothing measured inside it.
     fig.add_annotation(
-        x=2.35,
-        y=math.log10(0.048),
-        text="no reference point logged between these two",
+        x=0.12,
+        y=2.42,
+        text=(
+            "The reference curve inverted. Rounds before ~1B tokens are worse"
+            "<br>than anything the reference logged, so no ratio is defined."
+            "<br>Dotted: both arms run the same 10,000-step schedule, but the"
+            "<br>reference first reached these losses around step 3,400-4,200,"
+            "<br>well before its own warmdown. A warmed-down DiLoCo point is"
+            "<br>matched to a pre-warmdown reference point, which flatters"
+            "<br>DiLoCo — 3.41× is the last clean K=8 value."
+        ),
         showarrow=False,
-        xanchor="center",
-        yanchor="bottom",
-        font={"size": 10, "color": TCP_COLOR},
+        xanchor="left",
+        yanchor="top",
+        align="left",
+        font={"size": 11, "color": "#555555"},
+        row=2,
+        col=1,
     )
-    finish(fig, plots_dir / "diloco_k_penalty")
+    finish(fig, plots_dir / "diloco_k_penalty", height=760)
 
 
 def plot_diloco_transport(data_dir: Path, plots_dir: Path) -> None:
@@ -956,6 +1275,533 @@ def plot_diloco_transport(data_dir: Path, plots_dir: Path) -> None:
     finish(fig, plots_dir / "diloco_transport", height=760)
 
 
+# Owned hardware against rented hardware.  Not the neutral gray used elsewhere
+# for a baseline: gray against DDP_COLOR is ΔE 11.8 to normal vision, which is
+# below the readable floor, while this green is 19.6.  It must never share a
+# figure with DILOCO_COLOR, which it is ΔE 4.2 from under protanopia -- and it
+# does not: the cost-basis figures carry no DiLoCo series.
+OWNED_COLOR = "#6A8E3A"
+
+
+def cost_rows(data_dir: Path) -> dict[str, dict[str, str]]:
+    return {row["config_id"]: row for row in read_csv(data_dir / "costs.csv")}
+
+
+def _bar_panel(
+    fig, *, row, labels, values, colors, template, hover,
+    error=None, text=None, textposition="outside",
+):
+    """One direct-labelled bar panel.
+
+    Every value is printed on its bar, so identity never rests on colour alone
+    and the panels stay readable in grayscale and under any CVD.  `textposition`
+    takes a per-bar list too, for the case where a reference line would otherwise
+    strike through one label.
+    """
+    fig.add_bar(
+        x=labels,
+        y=values,
+        marker_color=colors,
+        text=text if text is not None else values,
+        texttemplate=template,
+        textposition=textposition,
+        cliponaxis=False,
+        showlegend=False,
+        error_y=error,
+        hovertemplate=hover,
+        row=row,
+        col=1,
+    )
+
+
+def plot_time_and_cost(
+    data_dir: Path,
+    plots_dir: Path,
+    *,
+    configs: list[str],
+    name: str,
+    title: str,
+    caption: str,
+) -> None:
+    """Time and price for one converged run, on the machines available to it.
+
+    Two panels rather than two y axes on one plot: hours and dollars are
+    different scales and a twin axis makes their crossing point an artifact of
+    where the axes are pinned.  Stacked panels share the categorical x axis and
+    each keeps a single scale, so the comparison is the reader's to make.
+
+    Colour carries the one thing that must not be silently averaged: the desktop
+    is *owned*, priced from wall power and electricity, while every other bar is
+    a rental rate.  Those are not the same kind of dollar and the legend says so.
+    """
+    priced = cost_rows(data_dir)
+    rows = [priced[config] for config in configs if config in priced]
+    labels = [row["display_name"] for row in rows]
+    hours = [float(row["runtime_hours"]) for row in rows]
+    costs = [float(row["total_cost"]) for row in rows]
+    bases = [row["cost_basis"] for row in rows]
+    colors = [OWNED_COLOR if basis.startswith("wall power") else DDP_COLOR for basis in bases]
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=("", "Price of that one run"),
+    )
+    _bar_panel(
+        fig,
+        row=1,
+        labels=labels,
+        values=hours,
+        colors=colors,
+        template="%{y:.2f} h",
+        hover="%{x}<br>%{y:.3f} h<extra></extra>",
+    )
+    _bar_panel(
+        fig,
+        row=2,
+        labels=labels,
+        values=costs,
+        colors=colors,
+        template="$%{y:.2f}",
+        hover="%{x}<br>$%{y:.2f}<extra></extra>",
+    )
+    # A legend for the cost basis, drawn as two empty traces: the bars above are
+    # a single trace each, so this is the only way to name the two colours.
+    present = {
+        "Rented, hourly rate": any(basis == "rental" for basis in bases),
+        "Owned, wall power": any(basis.startswith("wall power") for basis in bases),
+    }
+    for basis, color in (("Rented, hourly rate", DDP_COLOR), ("Owned, wall power", OWNED_COLOR)):
+        if present[basis]:
+            fig.add_bar(x=[None], y=[None], name=basis, marker_color=color, showlegend=True)
+
+    fig.update_yaxes(
+        title_text="Hours to validation loss 3.28", range=[0, max(hours) * 1.22],
+        row=1, col=1,
+    )
+    fig.update_yaxes(title_text="US dollars", range=[0, max(costs) * 1.22], row=2, col=1)
+    for annotation in fig.layout.annotations:
+        annotation.update(font={"size": 13, "color": "#222222"})
+    fig.update_layout(title_text=title, barmode="group")
+    fig.add_annotation(
+        x=0.99,
+        y=0.99,
+        xref="paper",
+        yref="paper",
+        text=caption,
+        showarrow=False,
+        xanchor="right",
+        yanchor="top",
+        align="right",
+        font={"size": 11, "color": "#555555"},
+    )
+    finish(fig, plots_dir / name, height=700)
+
+
+def plot_transport_cost(data_dir: Path, plots_dir: Path) -> None:
+    """What a converged run costs on each fabric, and why the ranking is not the price.
+
+    Three panels because price is a product of two independent things: the hours
+    the fabric makes you buy and the hourly rate of the SKU.  Putting hours and
+    cost on twin y axes would invite reading their crossing as meaningful;
+    stacked single-scale panels let the reader multiply the first two into the
+    third.  The result is the writeup's point: the PCIe box is the cheapest
+    machine per hour and one of the more expensive runs.
+
+    The single A100 leads the row as the thing every fabric is being bought
+    *instead of* -- it has no all-reduce at all, so it belongs before the
+    bandwidth ordering rather than inside it, and it is the only bar whose rate
+    is a one-GPU rate.
+
+    The netem rows carry no rate: nothing was ever quoted for a throttled link,
+    so their rate and cost bars are deliberately absent rather than zero.
+    """
+    rows = read_csv(data_dir / "transport_costs.csv")
+    rows.sort(key=lambda row: -float(row["effective_bus_gbps"]))
+    single = next(
+        row for row in read_csv(data_dir / "costs.csv") if row["config_id"] == "a100x1"
+    )
+    single_hours = float(single["runtime_hours"])
+    single_cost = float(single["total_cost"])
+
+    # Six categories leave about 125 px per tick and plotly rotates anything
+    # wider, so the long transport names are pre-wrapped instead of tilted.
+    wrapped = {
+        "A100 PCIe (P2P off, SHM)": "A100 PCIe<br>(P2P off, SHM)",
+        "netem nominal 40 Gbit/s": "netem nominal<br>40 Gbit/s",
+        "netem nominal 10 Gbit/s": "netem nominal<br>10 Gbit/s",
+    }
+    labels = ["1×A100 baseline<br>no all-reduce"] + [
+        f"{wrapped.get(row['transport'], row['transport'])}"
+        f"<br>{float(row['effective_bus_gbps']):.2f} GB/s"
+        for row in rows
+    ]
+    evidence = [single["evidence"]] + [row["ddp_evidence"] for row in rows]
+    colors = [
+        DDP_COLOR if item == "Measured step time" else DILOCO_COLOR for item in evidence
+    ]
+    # A missing rate reads as NaN and plots as no bar; only the priced ones may
+    # set an axis range.
+    rates = [float(single["hourly_rental_rate"])] + [
+        float(row["usd_per_hour"]) for row in rows
+    ]
+    hours = [single_hours] + [float(row["ddp_hours"]) for row in rows]
+    costs = [single_cost] + [float(row["ddp_cost"]) for row in rows]
+
+    def axis_top(values: list[float], headroom: float) -> float:
+        return max(value for value in values if not math.isnan(value)) * headroom
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.09,
+        subplot_titles=(
+            "",
+            "What the machine costs by the hour",
+            "Price of one converged run — the product of the two above",
+        ),
+    )
+    # A bar ending just under the one-GPU rule would have its outside label
+    # struck through by that line, so those few label themselves inside.
+    clearance = axis_top(hours, 1.25) * 0.09
+    _bar_panel(
+        fig,
+        row=1,
+        labels=labels,
+        values=hours,
+        colors=colors,
+        template="%{y:.2f} h",
+        hover="%{x}<br>%{y:.2f} h<extra></extra>",
+        textposition=[
+            "inside" if 0 < single_hours - value < clearance else "outside"
+            for value in hours
+        ],
+    )
+    _bar_panel(
+        fig,
+        row=2,
+        labels=labels,
+        values=rates,
+        colors=colors,
+        template="$%{y:.2f}",
+        hover="%{x}<br>$%{y:.2f}/h<extra></extra>",
+    )
+    _bar_panel(
+        fig,
+        row=3,
+        labels=labels,
+        values=costs,
+        colors=colors,
+        template="$%{y:.0f}",
+        hover="%{x}<br>$%{y:.2f}<extra></extra>",
+    )
+    for name, color in (
+        ("Measured step time", DDP_COLOR),
+        ("Reconstructed step time", DILOCO_COLOR),
+    ):
+        fig.add_bar(x=[None], y=[None], name=name, marker_color=color, showlegend=True)
+
+    # finish() pins the legend to the strip the first row's subplot title would
+    # occupy, so that panel names itself inside its own plotting area.
+    fig.add_annotation(
+        xref="x domain",
+        yref="y domain",
+        x=0.02,
+        y=0.99,
+        text="How many hours the fabric makes you buy",
+        showarrow=False,
+        xanchor="left",
+        yanchor="top",
+        row=1,
+        col=1,
+    )
+    # The same ruler in both panels: what one A100 charges you in time, and in
+    # money. Its label dodges left of the netem bars, which reach past the line.
+    fig.add_hline(
+        y=single_hours,
+        line_dash="dash",
+        line_color="#333333",
+        line_width=1.2,
+        row=1,
+        col=1,
+    )
+    fig.add_annotation(
+        xref="x domain",
+        yref="y",
+        x=0.30,
+        y=single_hours,
+        text=f"One A100 alone: {single_hours:.2f} h",
+        showarrow=False,
+        xanchor="left",
+        yanchor="bottom",
+        font={"size": 11, "color": "#333333"},
+        row=1,
+        col=1,
+    )
+    fig.add_hline(
+        y=single_cost,
+        line_dash="dash",
+        line_color="#333333",
+        line_width=1.2,
+        row=3,
+        col=1,
+    )
+    fig.add_annotation(
+        xref="x3 domain",
+        yref="y3",
+        x=0.98,
+        y=single_cost,
+        text=f"One A100 alone: ${single_cost:.2f}",
+        showarrow=False,
+        xanchor="right",
+        yanchor="bottom",
+        font={"size": 11, "color": "#333333"},
+        row=3,
+        col=1,
+    )
+    fig.update_yaxes(title_text="Hours", range=[0, axis_top(hours, 1.25)], row=1, col=1)
+    fig.update_yaxes(
+        title_text="US dollars / hour", range=[0, axis_top(rates, 1.3)], row=2, col=1
+    )
+    fig.update_yaxes(
+        title_text="US dollars", range=[0, axis_top(costs, 1.25)], row=3, col=1
+    )
+    for annotation in fig.layout.annotations:
+        annotation.update(font={"size": 13, "color": "#222222"})
+    fig.update_layout(title_text="What each fabric costs per converged run")
+    fig.add_annotation(
+        xref="x3 domain",
+        yref="y3 domain",
+        x=0.02,
+        y=0.99,
+        text=(
+            "Rates priced 2026-08-24 and quoted per SKU, so venue and fabric"
+            "<br>move together — see cost_inputs.csv. The PCIe bar is a 2-rank"
+            "<br>measurement projected to 8, and its rate is a listed price"
+            "<br>with no stock behind it. The netem links were never quoted,"
+            "<br>so they are priced nowhere."
+        ),
+        showarrow=False,
+        xanchor="left",
+        yanchor="top",
+        align="left",
+        font={"size": 11, "color": "#555555"},
+    )
+    finish(fig, plots_dir / "transport_cost", height=900)
+
+
+def plot_equal_token_cost(data_dir: Path, plots_dir: Path) -> None:
+    """What the same token budget costs under DDP and under DiLoCo.
+
+    The companion to `equal_token_runtime`: same 4.915B tokens, same box, same
+    rate, so the bars differ only by method.  They are nearly equal, which is
+    the finding -- on NVLink DiLoCo buys no time and therefore no money, while
+    ending 0.245 worse.  Cost per run is not cost per result.
+    """
+    priced = cost_rows(data_dir)
+    rows = [priced[config] for config in ("ddp_equal_tokens", "diloco_equal_tokens")]
+    labels = ["DDP", "DiLoCo (H=500)"]
+    costs = [float(row["total_cost"]) for row in rows]
+    losses = [3.2730, 3.5183]
+    fig = Figure()
+    fig.add_bar(
+        x=labels,
+        y=costs,
+        marker_color=[DDP_COLOR, DILOCO_COLOR],
+        text=[f"${value:.2f}" for value in costs],
+        textposition="outside",
+        cliponaxis=False,
+        showlegend=False,
+        customdata=[[loss, float(row["runtime_hours"])] for loss, row in zip(losses, rows)],
+        hovertemplate=(
+            "%{x}<br>$%{y:.2f}<br>%{customdata[1]:.3f} h"
+            "<br>Validation loss %{customdata[0]:.4f}<extra></extra>"
+        ),
+    )
+    for label, cost, loss in zip(labels, costs, losses):
+        fig.add_annotation(
+            x=label,
+            y=cost / 2,
+            text=f"ends at<br>val {loss:.4f}",
+            showarrow=False,
+            font={"size": 12, "color": "#FFFFFF"},
+        )
+    fig.update_layout(
+        title="Price of an equal 4.915B-token budget on 8×A100",
+        xaxis_title="Method",
+        yaxis_title="US dollars",
+    )
+    fig.update_yaxes(range=[0, max(costs) * 1.25])
+    fig.add_annotation(
+        x=0.5,
+        y=0.99,
+        xref="paper",
+        yref="paper",
+        text=(
+            "Same box and the same $17.56/h, so only the method differs. Equal spend, "
+            "worse result:<br>only the DDP bar is also a time to 3.28 — DiLoCo never "
+            "reached the target inside this corpus."
+        ),
+        showarrow=False,
+        xanchor="center",
+        yanchor="top",
+        align="center",
+        font={"size": 11, "color": "#555555"},
+    )
+    finish(fig, plots_dir / "equal_token_cost")
+
+
+def plot_diloco_transport_cost(data_dir: Path, plots_dir: Path) -> None:
+    """Where DiLoCo's low communication is worth money rather than milliseconds.
+
+    The runtime companion of this figure already exists; this one multiplies each
+    bar by that SKU's hourly rate, which reorders nothing on its own -- DDP and
+    DiLoCo share a machine on every fabric -- but puts the gap in the units the
+    question was asked in.  DiLoCo's hours charge section 18's 2.49x token ratio,
+    an estimate rather than a measured crossing, so every orange bar inherits it.
+    """
+    rows = read_csv(data_dir / "transport_costs.csv")
+    rows.sort(key=lambda row: -float(row["effective_bus_gbps"]))
+    labels = [
+        f"{row['transport']}<br>{float(row['effective_bus_gbps']):.2f} GB/s" for row in rows
+    ]
+    fig = Figure()
+    for name, column, color in (
+        ("DDP", "ddp_cost", DDP_COLOR),
+        ("DiLoCo (H=500)", "diloco_cost", DILOCO_COLOR),
+    ):
+        values = [float(row[column]) for row in rows]
+        fig.add_bar(
+            x=labels,
+            y=values,
+            name=name,
+            marker_color=color,
+            text=[f"${value:.0f}" for value in values],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="%{x}<br>%{fullData.name}: $%{y:.2f}<extra></extra>",
+        )
+    costs = [float(row[column]) for row in rows for column in ("ddp_cost", "diloco_cost")]
+    fig.update_layout(
+        title="Price of one converged run: DDP against DiLoCo, by fabric",
+        xaxis_title="Transport",
+        yaxis_title="US dollars",
+        barmode="group",
+    )
+    fig.update_yaxes(range=[0, max(costs) * 1.15])
+    fig.add_annotation(
+        x=0.03,
+        y=0.93,
+        xref="paper",
+        yref="paper",
+        text=(
+            "Both methods pay the same hourly rate on each fabric, so this is"
+            "<br>the runtime figure in dollars. DiLoCo bars are reconstructed and"
+            "<br>charge §18's 2.49× token ratio — an estimate; DiLoCo never"
+            "<br>reached 3.28 inside this corpus."
+        ),
+        showarrow=False,
+        xanchor="left",
+        yanchor="top",
+        align="left",
+        font={"size": 11, "color": "#555555"},
+    )
+    finish(fig, plots_dir / "diloco_transport_cost")
+
+
+def plot_diloco_transport_mfu(data_dir: Path, plots_dir: Path) -> None:
+    """How much of the GPUs each method actually uses as the fabric slows.
+
+    The DDP-only version of this figure falls off a cliff; the point of putting
+    DiLoCo beside it is that its bars barely move, because an outer sync every
+    500 steps is 1/500th of the traffic.  MFU here is the same PaLM-style
+    numerator and the same measured bf16 roofline as everywhere else, so a
+    reconstructed step time yields a lower-bound utilization.
+    """
+    rows = read_csv(data_dir / "diloco_transport.csv")
+    rows.sort(key=lambda row: -float(row["effective_bus_gbps"]))
+    labels = [
+        f"{row['transport']}<br>{float(row['effective_bus_gbps']):.2f} GB/s" for row in rows
+    ]
+
+    def mfu(step_ms: float) -> float:
+        return (
+            100
+            * MODEL_FLOPS_PER_TOKEN
+            * TOKENS_PER_STEP
+            / (step_ms / 1000)
+            / (TRANSPORT_GPUS * A100_SXM4_40GB_TFLOPS * 1e12)
+        )
+
+    fig = Figure()
+    for name, column, color in (
+        ("DDP", "ddp_step_ms_batch480", DDP_COLOR),
+        ("DiLoCo (H=500)", "diloco_step_ms_batch480", DILOCO_COLOR),
+    ):
+        values = [mfu(float(row[column])) for row in rows]
+        fig.add_bar(
+            x=labels,
+            y=values,
+            name=name,
+            marker_color=color,
+            text=[f"{value:.1f}%" for value in values],
+            textposition="outside",
+            cliponaxis=False,
+            customdata=[[float(row[column])] for row in rows],
+            hovertemplate=(
+                "%{x}<br>%{fullData.name}: %{y:.1f}%"
+                "<br>Step time: %{customdata[0]:.0f} ms<extra></extra>"
+            ),
+        )
+    single = next(
+        row for row in read_csv(data_dir / "scaling.csv") if row["config"] == "1xA100"
+    )
+    single_mfu = (
+        100
+        * MODEL_FLOPS_PER_TOKEN
+        * TOKENS_PER_STEP
+        / (float(single["step_ms"]) / 1000)
+        / A100_SXM4_40GB_TFLOPS
+        / 1e12
+    )
+    fig.add_hline(
+        y=single_mfu,
+        line_dash="dash",
+        line_color="#333333",
+        line_width=1.2,
+    )
+    fig.update_layout(
+        title="Model FLOPs utilization: DDP against DiLoCo, by fabric",
+        xaxis_title="Transport",
+        yaxis_title="MFU (%)",
+        barmode="group",
+    )
+    # Headroom for a caption band: every DiLoCo bar reaches about 60%, so there
+    # is no free corner left inside the data.
+    fig.update_yaxes(range=[0, max(single_mfu, 62) * 1.6])
+    fig.add_annotation(
+        x=0.99,
+        y=0.97,
+        xref="paper",
+        yref="paper",
+        text=(
+            f"Dashed: one A100 on its own, {single_mfu:.1f}%. DiLoCo holds that level on every"
+            "<br>fabric, because it all-reduces once per 500 steps. That is a claim about the"
+            "<br>GPUs, not about the result: at equal tokens DiLoCo ends 0.245 worse, and it"
+            "<br>needs about 2.5× the tokens to catch up."
+        ),
+        showarrow=False,
+        xanchor="right",
+        yanchor="top",
+        align="right",
+        font={"size": 11, "color": "#555555"},
+    )
+    finish(fig, plots_dir / "diloco_transport_mfu")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     root = Path(__file__).resolve().parents[1]
@@ -975,8 +1821,37 @@ def main(argv: list[str] | None = None) -> int:
     plot_transport_mfu(args.data, args.output)
     plot_equal_token_runtime(args.data, args.output)
     plot_ddp_modes(args.data, args.output)
+    plot_ratio_sweep(args.data, args.output)
     plot_pcie_modes(args.data, args.output)
     plot_diloco_sync(args.data, args.output)
+    plot_time_and_cost(
+        args.data,
+        args.output,
+        configs=["rtx3090_desktop_estimate", "a100x1"],
+        name="time_and_cost_baseline",
+        title="One GPU: how long the baseline takes, and what it costs",
+        caption=(
+            "Both bars extrapolate a measured step time to the measured step-9999"
+            "<br>crossing. The desktop is owned hardware: 800 W average at $0.23/kWh,"
+            "<br>no capital allocation, so it is a floor rather than a like-for-like price."
+        ),
+    )
+    plot_time_and_cost(
+        args.data,
+        args.output,
+        configs=["rtx3090_desktop_estimate", "a100x1", "a100x8_nvlink"],
+        name="time_and_cost_scaling",
+        title="Adding the ideal 8-GPU box: 7.66× the speed, roughly the same price",
+        caption=(
+            "Eight A100s over NVLink cost about what one A100 costs for the same run:"
+            "<br>the rate is 8× but the hours are 7.66× fewer. Scaling is nearly free"
+            "<br>here — it is the slower fabrics, further on, that are not."
+        ),
+    )
+    plot_transport_cost(args.data, args.output)
+    plot_equal_token_cost(args.data, args.output)
+    plot_diloco_transport_cost(args.data, args.output)
+    plot_diloco_transport_mfu(args.data, args.output)
     print(f"wrote interactive HTML, SVG, and PNG plots to {args.output}")
     return 0
 

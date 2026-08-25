@@ -25,11 +25,12 @@ uv run --extra plots python scripts/plot_writeup.py
 | [`pcie.csv`](pcie.csv) | The 2026-08-22 A100-PCIe session: five batch-480 arms on one box, with MFU against that card's own measured peak. |
 | [`diloco_sync.csv`](diloco_sync.csv) | Per-rank validation spread and the effect of each DiLoCo outer merge. |
 | [`diloco_transport.csv`](diloco_transport.csv) | DDP and DiLoCo step time at each measured transport, with DiLoCo's outer sync amortized over H=500. |
-| [`diloco_k_penalty.csv`](diloco_k_penalty.csv) | Validation-loss cost of the outer merge over the whole schedule, at K=2 and K=8. |
+| [`diloco_k_penalty.csv`](diloco_k_penalty.csv) | Cost of the outer merge over the whole schedule, at K=2 and K=8 — as a validation-loss gap and as the token ratio to reach equal loss. |
 | [`transport_crossovers.csv`](transport_crossovers.csv) | The two bandwidths where the ranking of the options flips. |
 | [`capacity_availability.csv`](capacity_availability.csv) / [`capacity_timeline.csv`](capacity_timeline.csv) | Measured 8-GPU stock at both venues, per poll and summarized. |
-| [`ddp_modes.csv`](ddp_modes.csv) | Every measured (implementation, transport, batch): four modes at batch 64 over sockets, two at the anchor batch on NVLink and sockets. |
-| [`ddp_mode_steps.csv`](ddp_mode_steps.csv) | The individual timed steps behind the batch-64 comparison, because its means are tail-driven. |
+| [`ddp_modes.csv`](ddp_modes.csv) | Every measured (implementation, transport, batch): four modes at batch 64 over sockets, two at the anchor batch on NVLink, real A100 PCIe and sockets. |
+| [`ddp_mode_steps.csv`](ddp_mode_steps.csv) | Every individual timed step behind `ddp_modes.csv`, because the means are tail-driven. |
+| [`ratio_sweep.csv`](ratio_sweep.csv) | Four DDP modes across four micro-batches on 2×A100-SXM4-80GB, native NVLink and forced TCP: the mode ranking as a function of compute per collective. |
 | [`cost_inputs.csv`](cost_inputs.csv) | Prefilled runtimes and blank rate/energy fields for the progressive cost plots. This file is user-edited and is not overwritten by the collector. |
 | [`data_gaps.csv`](data_gaps.csv) | Coverage manifest with exact missing measurements. |
 
@@ -38,7 +39,7 @@ The main collected results are:
 - 1×A100: **2589.1 ms/step**, **7.19 h** projected to the measured step-9999 crossing.
 - 8×A100 NVLink: **337.8 ms/step**, **0.94 h**, **7.66× speedup**, **95.8% scaling efficiency** at matched per-device micro-batch.
 - 8×A100 forced TCP/loopback: **1.22–1.27 s/step**, **3.38–3.53 h**, depending on the selected DDP implementation.
-- 1×RTX 3090: **21.30 h estimated** from an existing Trackio run's 7.6684 s/step average and the independently measured step-9999 crossing. The 3090 run itself stopped at val 3.332745 and did not cross 3.28.
+- 1×RTX 3090: **21.22 h measured** — `ref-1gpu-10k` (aurora, 2026-08-24) crossed 3.28 at step 9999 at val 3.2678, 76403.7 training seconds at 7.6333 s/step and 66.6% MFU. Run as the K=2 DiLoCo arm's single-GPU reference, so it cost nothing extra; it confirms the earlier 21.299 h Trackio extrapolation to 0.36%. At 800 W and $0.23/kWh that is **$3.91** of electricity, against **$14.31** to rent one A100 for the same convergence.
 - Transport MFU: **57.6% NVLink**, **15.3% TCP**, with lower bounds of **8.9%** and **2.6%** from the reconstructed nominal 40 and 10 Gbit points.
 - A100 80GB PCIe, measured 2026-08-22 on 2 GPUs: **2.29 GB/s** effective
   all-reduce bandwidth, **1745.4 ms/step** at global batch 480, **79.8%** scaling
@@ -54,18 +55,44 @@ The main collected results are:
   apart — and their mean ordering is produced by late-run tails, not by the
   implementations. Bucketed's *median* (1140.8 ms) is faster than interleaved's
   (1176.7 ms), reversing the mean ranking.
-- At the anchor batch of 480 the question mostly dissolves: interleaved versus
-  PyTorch DDP is **337.8 vs 340.3 ms on NVLink** (0.7%, σ≈0.8) and **1218.4 vs
-  1270.3 ms over sockets** (4.3%).
+- Ratio sweep, 2×A100-SXM4-80GB, 2026-08-24 ($2.13 over two rentals): on **NVLink**
+  all four modes sit within **2.2%** at 8 seqs/rank and **1.7%** at 60 — naive
+  included. On **forced TCP** `ddp_torch` wins at every ratio by **10.1%** (micro 8)
+  rising to **32.4%** (micro 60). Subtracting compute, compiled interleaved exposes
+  the whole collective while `ddp_torch` hides **9–11%** of it at micro 8 and **50%**
+  at micro 60: overlap is bounded by the compute available to hide behind (§28).
+- **Socket step times are host-specific.** Two boxes of the same SKU agreed to
+  **3.1%** on every NVLink arm and differed by **20.8–45.8%** on every forced-TCP
+  arm. Quote socket ratios only within one box; this qualifies the netem ladder
+  and the forced-TCP control too.
+- At the anchor batch of 480 the interleaved-versus-PyTorch gap **changes sign
+  with the fabric**: **337.8 vs 340.3 ms on NVLink** (+0.8%, σ≈0.8), **1869.3 vs
+  1745.4 ms on real A100 PCIe at 2 ranks** (−6.6%, and the minima are 7.5σ
+  apart), **1218.4 vs 1270.3 ms over sockets** (+4.3%, but PyTorch DDP's fastest
+  step is the faster of the two — a tail, not a finding). Under `torch.compile`
+  our interleaved mode does not overlap at all and PyTorch DDP does, so the two
+  are trading exposed communication against lost fusion; which wins is set by
+  the fabric (`docs/decisions.md` §26).
 - Rentability of an 8-GPU node, 2026-08-19 to 2026-08-21: RunPod A100-SXM4-80GB in
   stock on **2.8%** of 247 polls, RunPod H100 on **26.3%**, Prime Intellect A100 on
   **99.0%** of 103. The A100 that was available billed at $22.32/h; the one that was
   not billed at $12.72/h.
-- DiLoCo merge penalty: mostly transient. It decays from **+0.83 → +0.031** at K=2
-  and **+2.07 → +0.245** at K=8, most of it inside the first ~1B tokens, settling
-  about **7× higher at K=8** before the warmdown lifts both slightly. **Caveat:** the
-  committed K=2 arm ran 6000 steps against K=8's 10000, so K is confounded with the
-  schedule. Matched 10000-step K=2 arms are in flight — see below.
+- DiLoCo merge penalty: mostly transient, and **the loss gap overstates it**. Over
+  the plateau the gap decays from **+0.84 → +0.025** at K=2 and **+2.07 → +0.205**
+  at K=8, most of it inside the first ~1B tokens. The gap then *widens* through the
+  warmdown, to **+0.057** and **+0.245** — but that is the reference's own slope,
+  not a regression: the reference falls about **10× faster** in the warmdown than on
+  the plateau, so an unchanged token lag reads as a bigger loss gap. Inverting the
+  reference curve instead: DiLoCo needs **1.15–1.25×** the reference's tokens for
+  equal loss at K=2 and **2.7–3.4×**, rising with training, at K=8. Report the token
+  ratio, not the loss gap — same conclusion as §23's crossing ratio. **The inversion
+  is only valid while both sides sit on the same side of the warmdown**, which the
+  `ratio_comparison` column records: at K=2 the warmdown points match the reference's
+  own warmdown and are clean, ending at **1.05×**, but at K=8 they match reference
+  points still on the plateau, so the apparent fall to 2.36× is a schedule-position
+  artifact, not a catch-up. **3.41×** at step 9000 is the last clean K=8 value. Both
+  arms now run the same 10000-step trapezoid on a 500-step validation
+  grid, so K is no longer confounded with the schedule — see below.
 - End to end, DiLoCo lands at **2.25–2.35 h across every transport** while DDP runs
   0.94 h on NVLink and 21.10 h at netem-10 — it loses on a good fabric and wins on
   a bad one.
@@ -89,10 +116,11 @@ Every entry is currently rendered as `.svg` under
 | [`transport_sensitivity.svg`](../plots/transport_sensitivity.svg) | Target time versus effective all-reduce bandwidth, with the 1×A100 time and the 0.50 GB/s break-even marked. | NVLink/forced TCP measured; 40/10 Gbit reconstructed upper bounds. |
 | [`transport_mfu.svg`](../plots/transport_mfu.svg) | Effective MFU lost as transport slows, against the 60.1% a single A100 reaches alone. | Measured points plus lower bounds derived from reconstructed times. |
 | [`equal_token_runtime.svg`](../plots/equal_token_runtime.svg) | DDP and DiLoCo wall clock through the same 4.915B tokens. | Measured; explicitly not DiLoCo time-to-convergence. |
-| [`ddp_mode_comparison.svg`](../plots/ddp_mode_comparison.svg) | Which implementation gaps survive the measurement noise, at batch 64 and at the anchor batch. | 15 timed steps after 5 warmups, drawn individually; anchor-batch bars are 20-step means. |
+| [`ddp_mode_comparison.svg`](../plots/ddp_mode_comparison.svg) | Which implementation gaps survive the noise, and that the surviving one changes sign with the fabric. | 15 timed steps after 5 warmups, drawn individually; anchor-batch bars are 12–15-step means on all three measured fabrics. |
+| [`ratio_sweep.svg`](../plots/ratio_sweep.svg) | That the implementation is worth ~0% on NVLink at any batch and up to 31% on sockets, and that the micro-batch is what unlocks it. | 10 timed steps after 6 warmups per arm, 24 arms on one box. |
 | [`pcie_modes.svg`](../plots/pcie_modes.svg) | Compilation is worth 1.64× on real PCIe; overlap is worth nothing. | 15 measured steps after 10 warmups, 2×A100 PCIe. |
 | [`diloco_outer_sync.svg`](../plots/diloco_outer_sync.svg) | Replica spread and whether each outer merge helps or hurts validation. | Measured pre/post-sync evaluations. |
-| [`diloco_k_penalty.svg`](../plots/diloco_k_penalty.svg) | How long the merge penalty lasts at K=2 and K=8. | Measured curves. Each arm is drawn only against its own reference — the two arms' absolute losses are not comparable. |
+| [`diloco_k_penalty.svg`](../plots/diloco_k_penalty.svg) | What the merge penalty costs at K=2 and K=8: the loss gap, then the tokens to reach equal loss. | Measured curves on a shared 10000-step schedule at 491,520 tokens/step. Each arm is drawn against a no-DiLoCo run of the same config on its own box; those two references are the same experiment and agree to within 0.016 at every step. |
 | [`diloco_transport.svg`](../plots/diloco_transport.svg) | Where DiLoCo's low communication starts to pay: per step, then end to end with its 2.49× step penalty charged. | DDP measured/reconstructed; DiLoCo reconstructed at H=500; the step ratio is §18's estimate. |
 
 ### Entering costs
@@ -109,6 +137,12 @@ across rows that will appear in the same plot.
   `electricity_price_per_kwh`, plus capital and fixed costs.
 - Use `total_cost_override` when the provider supplied an authoritative billed
   amount or when a different accounting convention is required.
+
+Rates currently in the file are a **2026-08-24 list-price snapshot**: RunPod
+secure cloud and Prime Intellect on-demand, averaged where both venues quote the
+shape, single-venue where only one does. Each row's `notes` records which quotes
+it came from. They are list prices, not billed amounts -- prefer
+`total_cost_override` for a row that has a real invoice.
 
 Rows with `missing_measurement` deliberately have no runtime. The DiLoCo
 equal-token row is not comparable to time-to-3.28 rows until DiLoCo converges.
@@ -143,8 +177,17 @@ caveats travel with it and are drawn into the figure rather than left in prose:
 
 Both implementations use the same 25 MB bucket cap — `ddp_torch` is constructed
 with `bucket_cap_mb` from the same `--ddp-bucket-size` the hand-rolled modes use —
-so the comparison is not a tuning artifact. Under `torch.compile` DDPOptimizer
-graph-breaks at bucket boundaries, which is why the two land so close.
+so the comparison is not a tuning artifact. Every row is compiled, and gradient
+accumulation is excluded from communication on both sides (`no_sync()` for
+`ddp_torch`, `set_last_iteration()` for ours).
+
+What the two are actually trading is measured in `docs/decisions.md` §26 and
+reproducible for free with `scripts/probe_compile_overlap.py`: under
+`torch.compile` AOTAutograd fuses the backward into one node, so the hand-rolled
+hooks all fire at its end and compiled `ddp_interleaved` is bucketed with an
+async launch; DDPOptimizer splits the graph into 14 subgraphs at the bucket
+boundaries and keeps the eager gradient-arrival profile, paying for it in fusion
+lost at each seam. Never quote compiled interleaved as evidence about overlap.
 
 ## Plots still missing
 
@@ -169,20 +212,16 @@ only 1.2 Gbit/s effective and puts an 8-GPU DDP run at 21.1 h against one A100's
 [`transport_crossovers.csv`](transport_crossovers.csv) where eight GPUs stop
 beating one. A lower point would extend a curve whose conclusion is settled.
 
-**A direct RTX 3090 convergence run.** The 21.30 h figure is a step-time
-extrapolation on exactly the same footing as the 1×A100 7.19 h bar; only the cost
-inputs are open.
-
 **Seed error bars.** Not worth the aurora-days or the rental.
 
-### In flight: the matched-schedule K=2 arms
+### Landed: the matched-schedule K=2 arms
 
-The K=2 and K=8 DiLoCo arms ran different schedule lengths (6000 versus 10000
-steps), so no shared x axis makes their penalties strictly comparable — a
+The K=2 and K=8 DiLoCo arms used to run different schedule lengths (6000 versus
+10000 steps), so no shared x axis made their penalties strictly comparable — a
 normalized one implies equal progress at equal position, and a token axis leaves
 them at different points in the LR trapezoid. `scripts/run-k2-10k-arms.sh`
-removes the confound by putting both K=2 arms on the K=8 arm's schedule.
-Launched on aurora 2026-08-22, ~36 h sequential on one GPU, $0:
+removed the confound by putting both K=2 arms on the K=8 arm's schedule. Run on
+aurora 2026-08-22 to 2026-08-24, ~36 h sequential on one GPU, $0:
 
 1. `diloco-k2-10k` — the existing arm **resumed from its step-4000 checkpoint**
    with `--max-steps 10000`. `lr_at()` holds the LR constant from `warmup_steps`
@@ -195,7 +234,24 @@ Launched on aurora 2026-08-22, ~36 h sequential on one GPU, $0:
 2. `ref-1gpu-10k` — a fresh 10000-step single-GPU reference. `checkpoints/ckpt.pt`
    could not serve: it is `rotary-calibration-3B` at `next_step=8500` on a
    **9000**-step schedule, already past a warmdown restart, which is exactly why
-   that run's validation jumped 3.3664 → 3.4638 at step 6250.
+   that run's validation jumped 3.3664 → 3.4638 at step 6250. It ends at **3.2678**,
+   reaching the 3.28 target at step 9999.
+
+Both finished. The K=2 arm ends at **3.3248** against that reference — a gap of
+**+0.057**, wider than the +0.031 §23 reported at 6000 steps, because the matched
+schedule now runs the arm through the warmdown that the 6000-step arm stopped
+short of. In token terms it is the opposite: **1.05×** the reference's tokens for
+equal loss at the endpoint, against 1.25× on the plateau — and at K=2 that endpoint
+figure is clean, because the reference reaches the same loss inside its own warmdown
+(step 9553) rather than on the plateau. The K=8 arm's warmdown points are not clean
+in that sense, so its last trustworthy ratio is 3.41× at step 9000; `ratio_comparison`
+marks the difference and the plot draws those points dotted and open.
+`token_ratio` is **interpolated** on the reference curve (`token_ratio_status` records this), not
+an unsmoothed crossing like §23's, and the two references sit on different val
+grids — 250 steps for K=8, 500 for K=2 — so K=2's warmdown ratio is the more
+coarsely resolved of the two. `diloco_k_penalty.csv` splices the DiLoCo curve at step
+4000: everything below comes from the 6000-step arm this one resumed, which is
+the same trajectory on the shared plateau.
 
 Both validate every 500 steps: `train.py` requires `val_every` to be a multiple
 of `outer_sync_every`, so the DiLoCo arm cannot run a 250 grid. Matching the

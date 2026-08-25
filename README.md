@@ -139,12 +139,15 @@ the field-level manifest stays in
 Cost inputs belong in [`cost_inputs.csv`](docs/writeup_data/cost_inputs.csv),
 which has the measured/projected runtimes prefilled and leaves rental rates,
 average desktop wall power, electricity prices, capital allocation, and overrides
-blank. The existing
-3090 Trackio run supports a **21.30 h projected time to 3.28** (7.6684 s/step ×
-9999); it did not itself cross the target and is labelled as an extrapolation.
-That is the *same* evidence class as the 1×A100 **7.19 h** bar, which is also a
-measured step time times the measured step-9999 crossing — so no direct 3090
-convergence run is planned, and only the power and electricity fields are open.
+blank. The 3090 bar is now **measured**: `ref-1gpu-10k` (aurora, 2026-08-24) ran a clean
+10000-step trapezoid and crossed 3.28 at step 9999 at val 3.2678, after
+**76403.7 training seconds = 21.22 h** at 7.6333 s/step and 66.6% MFU. It was
+run as the K=2 DiLoCo arm's single-GPU reference, so the bar cost nothing extra,
+and it confirms the previous 21.299 h Trackio extrapolation to **0.36%** — which
+is also a check on the 1×A100 **7.19 h** bar, still an extrapolation of the same
+kind. With wall power and electricity filled in, a converged run costs **$3.91**
+of electricity on the desktop against **$14.31** of rental on one A100: 3.0×
+slower, 3.7× cheaper.
 
 ## Machines
 

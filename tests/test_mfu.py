@@ -63,6 +63,24 @@ class TestPeakLookup:
         86.5% of the 312 datasheet figure the table previously carried."""
         assert peak_bf16_spec("NVIDIA A100-SXM4-80GB").measured
 
+    def test_datasheet_twins_stay_shadowed(self):
+        """Every measured card resolves to its measurement, not the datasheet line below it.
+
+        The table carries the vendor figure under each measured entry for reference only;
+        it is inert purely by ordering. Reordering one above its twin would restore the
+        denominator the measurement was taken to replace -- on the A100 PCIe that is a
+        22% inflation of every MFU, and on the 3090 it would put MFU above 100%.
+        """
+        for name in (
+            "NVIDIA A100-SXM4-80GB",
+            "NVIDIA A100-SXM4-40GB",
+            "NVIDIA A100 80GB PCIe",
+            "NVIDIA GeForce RTX 3090",
+        ):
+            spec = peak_bf16_spec(name)
+            assert spec.measured, f"{name} resolved to {spec.source!r}"
+            assert "SHADOWED" not in spec.source
+
     def test_unknown_device_raises(self):
         with pytest.raises(KeyError, match="no bf16 dense peak recorded"):
             peak_bf16_flops("NVIDIA Tesla K80")

@@ -181,9 +181,11 @@ Mean ms/step, 8 ranks, `bench_ddp_modes.py` (global batch 64 = 8 seqs/rank):
 | 10 gbit | **7314.6** | 7323.3 | 7317.9 | — | — |
 
 **§14 predicted the compile-vs-overlap lead would "flip back" under netem. It
-does not flip — it dissolves.** Uncompiled/overlapped interleaved does retake
-the lead the moment the transport becomes sockets (1180 vs 1285 ms unthrottled,
-matching the 2×3090 Socket+SHM result), but as soon as bandwidth binds, every
+does not flip — it dissolves.** Interleaved appears to retake the lead the
+moment the transport becomes sockets (1180 vs 1285 ms unthrottled, matching the
+2×3090 Socket+SHM result) — both compiled, as the table above says, and
+decisions.md §26 later showed the gap is a tail rather than a finding — but as
+soon as bandwidth binds, every
 config converges: 1.5% spread at 40 gbit, **0.12% at 10 gbit**. Overlap cannot
 hide communication that *is* the step, and compilation only accelerates compute
 that has stopped being the bottleneck. The mode choice matters in the middle

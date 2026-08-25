@@ -164,6 +164,52 @@ attention matrix, while causal SDPA computes roughly half of it. PaLM and nanoGP
 count it this way, so keeping it preserves comparability with published MFU figures at
 the cost of a small overstatement.
 
+**Datasheet figures recorded alongside the measurements (2026-08-25).** Every card the
+study measured is now followed in `_PEAK_BF16` by the vendor figure it replaced, marked
+`SHADOWED`. The lookup takes the first substring match, so those lines are unreachable
+and no MFU number moves; they exist so the size of the gap lives next to the number that
+corrects it, and so "measure, don't cite" is backed by the arithmetic rather than asserted.
+
+| Card | Measured | Datasheet dense | Measured / datasheet |
+|---|---|---|---|
+| A100-SXM4-80GB | 269.9 | 312.0 | 86.5% |
+| A100-SXM4-40GB | 270.1 | 312.0 | 86.6% |
+| A100 80GB PCIe | 256.5 (4096^3) | 312.0 | 82.2%, 71.8% at 16384^3 |
+| RTX 3090 | 82.6 | 71.2 | **116%** |
+
+Two of these are worth carrying forward. **The A100 PCIe gap is the widest**: NVIDIA
+quotes the same 312 for the 300 W PCIe part as for the 400 W SXM4 one, so the datasheet
+overstates the card by 22% against its best sustained figure and 39% against the
+16384^3 one (§25).
+**The 3090 is inverted** — the measurement is 16% *above* the vendor figure, and the
+reason is the clock, not the accumulate mode. Resolved by measurement on aurora
+(2026-08-25): during a 16384^3 bf16 GEMM the card holds a **mean SM clock of 1990 MHz**
+(min 1965, max 2010) at 394 W of its 420 W limit, throttle reason `0x4` = SW power cap.
+Per clock that is 41.7 kFLOP/clk against the 42.0 kFLOP/clk implied by the whitepaper's
+71.16 TFLOP/s at the 3090 FE's 1695 MHz boost — **99.3% of the architectural rate**. The
+card is doing exactly what a GA102 is specified to do, at a 17% higher clock than the
+table assumes. Note bf16 has no FP16-accumulate path (the 142.3 beside it is the same
+rate with 2:4 sparsity), so that is not the explanation and never was. The cross-check:
+the RunPod 3090 at 75.3 TFLOP/s (§ 2026-08-09 session) is the same 41.7 kFLOP/clk at
+~1.79 GHz, i.e. two different cards, one architectural rate, two clocks.
+
+The consequence for this table is that a consumer card's peak is a property of the board
+and its power limit, not of the GPU name. `RTX 3090` keys aurora's 420 W card; a 350 W FE
+would land nearer 71-75, so a rented 3090 must be measured rather than assumed to match.
+
+The four remaining `UNVERIFIED` entries were checked against their datasheets at the same
+time and are correct as recorded: H100 SXM 989.4, H100 PCIe 756.5, H100 NVL 835 per GPU,
+L40S 181, A100 312 — all dense, i.e. the quoted sparse figure halved.
+
+Ordering is the only thing keeping the shadowed entries inert, which is a hazard in a
+table whose entire purpose is to prevent a wrong denominator. The new
+`test_datasheet_twins_stay_shadowed` in `TestPeakLookup` pins that all four measured
+device names still resolve to a measured spec, so a sort or a careless reorder fails a
+test instead of quietly reinstating 312.
+
+Sources: [GA102 architecture whitepaper v2.1](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.1.pdf),
+[A100 80GB datasheet](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/a100-80gb-datasheet-update-a4-nvidia-1485612-r12-web.pdf).
+
 ## 4. Time-to-target-loss definition — **load-bearing**
 
 The headline Track A metric. Pinned before any paid run, because ambiguity here
@@ -1135,9 +1181,13 @@ carried §16's converged anchor and a trimmed version of §15's curve.
 - **μ=0.5 at K=8 shows no excursion at all**, confirming §19's arm-A choice.
   The μ=0.9 sawtooth does not appear, and no gap grows after step 1500.
 - **§14's "expect the lead to flip back under netem" is wrong in an
-  instructive way — the lead dissolves instead.** Uncompiled interleaved does
+  instructive way — the lead dissolves instead.** Interleaved appears to
   retake the lead once the transport is sockets (1180 vs `ddp_torch`'s 1285 ms
-  unthrottled, 8 ranks), reproducing the 2×3090 Socket+SHM result. But throttling
+  unthrottled, 8 ranks), reproducing the 2×3090 Socket+SHM result. **Both of
+  those runs are compiled** — this bullet originally said "uncompiled", which
+  is wrong and is what later made the appendix figure unreadable; and §26 shows
+  the gap itself is a late-run tail, since `ddp_torch`'s fastest step is the
+  faster of the two. But throttling
   collapses the differences: 1.5% spread at 40 gbit, **0.12% at 10 gbit**.
   Overlap cannot hide communication that *is* the step, and compilation only
   helps compute that has stopped being the bottleneck. **Mode choice matters in
@@ -1398,3 +1448,213 @@ from.
 **Scaling at 2 ranks over this fabric is 79.8%** (2786.8 ms → 1745.4 ms), at the
 same global batch 480 and micro-batch 30 as the NVLink and TCP rows. Not
 like-for-like against 8-rank numbers, but same box, same chunking.
+
+## 26. Under `torch.compile`, only PyTorch DDP still overlaps (2026-08-22)
+
+Prompted by reading `docs/plots/ddp_mode_comparison.svg` as "our hand-rolled DDP
+beats upstream's", which is not what it says. Measured on aurora for $0 with
+[`scripts/probe_compile_overlap.py`](../scripts/probe_compile_overlap.py) — gloo,
+CPU, 2 ranks, the real 162.2M-parameter model and the real 25 MB bucket cap. It
+reports where in the backward each gradient becomes ready, which is the window
+any overlap has to live in:
+
+| configuration | first grad | median | last |
+|---|---|---|---|
+| eager | 30.8% | 64.4% | 100% |
+| compiled (our `ddp_bucketed` / `ddp_interleaved`) | **100%** | 100% | 100% |
+| compiled + `ddp_torch` | 29.3% | 66.3% | 95.4% |
+
+These are CPU timings on a shared box, so the percentages move a point or two
+between runs; the three shapes do not. The probe also needs
+`torch._dynamo.reset()` between configurations — without it dynamo reuses the
+code compiled for the previous one and the DDP row silently re-measures the
+plain compiled graph, which is how the first version of this section got the
+DDP row wrong.
+
+**Under `--compile` our interleaved mode is not interleaving anything.**
+AOTAutograd fuses the backward into a single autograd node, so every
+`register_post_accumulate_grad_hook` fires after all of it — compiled
+interleaved is bucketed with an async launch, and compiled bucketed and
+interleaved are the same algorithm. Upstream DDP keeps the eager arrival profile
+because DDPOptimizer splits the graph at bucket boundaries: **14 subgraphs**,
+`[147.4, 27.0 x12, 147.4]` MiB. The two outsized pieces are the untied `wte` and
+`lm_head`; each is ~6x the cap, cannot be split, and the last of them cannot
+overlap with anything on any implementation.
+
+So the two are making opposite trades — overlap bought with 13 graph breaks and
+the fusion lost at each seam, versus one fused graph with all communication
+exposed — and **which one wins is set by how much communication there is to
+hide, not by implementation quality**:
+
+| fabric | interleaved | `ddp_torch` | gap | minima |
+|---|---|---|---|---|
+| NVLink NV12, 8 ranks, 151 GB/s | 337.8 ± 0.7 | 340.3 ± 0.8 | +0.8% | 336.5 / 338.9 |
+| A100 PCIe host-staged, 2 ranks, 2.29 GB/s | 1869.3 ± 13.3 | **1745.4 ± 19.6** | **-6.6%** | 1851.0 / **1721.8** |
+| Forced TCP/loopback, 8 ranks, 0.92 GB/s | 1218.4 ± 14.6 | 1270.3 ± 76.6 | +4.3% | 1199.5 / **1168.6** |
+| Forced TCP/loopback, 8 ranks, batch 64 | 1180.4 ± 33.1 | 1285.5 ± 134.1 | +8.9% | 1132.7 / 1134.9 |
+
+**The batch-64 row is not a fourth data point, it is a floor.** At 8 sequences
+per rank the step is 49.5 ms of compute against a 649 MB all-reduce that takes
+over 1.1 s — the collective is **96% of the step**, and all three bucketing modes
+issue the same one. Whatever an implementation can do about scheduling is
+therefore bounded by that 49.5 ms, i.e. ±4% of the step: overlap can hide at most
+the compute, and splitting the graph can cost at most a similar amount. The
+measured spread agrees — minima 1132.7 vs 1134.9 (+0.2%), medians +43 ms, means
++105 ms, with 5 of `ddp_torch`'s 15 steps above 1.1x its own minimum against 1 of
+interleaved's. Naive is the one mode that separates, and not because of overlap:
+it sends 75 small collectives instead of 14 fused ones, which changes the
+communication itself and costs ~400 ms. **The batch is why this operating point
+cannot rank implementations** — the same lesson as §22's "scaling efficiency is a
+function of the batch", from the other end.
+
+Only two rows carry a finding. **The NVLink +0.8% is real** — sigma under 1 ms,
+the distributions barely touch — and about half of it is priced independently by
+§22's one-rank control: `single` 2589.1 vs `ddp_torch` 2597.7 ms at accum 16 is
+0.54 ms of wrapper per micro-batch, ~1.1 ms of the 2.5 ms gap. **The PCIe -6.6%
+is real and is the interesting one** (§25 quoted it as `ddp_torch` leading by
+7.1%, the same measurement against the other base): the two ranges do not
+touch — 129 ms between the minima, against sigmas of 13 and 20. The two socket
+rows carry nothing — in both, `ddp_torch`'s *fastest* step is faster than
+interleaved's, its sigma is 4-5x larger, and the mean gap is a late-run tail,
+exactly as §21's own caveat says.
+
+Consequences:
+
+- **No reported result changes.** Every converged run and every scaling number
+  was measured under `ddp_torch --compile` (§14), i.e. the mode that keeps its
+  overlap. The comparison figure was the only artifact reading the other way,
+  and it read that way because it drew two fabrics and omitted the third.
+- **`ddp_interleaved` is honest only uncompiled.** Keep it — the uncompiled
+  comparison in §25 is what the three hand-rolled modes exist to teach — but
+  never quote compiled interleaved as evidence about overlap. §21's "overlap
+  cannot hide communication that *is* the step" and §25's "overlap is worth
+  nothing" both have this simpler explanation available: under compile there was
+  no overlap to be worth anything.
+- **Config advice, by fabric**: NVLink, either (0.8%); anything host-staged or
+  slower, `ddp_torch`.
+
+## 27. The matched-schedule K=2 arms landed, and bought a 3090 bar (2026-08-24)
+
+Both arms of `scripts/run-k2-10k-arms.sh` finished on aurora, ~36 h sequential,
+$0. They close §23's confound and one of the write-up's open cost inputs.
+
+- **The K=2 merge penalty on a matched schedule is +0.057**, not §23's +0.031:
+  reference 3.2678 against DiLoCo 3.3248 at step 9999. The penalty *grew* when
+  the schedule was matched, because the 6000-step arm stopped short of the
+  warmdown the reference runs through. In token terms it reads the other way —
+  **1.05x** the reference's tokens for equal loss at the endpoint against 1.25x
+  on the plateau — and at K=2 that endpoint ratio is clean, because the
+  reference reaches the same loss inside its own warmdown (step 9553) rather
+  than on the plateau. Against K=8's +0.245 this is **4.3x smaller at a quarter
+  of the replicas**, which is the shape §18 predicted.
+- **The resume was exact.** Re-entering the step-4000 keep reproduced
+  validation 3.5524 to 1e-5, which is the check that the splice is a genuine
+  unbroken trapezoid rather than a restart-after-warmdown artifact.
+- **A direct RTX 3090 convergence run now exists, for free.** The reference arm
+  `ref-1gpu-10k` is one: a clean 10000-step trapezoid crossing 3.28 at step 9999
+  at val 3.2678, **76403.7 training seconds = 21.22 h**, 7.6333 s/step, 66.6%
+  MFU. It was bought as a DiLoCo control and is a cost bar as a side effect.
+  This retires the "deliberately not measured" entry in `writeup_data/README.md`,
+  which had become self-contradictory — the same file already described the arm.
+- **It validates the extrapolation method, which matters beyond this bar.** The
+  Trackio-derived estimate was 21.299 h; the measured crossing is 21.223 h,
+  **0.36% apart**. The 1xA100 7.19 h bar is an extrapolation of exactly the same
+  construction (measured step time x measured step-9999 crossing), so this is
+  the first direct evidence that construction is sound, not merely plausible.
+- **The desktop is 3.0x slower and 3.7x cheaper.** At the now-filled 800 W and
+  $0.23/kWh, a converged run costs **$3.91** of electricity on the 3090 against
+  **$14.31** of rental on one A100. Owned versus rented are different kinds of
+  number and `costs.csv` keeps them in separate columns, but for the article's
+  "should you rent" question this is the honest single comparison.
+
+**Not a finding, but load-bearing for reading the DiLoCo wall clock:** the K=2
+arm took 24.36 h against the reference's 21.22 h. That is two ranks sharing one
+3090, so it prices GPU contention, not DiLoCo's communication. No DiLoCo
+wall-clock claim may be drawn from it.
+
+**Aftermath, unrelated to the runs.** Aurora's 3090 fell off the bus at 14:38 on
+2026-08-24, ~5 h after the last arm finished and while idle: `Xid 79` followed by
+`Xid 154 (GPU Reset Required)`. Nothing was lost. Recovery needs a power cycle,
+not a module reload, and it must not be done while a rented pod is billing from
+that machine -- this session drives the teardown trap.
+
+
+## 28. The ratio sweep: overlap is worth 0% or 32%, and the batch decides (2026-08-24)
+
+§26 argued from a CPU probe that under `torch.compile` only `ddp_torch` still
+overlaps, and that the four-way panel at 8 seqs/rank could not see it because the
+collective was 96% of the step there. This measures it. Two 2xA100-SXM4-80GB
+rentals (RunPod SECURE, $3.18/h, **$2.13 all in**, including one host that took
+the money and never opened port 22). Four modes x four micro-batches on the
+native fabric and again over forced TCP, accumulation 1 and global batch =
+micro x ranks throughout, so micro-batch is the only variable and every arm moves
+compute against a fixed collective. `scripts/ratio_sweep.sh`, artifacts in
+`out/ratio-sweep-full/` (and `out/ratio-sweep/`, the first box), projected to
+`ratio_sweep.csv`.
+
+Median ms and each mode's excess over the fastest mode at that ratio, all from
+the second box so the whole matrix is one host:
+
+| seqs/rank | fabric | Naive | Bucketed | Interleaved | `ddp_torch` |
+|---|---|---|---|---|---|
+| 8 | NVLink | 55.4 (+2.2%) | 54.6 (+0.7%) | 54.2 (+0.1%) | **54.2** |
+| 16 | NVLink | 95.0 (+0.9%) | 94.2 (+0.1%) | **94.2** | 94.7 (+0.5%) |
+| 30 | NVLink | 163.8 (+0.6%) | 163.4 (+0.4%) | **162.8** | 163.9 (+0.6%) |
+| 60 | NVLink | 308.5 (+0.2%) | 309.1 (+0.4%) | **307.9** | 313.1 (+1.7%) |
+| 8 | forced TCP | 357.5 (+14.4%) | 346.9 (+11.0%) | 344.0 (+10.1%) | **312.5** |
+| 16 | forced TCP | 501.2 (+30.4%) | 411.1 (+6.9%) | 461.1 (+19.9%) | **384.4** |
+| 30 | forced TCP | 535.5 (+34.7%) | 527.0 (+32.6%) | 534.6 (+34.5%) | **397.4** |
+| 60 | forced TCP | 629.1 (+38.6%) | 592.8 (+30.6%) | 601.0 (+32.4%) | **453.9** |
+
+**On a fast fabric the implementation is worth nothing, at any batch.** Every
+mode is within 2.2% at the smallest ratio and within 1.7% at the largest, and
+*naive* -- 75 separate blocking collectives -- is 0.2% off the best at micro 60.
+At 152.9 GB/s there is nothing to schedule; choosing a DDP implementation for an
+NVLink box is optimizing a rounding error.
+
+**On a slow fabric `ddp_torch` wins at every ratio, and its lead grows with the
+micro-batch.** Subtracting each ratio's own compute isolates the collective:
+
+| seqs/rank | compute | exposed by interleaved | by `ddp_torch` | hidden (median / min) |
+|---|---|---|---|---|
+| 8 | 54.2 ms | 289.8 ms | 258.3 ms | 31.5 ms, 11% / 26.9 ms, 9% |
+| 16 | 94.2 ms | 366.9 ms | 290.2 ms | 76.7 ms, 21% / 45.8 ms, 14% |
+| 30 | 162.8 ms | 371.8 ms | 234.6 ms | 137.2 ms, 37% / 98.9 ms, 30% |
+| 60 | 307.9 ms | 293.1 ms | 146.1 ms | 147.1 ms, 50% / 144.5 ms, 50% |
+
+**Overlap is bounded by the compute available to hide behind, and `ddp_torch`
+converts that budget as it grows** -- 9-11% of the collective hidden when the
+backward is 54 ms, 50% when it is 308 ms. On minima the progression is monotone
+(9 -> 14 -> 30 -> 50%); on medians it is the same story with a noisier middle.
+Both statistics are in `ratio_sweep.csv` and the figure draws a whisker from each
+median down to that arm's fastest step, because two positions rest on tails:
+bucketed at micro 16 (411.1 ms, against interleaved's 461.1) and interleaved at
+micro 30. **Nothing here separates bucketed from interleaved** -- they are the
+same algorithm once compiled (§26), and where they differ, the whisker says why.
+
+**Forced-TCP step times are a property of the host, not of the GPU SKU.** The two
+boxes are the same part at the same price, and they agree to **3.1%** on every
+NVLink arm -- but on TCP the second is **20.8% to 45.8%** slower, uniformly across
+all four modes. Loopback TCP exercises the host's CPU, NUMA and network stack, so
+a socket number is only comparable to another socket number measured on the same
+box. This retroactively qualifies §21's netem ladder and §22's forced-TCP
+control: their absolute times are that box's, and only ratios taken within a box
+should be quoted. The first box's clean result that the collective costs the same
+~187 ms at every ratio is likewise its own -- the second box shows 283-372 ms
+with real variation across arms.
+
+Consequences:
+
+- **§26's config advice, sharpened**: on anything slower than NVLink, `ddp_torch`
+  *at the largest micro-batch that fits*. The two choices compound -- 10.1% at
+  micro 8 becomes 32.4% at micro 60.
+- **Micro-batch is a transport knob, not only a memory one.** At fixed global
+  batch, trading accumulation depth for micro-batch buys overlap window at no
+  cost in tokens. §25's PCIe pair already showed the effect without the
+  explanation: micro 30 x accum 2 = 1745.4 ms against micro 60 x accum 4 =
+  1700.5 ms, same global batch, same collective.
+- **The batch-64 four-way panel is not a ranking.** It is the left edge of the
+  TCP column, where the spread is smallest and every mode is within 14%.
+
+Caveat that does not go away: this is **2 ranks**, where the ring factor is 1.0
+against 1.75 at 8. The mechanism generalizes; the percentages are this box's.

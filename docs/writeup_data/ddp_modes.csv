@@ -5,5 +5,7 @@ ddp_interleaved,Interleaved,Forced TCP/loopback,64,15,1180.4333333333334,1176.7,
 ddp_torch,PyTorch DDP,Forced TCP/loopback,64,15,1285.4533333333334,1220.1,134.1371465897426,1134.9,8,true,measured,out/prime-diloco/session_out/bench-control/20260821T150140Z/results.json
 ddp_interleaved,Interleaved,NVLink NV12,480,12,337.775,337.79999999999995,0.738702794215515,336.5,8,true,measured,out/prime-pcie/session_out/bench-8gpu/20260821T170426Z/results.json
 ddp_torch,PyTorch DDP,NVLink NV12,480,12,340.34166666666664,340.4,0.8095546849217817,338.9,8,true,measured,out/prime-pcie/session_out/bench-8gpu/20260821T170426Z/results.json
+ddp_interleaved,Interleaved,"A100 PCIe (P2P off, SHM)",480,15,1869.3266666666666,1867.1,13.270077331385535,1851.0,2,true,measured,out/runpod-pcie/session_out/bench-b480-il/20260822T193853Z/results.json
+ddp_torch,PyTorch DDP,"A100 PCIe (P2P off, SHM)",480,15,1745.4133333333334,1740.3,19.624724444531935,1721.8,2,true,measured,out/runpod-pcie/session_out/bench-b480/20260822T193724Z/results.json
 ddp_interleaved,Interleaved,Forced TCP/loopback,480,12,1218.425,1216.5500000000002,14.61867578880457,1199.5,8,true,measured,out/prime-pcie/session_out/bench-8gpu-socket/20260821T170636Z/results.json
 ddp_torch,PyTorch DDP,Forced TCP/loopback,480,12,1270.3166666666666,1268.25,76.5760089813719,1168.6,8,true,measured,out/prime-pcie/session_out/bench-8gpu-socket/20260821T170636Z/results.json

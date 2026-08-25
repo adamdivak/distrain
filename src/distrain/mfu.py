@@ -51,18 +51,39 @@ class PeakSpec:
 # trusting its MFU numbers, and record the result here -- the same discipline the brief
 # already applies to interconnect, where nccl-tests defines the ceiling rather than the
 # vendor's bandwidth claim.
+#
+# Each measured entry is followed by the vendor figure it replaced, marked `SHADOWED`.
+# Those lines are unreachable by construction -- the measured twin above them matches
+# first -- and exist so the measured/datasheet gap is recorded next to the number it
+# corrects. Never reorder one above its measured twin: it would silently restore the
+# denominator the measurement was taken to replace. `TestPeakLookup` pins the ordering.
 _PEAK_BF16: tuple[tuple[str, PeakSpec], ...] = (
     ("H100 PCIe", PeakSpec(756.0, "datasheet dense, UNVERIFIED")),
     ("H100 NVL", PeakSpec(835.0, "datasheet dense, UNVERIFIED")),
     ("H100", PeakSpec(989.0, "datasheet dense SXM, UNVERIFIED")),
     ("A100-SXM4-80GB", PeakSpec(269.9, "measured on runpod 8xA100 US-MD-1 2026-08-16, 16384^3 bf16 GEMM")),
+    ("A100-SXM4-80GB", PeakSpec(312.0, "A100 datasheet dense; SHADOWED -- measured is 86.5% of it")),
     ("A100-SXM4-40GB", PeakSpec(270.1, "measured on prime/lambdalabs 8xA100 us-east-1 2026-08-21, 16384^3 bf16 GEMM")),
+    ("A100-SXM4-40GB", PeakSpec(312.0, "A100 datasheet dense; SHADOWED -- measured is 86.6% of it")),
     ("A100 80GB PCIe", PeakSpec(256.5, "measured on runpod 2xA100-PCIe CA-MTL-3 2026-08-22, "
                                 "4096^3 bf16 GEMM; 223.9 at 16384^3 -- the 300 W part throttles "
                                 "on long large GEMMs where the SXM4 cards do not")),
+    # NVIDIA quotes the same 312 for the 300 W PCIe part as for the 400 W SXM4 one, which
+    # is where the widest gap in this table comes from.
+    ("A100 80GB PCIe", PeakSpec(312.0, "A100 datasheet dense, same figure as SXM4; SHADOWED -- "
+                                "measured is 82.2% of it at 4096^3, 71.8% at 16384^3")),
     ("A100", PeakSpec(312.0, "datasheet dense, UNVERIFIED")),
     ("L40S", PeakSpec(181.0, "datasheet dense, UNVERIFIED")),
     ("RTX 3090", PeakSpec(82.6, "measured on aurora 2026-07-28, 16384^3 bf16 GEMM")),
+    # The only card here measuring *above* its vendor figure, and the reason is clock, not
+    # accumulate mode: bf16 has no FP16-accumulate path. The whitepaper rate is quoted at the
+    # 3090 FE's 1695 MHz boost; aurora's card is a 420 W board holding 1990 MHz mean under a
+    # 16384^3 GEMM (measured 2026-08-25), which is 41.7 kFLOP/clk against the whitepaper's
+    # 42.0 -- 99.3% of the architectural rate. A 350 W FE would land near 71-75, so this
+    # entry describes aurora's board, not every 3090; measure any rented one.
+    ("RTX 3090", PeakSpec(71.2, "GA102 whitepaper dense, bf16 tensor with FP32 accumulate "
+                          "(142.3 with 2:4 sparsity), at the 1695 MHz FE boost clock; "
+                          "SHADOWED -- aurora's 420 W card clocks 17% higher")),
 )
 
 
@@ -71,7 +92,8 @@ def peak_bf16_spec(device_name: str) -> PeakSpec:
     for pattern, spec in _PEAK_BF16:
         if pattern in device_name:
             return spec
-    known = ", ".join(p for p, _ in _PEAK_BF16)
+    # dict.fromkeys: patterns repeat now that datasheet twins sit under measured entries
+    known = ", ".join(dict.fromkeys(p for p, _ in _PEAK_BF16))
     raise KeyError(
         f"no bf16 dense peak recorded for {device_name!r}. Measure it with "
         f"scripts/measure_roofline.py and add it to _PEAK_BF16. Known: {known}"

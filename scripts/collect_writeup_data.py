@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 import statistics
 from pathlib import Path
@@ -483,25 +484,53 @@ def collect_ddp_modes(root: Path, output: Path) -> None:
     and the per-step times are projected alongside: at 15 timed steps with a
     heavy right tail, the *mean* ranking of the three bucketing modes is not
     reproducible, while their minima agree to about 2%.
+
+    The anchor-batch rows cover all three measured fabrics, including the two
+    2-rank A100-PCIe runs (decisions.md section 26).  Leaving those out is what
+    made the figure read as "PyTorch DDP is slower": the sign of the gap flips
+    on the slowest fabric, and one fabric's pair cannot show that.
     """
     specs = [
         (
             "Forced TCP/loopback",
             64,
-            root / "out/prime-diloco/session_out/bench-control/20260821T150140Z/results.json",
-            ["ddp_naive", "ddp_bucketed", "ddp_interleaved", "ddp_torch"],
+            8,
+            {
+                mode: root / ("out/prime-diloco/session_out/bench-control/"
+                              "20260821T150140Z/results.json")
+                for mode in ("ddp_naive", "ddp_bucketed", "ddp_interleaved", "ddp_torch")
+            },
         ),
         (
             "NVLink NV12",
             480,
-            root / "out/prime-pcie/session_out/bench-8gpu/20260821T170426Z/results.json",
-            ["ddp_interleaved", "ddp_torch"],
+            8,
+            {
+                mode: root / ("out/prime-pcie/session_out/bench-8gpu/"
+                              "20260821T170426Z/results.json")
+                for mode in ("ddp_interleaved", "ddp_torch")
+            },
+        ),
+        (
+            "A100 PCIe (P2P off, SHM)",
+            480,
+            2,
+            {
+                "ddp_interleaved": root / ("out/runpod-pcie/session_out/bench-b480-il/"
+                                           "20260822T193853Z/results.json"),
+                "ddp_torch": root / ("out/runpod-pcie/session_out/bench-b480/"
+                                     "20260822T193724Z/results.json"),
+            },
         ),
         (
             "Forced TCP/loopback",
             480,
-            root / "out/prime-pcie/session_out/bench-8gpu-socket/20260821T170636Z/results.json",
-            ["ddp_interleaved", "ddp_torch"],
+            8,
+            {
+                mode: root / ("out/prime-pcie/session_out/bench-8gpu-socket/"
+                              "20260821T170636Z/results.json")
+                for mode in ("ddp_interleaved", "ddp_torch")
+            },
         ),
     ]
     labels = {
@@ -511,8 +540,8 @@ def collect_ddp_modes(root: Path, output: Path) -> None:
         "ddp_torch": "PyTorch DDP",
     }
     summary, steps = [], []
-    for transport, batch, path, modes in specs:
-        for mode in modes:
+    for transport, batch, gpus, paths in specs:
+        for mode, path in paths.items():
             result = load_result(path, mode)
             summary.append(
                 {
@@ -525,25 +554,28 @@ def collect_ddp_modes(root: Path, output: Path) -> None:
                     "median_ms": result["median_ms"],
                     "std_ms": result["std_ms"],
                     "min_ms": result["min_ms"],
-                    "gpus": 8,
+                    "gpus": gpus,
                     "compiled": "true",
                     "status": "measured",
                     "source_file": str(path.relative_to(root)),
                 }
             )
-            if batch == 64:
-                for index, value in enumerate(result["step_times_ms"]):
-                    steps.append(
-                        {
-                            "mode": mode,
-                            "label": labels[mode],
-                            "transport": transport,
-                            "global_batch_seqs": batch,
-                            "timed_step_index": index,
-                            "step_ms": value,
-                            "source_file": str(path.relative_to(root)),
-                        }
-                    )
+            # Every step of every row, not just the batch-64 matrix: the anchor
+            # claims are about minima and medians too, and a mean with a heavy
+            # tail is exactly what the reader needs to be able to go behind.
+            for index, value in enumerate(result["step_times_ms"]):
+                steps.append(
+                    {
+                        "mode": mode,
+                        "label": labels[mode],
+                        "transport": transport,
+                        "global_batch_seqs": batch,
+                        "gpus": gpus,
+                        "timed_step_index": index,
+                        "step_ms": value,
+                        "source_file": str(path.relative_to(root)),
+                    }
+                )
     write_csv(
         output / "ddp_modes.csv",
         [
@@ -570,6 +602,7 @@ def collect_ddp_modes(root: Path, output: Path) -> None:
             "label",
             "transport",
             "global_batch_seqs",
+            "gpus",
             "timed_step_index",
             "step_ms",
             "source_file",
@@ -806,34 +839,86 @@ def read_trackio_val(db_path: Path, run_name: str) -> dict[int, float]:
     return points
 
 
+def tokens_at_equal_loss(reference: list[tuple[float, float]], loss: float) -> float | None:
+    """Token count at which the reference curve first reached `loss`.
+
+    The vertical loss gap is contaminated by the reference's own slope: the same
+    token lag reads as a far bigger gap during the warmdown, where the reference
+    falls about 10x faster than on the plateau.  Inverting the reference curve
+    instead answers the question the project actually committed to -- how much
+    longer DiLoCo takes to reach a given loss.
+
+    Interpolates in log-token space, since loss against tokens is roughly a power
+    law.  Returns None when `loss` is worse than anything the reference logged, so
+    early rounds report no ratio rather than an extrapolated one.
+    """
+    previous: tuple[float, float] | None = None
+    for tokens, reference_loss in reference:
+        if tokens <= 0:  # log-space interpolation cannot start from the init point
+            continue
+        if previous is not None and reference_loss <= loss <= previous[1]:
+            (tokens_before, loss_before), (tokens_after, loss_after) = previous, (
+                tokens,
+                reference_loss,
+            )
+            if loss_before == loss_after:
+                return tokens_before
+            fraction = (loss_before - loss) / (loss_before - loss_after)
+            return math.exp(
+                math.log(tokens_before)
+                + fraction * (math.log(tokens_after) - math.log(tokens_before))
+            )
+        previous = (tokens, reference_loss)
+    return None
+
+
 def collect_diloco_k_penalty(root: Path, output: Path, trackio_db: Path) -> None:
     """How the DiLoCo merge penalty evolves through training, at two replica counts.
 
     The endpoint alone is misleading: the penalty is largely transient, decaying
-    through training at both K, and the two arms ran different schedule lengths
-    on different hardware.  So this records the whole trajectory, and the plot
-    compares *gaps*, never absolute losses across the two arms -- those are not
-    comparable.
+    through training at both K.  So this records the whole trajectory.
 
-    K=2 comes from the aurora arm of decisions.md section 23 (Trackio), K=8 from
-    the rented session's logs.
+    Both arms run the same 10000-step trapezoid, the same 500-step val grid and
+    the same 491,520 tokens/step, so equal token counts sit at the same point in
+    the LR schedule.  Each arm carries its own reference -- the 1-GPU run for
+    K=2, the 8-GPU DDP run for K=8 -- but those are the same experiment, since
+    data order is world-size-independent and DDP at global batch 480 is the same
+    update as one GPU at global batch 480.  They agree to within 0.016 at every
+    step; pairing each arm with the copy from its own box just keeps the residual
+    bf16 reduction-order term out of the gap.  K=2 comes from aurora's Trackio
+    store (decisions.md section 23), K=8 from the rented session's logs.
     """
     arms = []
 
-    reference = read_trackio_val(trackio_db, "rotary-calibration-3B")
-    replicated = read_trackio_val(trackio_db, "diloco-b480-mom05")
-    if reference and replicated:
+    # The K=2 arm was rerun on a 10000-step trapezoid so it matches K=8's schedule
+    # (scripts/run-k2-10k-arms.sh).  Its DiLoCo curve is spliced: the rerun resumed
+    # the original 6000-step arm from its step-4000 keep, which sits inside both
+    # schedules' LR plateau, so everything below that step is the same trajectory
+    # and is taken from the original run.  Both runs log step 4000 and agree there
+    # to 1e-5 -- that agreement is the check that the splice is sound.
+    resumed = read_trackio_val(trackio_db, "diloco-k2-10k")
+    original = read_trackio_val(trackio_db, "diloco-b480-mom05")
+    reference = read_trackio_val(trackio_db, "ref-1gpu-10k")
+    if reference and resumed and original:
+        splice_step = min(resumed)
         arms.append(
             {
                 "replicas_k": 2,
-                "schedule_steps": 6000,
+                "schedule_steps": 10000,
                 "hardware": "1x RTX 3090 (aurora, 2 ranks sharing the GPU)",
                 "reference": reference,
-                "diloco": replicated,
-                "source_file": f"{trackio_db.name}: rotary-calibration-3B, diloco-b480-mom05",
+                "diloco": {
+                    **{step: loss for step, loss in original.items() if step < splice_step},
+                    **resumed,
+                },
+                "source_file": (
+                    f"{trackio_db.name}: ref-1gpu-10k, diloco-k2-10k "
+                    f"(steps below {splice_step} from diloco-b480-mom05)"
+                ),
                 "notes": (
-                    "decisions.md section 23. The reference logged no 5000/5500 point, so "
-                    "those rounds have no pair; step 5999 pairs with the reference's 6000."
+                    "decisions.md section 23. Same 10000-step trapezoid and 500-step val "
+                    f"grid as the K=8 arm; steps below {splice_step} come from the "
+                    "6000-step arm this one resumed, on the schedule's shared plateau."
                 ),
             }
         )
@@ -869,6 +954,11 @@ def collect_diloco_k_penalty(root: Path, output: Path, trackio_db: Path) -> None
     rows = []
     for arm in arms:
         schedule = arm["schedule_steps"]
+        # Sorted (tokens, loss) for the reference, so its curve can be inverted.
+        reference_curve = [
+            (reference_step * TOKENS_PER_STEP / 1e9, loss)
+            for reference_step, loss in sorted(arm["reference"].items())
+        ]
         for step, diloco_loss in sorted(arm["diloco"].items()):
             # The final step is logged as schedule-1; pair it with the reference's
             # own last point rather than dropping the most interesting round.
@@ -878,6 +968,26 @@ def collect_diloco_k_penalty(root: Path, output: Path, trackio_db: Path) -> None
             if pair_step not in arm["reference"]:
                 continue
             reference_loss = arm["reference"][pair_step]
+            tokens = step * TOKENS_PER_STEP / 1e9
+            equal_loss_tokens = tokens_at_equal_loss(reference_curve, diloco_loss)
+            # The inversion is only apples-to-apples while both sides sit on the
+            # same side of the warmdown.  Once DiLoCo has warmed down but the
+            # reference point it matches is still on the plateau, DiLoCo is
+            # carrying a warmdown boost the reference has not had, and the ratio
+            # flatters it -- the schedule-position confound this whole comparison
+            # exists to avoid, reappearing inside the inversion.
+            warmdown_start = schedule - WARMDOWN_STEPS
+            matched_step = (
+                equal_loss_tokens * 1e9 / TOKENS_PER_STEP if equal_loss_tokens else None
+            )
+            comparison = ""
+            if matched_step is not None:
+                comparison = (
+                    "clean"
+                    if (step > warmdown_start) == (matched_step > warmdown_start)
+                    else "schedule-mismatched: DiLoCo has warmed down, its matched "
+                    "reference point has not"
+                )
             rows.append(
                 {
                     "replicas_k": arm["replicas_k"],
@@ -889,6 +999,18 @@ def collect_diloco_k_penalty(root: Path, output: Path, trackio_db: Path) -> None
                     "reference_val_loss": reference_loss,
                     "diloco_val_loss": diloco_loss,
                     "penalty": diloco_loss - reference_loss,
+                    "reference_tokens_at_equal_loss": equal_loss_tokens,
+                    "token_ratio": (
+                        tokens / equal_loss_tokens if equal_loss_tokens and tokens else None
+                    ),
+                    "ratio_comparison": comparison,
+                    "token_ratio_status": (
+                        "interpolated"
+                        if equal_loss_tokens and tokens
+                        # Early rounds are worse than any loss the reference logged, so
+                        # there is no token count to compare against.
+                        else "undefined: worse than the reference's first logged point"
+                    ),
                     "status": "measured",
                     "source_file": arm["source_file"],
                     "notes": arm["notes"],
@@ -906,6 +1028,10 @@ def collect_diloco_k_penalty(root: Path, output: Path, trackio_db: Path) -> None
             "reference_val_loss",
             "diloco_val_loss",
             "penalty",
+            "reference_tokens_at_equal_loss",
+            "token_ratio",
+            "ratio_comparison",
+            "token_ratio_status",
             "status",
             "source_file",
             "notes",
@@ -914,7 +1040,9 @@ def collect_diloco_k_penalty(root: Path, output: Path, trackio_db: Path) -> None
     )
 
 
-def collect_diloco_transport(root: Path, output: Path, transport_rows: list[dict]) -> None:
+def collect_diloco_transport(
+    root: Path, output: Path, transport_rows: list[dict]
+) -> list[dict]:
     """DiLoCo's amortized step time at each measured transport.
 
     DiLoCo's outer synchronization all-reduces one gradient-sized tensor every H
@@ -980,6 +1108,7 @@ def collect_diloco_transport(root: Path, output: Path, transport_rows: list[dict
         ],
         rows,
     )
+    return rows
 
 
 def collect_crossovers(output: Path, anchor_compute_ms: float) -> None:
@@ -1031,6 +1160,277 @@ def collect_crossovers(output: Path, anchor_compute_ms: float) -> None:
     )
 
 
+# cost_inputs.csv is hand-maintained and carries display labels, not the
+# transport keys transport.csv uses.  Join on config_id so neither file has to
+# spell the other's strings.
+COST_TRANSPORT_KEY = {
+    "a100x8_nvlink": "NVLink NV12",
+    "a100x8_pcie": "A100 PCIe (P2P off, SHM)",
+    "a100x8_forced_tcp_torch": "Forced TCP/loopback",
+    "a100x8_netem40": "netem nominal 40 Gbit/s",
+    "a100x8_netem10": "netem nominal 10 Gbit/s",
+}
+# What a priced row's runtime actually rests on, kept short enough to sit in a
+# figure legend.  A cost is never better evidence than the runtime under it.
+COST_EVIDENCE = {
+    "extrapolated_from_measured_step_time": "Measured step time",
+    "extrapolated_from_trackio_mean_step_time": "Measured step time",
+    "extrapolated_from_reconstructed_step_time": "Reconstructed step time",
+    "measured_full_convergence": "Measured convergence",
+    "measured_not_converged": "Measured, not to target",
+}
+
+
+def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _number(row: dict[str, str], key: str) -> float:
+    """A blank cost input means "does not apply", not zero-as-a-measurement."""
+    value = row.get(key) or ""
+    return float(value) if value else 0.0
+
+
+def collect_costs(root: Path, output: Path, transport_rows: list[dict]) -> list[dict]:
+    """Price one converged run per configuration from `cost_inputs.csv`.
+
+    Rented boxes cost runtime times an hourly rate.  The 3090 desktop is owned,
+    so it has no rate and is costed from wall power and electricity instead --
+    the two bases are carried in a column rather than silently summed into one
+    "price", because they are not the same kind of number.
+
+    A configuration with no runtime anywhere produces no row: an unmeasured
+    convergence must not appear as a $0 bar.  The one exception is a fabric the
+    transport curve already carries a reconstructed runtime for, which is how
+    the 8-rank PCIe projection of decisions.md section 25 gets priced.
+    """
+    inputs = read_csv_rows(root / "docs/writeup_data/cost_inputs.csv")
+    by_transport = {row["transport"]: row for row in transport_rows}
+    rows = []
+    for entry in inputs:
+        runtime_status = entry["runtime_status"]
+        runtime_source = "cost_inputs.csv"
+        if entry["runtime_hours"]:
+            hours = float(entry["runtime_hours"])
+        else:
+            fallback = by_transport.get(COST_TRANSPORT_KEY.get(entry["config_id"], ""))
+            if fallback is None:
+                continue
+            hours = float(fallback["time_to_3_28_hours"])
+            runtime_status = fallback["time_status"]
+            runtime_source = "transport.csv"
+        rate = _number(entry, "hourly_rental_rate")
+        rental = rate * hours
+        energy = (
+            _number(entry, "average_psu_power_watts")
+            / 1000
+            * _number(entry, "electricity_price_per_kwh")
+            * hours
+        )
+        capital = _number(entry, "capital_cost_per_hour") * hours
+        total = rental + energy + capital + _number(entry, "fixed_cost")
+        if entry["total_cost_override"]:
+            total = float(entry["total_cost_override"])
+        rows.append(
+            {
+                "config_id": entry["config_id"],
+                "display_name": entry["display_name"],
+                "plot_stage": entry["plot_stage"],
+                "hardware": entry["hardware"],
+                "gpus": entry["gpus"],
+                "method": entry["method"],
+                "transport": entry["transport"],
+                "transport_key": COST_TRANSPORT_KEY.get(entry["config_id"], ""),
+                "comparison_basis": entry["comparison_basis"],
+                "runtime_hours": hours,
+                "runtime_status": runtime_status,
+                "runtime_source": runtime_source,
+                "evidence": COST_EVIDENCE.get(runtime_status, runtime_status),
+                "currency": entry["currency"],
+                "hourly_rental_rate": rate or "",
+                "rental_cost": rental,
+                "energy_cost": energy,
+                "capital_cost": capital,
+                "total_cost": total,
+                # Which of the two the bar is: a rented hour, or an owned card's
+                # electricity.  Mixing them on one axis needs saying out loud.
+                "cost_basis": "rental" if rate else "wall power (owned hardware)",
+                "effective_usd_per_hour": total / hours if hours else "",
+                "notes": entry["notes"],
+            }
+        )
+    write_csv(
+        output / "costs.csv",
+        [
+            "config_id",
+            "display_name",
+            "plot_stage",
+            "hardware",
+            "gpus",
+            "method",
+            "transport",
+            "transport_key",
+            "comparison_basis",
+            "runtime_hours",
+            "runtime_status",
+            "runtime_source",
+            "evidence",
+            "currency",
+            "hourly_rental_rate",
+            "rental_cost",
+            "energy_cost",
+            "capital_cost",
+            "total_cost",
+            "cost_basis",
+            "effective_usd_per_hour",
+            "notes",
+        ],
+        rows,
+    )
+    return rows
+
+
+def collect_transport_costs(
+    output: Path, transport_rows: list[dict], diloco_rows: list[dict], cost_rows: list[dict]
+) -> None:
+    """Price a converged run on each fabric, for DDP and for DiLoCo.
+
+    The writeup's question here is not "which fabric is fastest" but "which is
+    cheapest", and those differ: cost is the hourly rate times the hours, and the
+    rate moves with the SKU, not with the fabric.  So the rate is carried
+    alongside rather than folded away -- the PCIe box is half the SXM4 anchor's
+    price and still the more expensive run.
+
+    DiLoCo's hours already charge section 18's 2.49x token ratio, which is an
+    estimate rather than a measured crossing; every DiLoCo cost inherits that.
+    """
+    rates = {row["transport_key"]: row for row in cost_rows if row["transport_key"]}
+    diloco = {row["transport"]: row for row in diloco_rows}
+    rows = []
+    for row in transport_rows:
+        priced = rates.get(row["transport"])
+        if priced is None:
+            continue
+        rate = float(priced["hourly_rental_rate"])
+        ddp_hours = float(row["time_to_3_28_hours"])
+        diloco_hours = float(diloco[row["transport"]]["diloco_time_to_3_28_hours"])
+        rows.append(
+            {
+                "transport": row["transport"],
+                "effective_bus_gbps": row["effective_bus_gbps"],
+                "usd_per_hour": rate,
+                "rate_source_config": priced["config_id"],
+                "ddp_hours": ddp_hours,
+                "ddp_cost": ddp_hours * rate,
+                "ddp_evidence": COST_EVIDENCE.get(row["time_status"], row["time_status"]),
+                "diloco_hours": diloco_hours,
+                "diloco_cost": diloco_hours * rate,
+                "diloco_evidence": "Reconstructed step time",
+                "status": row["step_status"],
+                "notes": (
+                    f"Rate from cost_inputs.csv row {priced['config_id']}. DiLoCo hours "
+                    f"charge section 18's {DILOCO_TOKEN_RATIO_K8}x token ratio, an estimate: "
+                    "DiLoCo never reached 3.28 inside this corpus."
+                ),
+            }
+        )
+    write_csv(
+        output / "transport_costs.csv",
+        [
+            "transport",
+            "effective_bus_gbps",
+            "usd_per_hour",
+            "rate_source_config",
+            "ddp_hours",
+            "ddp_cost",
+            "ddp_evidence",
+            "diloco_hours",
+            "diloco_cost",
+            "diloco_evidence",
+            "status",
+            "notes",
+        ],
+        rows,
+    )
+
+
+def collect_ratio_sweep(root: Path, output: Path) -> None:
+    """The mode matrix as a function of the compute-to-communication ratio.
+
+    Answers what the batch-64 four-way panel could not (decisions.md section 26):
+    that panel sits at one ratio, where the collective is 96% of the step and no
+    implementation can differ by more than the compute.  Here micro-batch is the
+    only variable -- accumulation is 1 and global batch is micro x ranks -- so
+    every arm moves the ratio and nothing else.
+
+    Absolute step times are not comparable across arms, by construction: the
+    batch differs.  The comparable quantity is each mode's step time *relative to
+    the best mode at that same ratio*, which is what the figure draws.
+
+    Skipped silently when the session has not been run; every other CSV is
+    independent of it.
+    """
+    # More than one session can contribute: a later box may re-measure points an
+    # earlier one covered.  Later wins per (fabric, micro-batch, mode), so a
+    # re-run supersedes rather than duplicates, and the superseded arms stay on
+    # disk as an independent check.
+    sessions = sorted(path for path in root.glob("out/ratio-sweep*/session_out")
+                      if path.is_dir())
+    if not sessions:
+        return
+    labels = {
+        "ddp_naive": "Naive",
+        "ddp_bucketed": "Bucketed",
+        "ddp_interleaved": "Interleaved",
+        "ddp_torch": "PyTorch DDP",
+    }
+    fabrics = {"native": "Native fabric", "tcp": "Forced TCP/loopback"}
+    by_arm: dict[tuple[str, int, str], dict] = {}
+    for session in sessions:
+      for directory in sorted(session.glob("sweep-*-m*")):
+        # The same pattern also matches each arm's tee'd .log next to its directory.
+        if not directory.is_dir():
+            continue
+        tag, _, micro = directory.name.removeprefix("sweep-").rpartition("-m")
+        path = newest_bench(session, directory.name)
+        data = json.loads(path.read_text())
+        ranks = data["meta"]["nproc"]
+        for result in data["results"]:
+            # A failed arm has no stats; a single-process baseline is not a mode.
+            if "mean_ms" not in result or result["label"] not in labels:
+                continue
+            by_arm[(fabrics.get(tag, tag), int(micro), result["label"])] = (
+                {
+                    "fabric": fabrics.get(tag, tag),
+                    "micro_batch": int(micro),
+                    "global_batch_seqs": int(micro) * ranks,
+                    "tokens_per_rank_per_backward": int(micro) * data["meta"]["seq_len"],
+                    "gpus": ranks,
+                    "mode": result["label"],
+                    "label": labels[result["label"]],
+                    "timed_steps": result["n"],
+                    "mean_ms": result["mean_ms"],
+                    "median_ms": result["median_ms"],
+                    "std_ms": result["std_ms"],
+                    "min_ms": result["min_ms"],
+                    "gpu": data["meta"].get("gpu", ""),
+                    "status": "measured",
+                    "source_file": str(path.relative_to(root)),
+                }
+            )
+    if not by_arm:
+        return
+    rows = [by_arm[key] for key in sorted(by_arm)]
+    write_csv(
+        output / "ratio_sweep.csv",
+        ["fabric", "micro_batch", "global_batch_seqs", "tokens_per_rank_per_backward",
+         "gpus", "mode", "label", "timed_steps", "mean_ms", "median_ms", "std_ms",
+         "min_ms", "gpu", "status", "source_file"],
+        rows,
+    )
+
+
 def collect_gaps(output: Path) -> None:
     rows = [
         {
@@ -1043,11 +1443,13 @@ def collect_gaps(output: Path) -> None:
         },
         {
             "requested_comparison": "Desktop RTX 3090 time and price to 3.28",
-            "availability": "partial",
+            "availability": "complete",
             "reason": (
-                "The 21.30 h figure is a step-time extrapolation on exactly the same footing "
-                "as the 1xA100 7.19 h bar, so no direct crossing run is wanted. Only the cost "
-                "inputs are open: average wall power and electricity price in cost_inputs.csv."
+                "Measured end to end on 2026-08-24: a clean 10000-step trapezoid on aurora "
+                "crossed 3.28 at step 9999 in 76403.66 training seconds (21.223 h, 66.6% MFU, "
+                "out/ref-1gpu-10k.log). It ran as the K=2 DiLoCo arm's single-GPU reference, "
+                "so the bar cost nothing extra, and it confirms the previous 21.299 h "
+                "extrapolation to 0.36%. Wall power and electricity price are filled in."
             ),
         },
         {
@@ -1061,6 +1463,21 @@ def collect_gaps(output: Path) -> None:
                 "P2P. The 8-GPU bar is out of stock rather than mispriced: RunPod sells "
                 "the SKU at half the SXM4 anchor's price and had no capacity on "
                 "2026-08-22; Prime Intellect has none at all."
+            ),
+        },
+        {
+            "requested_comparison": "DiLoCo token ratio as a single constant",
+            "availability": "partial",
+            "reason": (
+                f"diloco_transport.csv and transport_crossovers.csv charge DiLoCo a flat "
+                f"{DILOCO_TOKEN_RATIO_K8}x token ratio, but diloco_k_penalty.csv measures that "
+                "quantity varying from 2.7x to 3.4x across the run's clean region, rising with "
+                f"training. {DILOCO_TOKEN_RATIO_K8}x sits below that entire range, so the "
+                "end-to-end hours and the 2.36 GB/s crossover currently flatter DiLoCo: at 3.0x "
+                "the crossover falls to about 1.73 GB/s and the PCIe verdict flips from DiLoCo "
+                "winning by 2% to losing by 18%. The ratio at the 3.28 target itself is not "
+                "measurable here -- no DiLoCo run reached 3.28 -- so this is recorded rather "
+                "than corrected."
             ),
         },
         {
@@ -1172,12 +1589,15 @@ def main(argv: list[str] | None = None) -> int:
     collect_diloco_sync(root, output)
     collect_scaling(root, output)
     transport_rows, anchor_compute_ms = collect_transport(root, output)
-    collect_diloco_transport(root, output, transport_rows)
+    diloco_rows = collect_diloco_transport(root, output, transport_rows)
     collect_crossovers(output, anchor_compute_ms)
+    cost_rows = collect_costs(root, output, transport_rows)
+    collect_transport_costs(output, transport_rows, diloco_rows, cost_rows)
     collect_diloco_k_penalty(root, output, args.trackio_db)
     collect_capacity(root, output)
     collect_pcie(root, output)
     collect_ddp_modes(root, output)
+    collect_ratio_sweep(root, output)
     collect_gaps(output)
     print(f"wrote writeup data to {output}")
     return 0
